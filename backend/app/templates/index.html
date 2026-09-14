@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMNI-Check</title>
+    <link rel="icon" type="image/png" href="/static/logo.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.11"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        #sidebar::-webkit-scrollbar-thumb { background: #1E293B; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased h-screen overflow-hidden flex">
+
+    <aside id="sidebar" class="w-[280px] bg-[#0B1120] text-slate-300 flex flex-col h-full shrink-0 transition-all duration-300 z-20 shadow-xl overflow-y-auto border-r border-[#1e293b]">
+        
+        <div class="p-4 flex items-center justify-between">
+            <div class="flex items-center gap-2.5 font-bold tracking-wide text-white text-base">
+                <img src="/static/logo.png" class="w-7 h-7 rounded-full aspect-square object-cover shadow-sm" alt="Logo">
+                <span>OMNI-Check</span>
+            </div>
+            <button onclick="toggleSidebar()" class="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition" title="Close Sidebar">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                </svg>
+            </button>
+        </div>
+
+        <div class="px-3 space-y-2 mt-1">
+            <button onclick="openHRModal()" class="w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-[#131b2e] hover:bg-[#1a253f] text-xs font-semibold text-indigo-300 border border-indigo-900/40 transition group">
+                <div class="flex items-center gap-2.5">
+                    <i class="fa-solid fa-user-shield text-indigo-400"></i>
+                    <span>Job Retention System</span>
+                </div>
+                <i class="fa-solid fa-lock text-[10px] text-slate-500 group-hover:text-indigo-300 transition"></i>
+            </button>
+            
+            <div class="h-1"></div>
+
+            <button onclick="createNewChat()" class="w-full flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow-sm transition">
+                <i class="fa-solid fa-plus text-xs"></i>
+                <span>New chat</span>
+            </button>
+
+            <div class="relative pt-1">
+                <input type="text" id="search-chats" oninput="filterChats(this.value)" placeholder="Search chats..." class="w-full bg-[#131b2e] text-xs text-slate-200 rounded-lg pl-8 pr-3 py-2 border border-slate-800 focus:outline-none focus:border-indigo-500 transition placeholder-slate-500">
+                <i class="fa-solid fa-magnifying-glass absolute left-3 top-3.5 text-xs text-slate-500"></i>
+            </div>
+        </div>
+
+        <div class="px-4 pt-5 pb-2 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+            Recent Activity
+        </div>
+
+        <div id="recents-list" class="flex-1 px-2 space-y-0.5 mb-4">
+            {% for s in sessions %}
+            <div class="chat-item group flex items-center justify-between px-3 py-2 rounded-lg text-xs cursor-pointer {% if active_session and active_session.id == s.id %}bg-[#1E293B] text-white font-medium{% else %}text-slate-400 hover:bg-[#131b2e] hover:text-slate-200{% endif %} transition relative" data-title="{{ s.title | lower }}">
+                
+                <div onclick="loadSession('{{ s.id }}')" class="flex items-center gap-2.5 truncate flex-1">
+                    {% if s.is_pinned %}
+                        <i class="fa-solid fa-thumbtack text-[10px] text-amber-400 shrink-0"></i>
+                    {% else %}
+                        <i class="fa-regular fa-message text-[11px] {% if active_session and active_session.id == s.id %}text-indigo-400{% else %}text-slate-500{% endif %} shrink-0"></i>
+                    {% endif %}
+                    <span class="truncate">{{ s.title }}</span>
+                </div>
+                
+                <div class="hidden group-hover:flex items-center gap-1.5 pl-2">
+                    <button onclick="event.stopPropagation(); pinSession('{{ s.id }}')" class="text-slate-500 hover:text-amber-400 p-1" title="Pin chat">
+                        <i class="fa-solid fa-thumbtack text-[10px]"></i>
+                    </button>
+                    <button onclick="event.stopPropagation(); renameSession('{{ s.id }}')" class="text-slate-500 hover:text-indigo-300 p-1" title="Rename chat">
+                        <i class="fa-solid fa-pen text-[10px]"></i>
+                    </button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </aside>
+
+    <main class="flex-1 flex flex-col h-full overflow-hidden relative bg-slate-50">
+        
+        <header class="h-14 border-b border-slate-200 px-4 md:px-6 flex items-center justify-between bg-white shrink-0 shadow-sm z-10">
+            <div class="flex items-center gap-3">
+                <button onclick="toggleSidebar()" class="hover:bg-slate-100 p-1.5 rounded-lg transition" title="Toggle Sidebar">
+                    <img src="/static/logo.png" class="w-7 h-7 rounded-full aspect-square object-cover" alt="Logo">
+                </button>
+                <div id="active-chat-title" class="text-sm font-bold text-slate-800 hidden md:block">
+                    {{ active_session.title if active_session else "Universal Investigation" }}
+                </div>
+            </div>
+            <div class="flex items-center gap-3 text-xs">
+                <span id="header-engine-indicator" class="px-3 py-1.5 rounded-md bg-slate-50 text-slate-600 border border-slate-200 font-medium flex items-center gap-2">
+                    <i class="fa-solid fa-cloud text-blue-500" id="header-engine-icon"></i>
+                    Engine: <span class="text-slate-800 font-semibold" id="header-engine-label">Groq + Serper Matrix</span>
+                </span>
+            </div>
+        </header>
+
+        <div id="chat-stream-container" class="flex-1 overflow-y-auto p-4 md:p-6 max-w-4xl w-full mx-auto">
+            <div id="chat-messages-list">
+                {% if messages %}
+                    {% for m in messages %}
+                        {% if m.sender == 'user' %}
+                        <div class="flex justify-end mb-6">
+                            <div class="flex flex-col items-end">
+                                <div class="bg-indigo-50 text-slate-800 px-5 py-3 rounded-2xl rounded-tr-sm max-w-[80%] text-[15px] shadow-sm border border-indigo-100 whitespace-pre-wrap">{{ m.content }}</div>
+                                <div class="text-[10px] text-slate-400 mt-1 font-medium pr-1">{{ m.created_at.strftime('%I:%M %p') }}</div>
+                            </div>
+                        </div>
+                        {% else %}
+                        <div class="flex items-start gap-4 mb-6">
+                            <img src="/static/logo.png" class="w-8 h-8 rounded-full aspect-square object-cover shadow-sm mt-1 shrink-0" alt="OC">
+                            <div class="flex flex-col items-start flex-1 max-w-[90%]">
+                                <div class="text-slate-800 leading-relaxed text-[15px] whitespace-pre-wrap font-sans bg-white border border-slate-200 px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm w-full">{{ m.content }}</div>
+                                <div class="text-[10px] text-slate-400 mt-1 font-medium pl-1">{{ m.created_at.strftime('%I:%M %p') }}</div>
+                            </div>
+                        </div>
+                        {% endif %}
+                    {% endfor %}
+                {% else %}
+                    <div id="empty-state" class="h-full flex flex-col items-center justify-center text-center p-8 mt-12">
+                        <img src="/static/logo.png" class="w-16 h-16 rounded-full aspect-square object-cover shadow-md mb-4" alt="Logo">
+                        <h2 class="text-2xl font-bold text-slate-800 mb-2">How can I help you today?</h2>
+                        <p class="text-slate-500 text-sm max-w-md mb-6 leading-relaxed">
+                            Select <strong>Cloud</strong> for blazing-fast live internet intelligence, or <strong>Local</strong> for completely offline privacy.
+                        </p>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="p-4 md:p-6 bg-slate-50 shrink-0 z-10">
+            <div class="max-w-4xl mx-auto relative">
+                <form id="chat-form" hx-post="/api/chat/send" hx-target="#chat-messages-list" hx-swap="beforeend" enctype="multipart/form-data" class="bg-white border border-slate-300 rounded-2xl p-3 shadow-md focus-within:border-indigo-500 focus-within:ring-1 focus-within:ring-indigo-500 transition-all relative">
+                    <input type="hidden" name="session_id" id="session_id_input" value="{{ active_session.id if active_session else '' }}">
+                    <input type="hidden" name="selected_mode" id="selected_mode_input" value="cloud">
+
+                    <div id="file-tray" class="flex flex-wrap gap-2 pb-2 empty:hidden"></div>
+
+                    <textarea id="prompt-input" name="prompt" rows="2" placeholder="Ask anything..." required class="w-full bg-transparent text-[15px] text-slate-800 placeholder-slate-400 focus:outline-none resize-none px-2 leading-relaxed max-h-40 overflow-y-auto"></textarea>
+
+                    <div id="rulebook-drawer" class="hidden pt-3 pb-2 border-t border-slate-100 mt-2 space-y-2 px-2">
+                        <input type="text" name="external_url" placeholder="Public folder or drive link..." class="w-full bg-slate-50 text-sm text-slate-700 rounded-lg px-3 py-2 border border-slate-200 focus:outline-none focus:border-indigo-400 transition">
+                        <textarea name="rulebook_text" rows="2" placeholder="Paste custom organizational rulebook or institutional laws (optional)..." class="w-full bg-slate-50 text-sm text-slate-700 rounded-lg px-3 py-2 border border-slate-200 focus:outline-none focus:border-indigo-400 resize-none transition"></textarea>
+                    </div>
+
+                    <div class="flex justify-between items-center pt-2 mt-1 px-1">
+                        <div class="flex items-center gap-2">
+                            <label class="cursor-pointer text-slate-400 hover:text-indigo-600 p-2 rounded-lg hover:bg-slate-100 transition" title="Attach any format">
+                                <i class="fa-solid fa-paperclip text-lg"></i>
+                                <input type="file" name="files" multiple id="file-input" class="hidden" onchange="handleFileSelect(this)">
+                            </label>
+                            <button type="button" onclick="toggleRulebookDrawer()" class="text-xs font-semibold text-slate-500 hover:text-indigo-600 flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-slate-100 transition">
+                                <i class="fa-solid fa-scale-balanced text-[11px]"></i>
+                                <span>Rulebooks & Links</span>
+                            </button>
+                        </div>
+
+                        <div class="flex items-center gap-2">
+                            <div class="relative">
+                                <button type="button" id="model-picker-btn" onclick="toggleModelDropdown(event)" class="flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 transition select-none">
+                                    <span id="selected-model-pill" class="flex items-center gap-1.5">
+                                        <i class="fa-solid fa-cloud text-blue-500 text-[11px]"></i>
+                                        <span>Omni Cloud</span>
+                                    </span>
+                                    <i class="fa-solid fa-chevron-down text-[10px] text-slate-400" id="model-chevron"></i>
+                                </button>
+
+                                <div id="model-dropdown-menu" class="hidden absolute right-0 bottom-full mb-2 w-64 bg-white border border-slate-200 rounded-2xl shadow-xl py-1.5 z-30">
+                                    <button type="button" onclick="selectModelMode('cloud')" class="w-full text-left px-3.5 py-2.5 hover:bg-slate-50 flex items-start gap-3 transition">
+                                        <div class="w-7 h-7 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center shrink-0 mt-0.5">
+                                            <i class="fa-solid fa-cloud text-xs"></i>
+                                        </div>
+                                        <div class="flex-1">
+                                            <div class="text-xs font-bold text-slate-800 flex items-center justify-between">
+                                                <span>Omni Cloud</span>
+                                                <span class="text-[10px] font-medium text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded">Fast</span>
+                                            </div>
+                                            <div class="text-[10px] text-slate-500 mt-0.5">Groq + Serper &rarr; Gemini</div>
+                                        </div>
+                                    </button>
+                                    <div class="border-t border-slate-100 my-1"></div>
+                                    <button type="button" onclick="selectModelMode('local')" class="w-full text-left px-3.5 py-2.5 hover:bg-slate-50 flex items-start gap-3 transition">
+                                        <div class="w-7 h-7 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0 mt-0.5">
+                                            <i class="fa-solid fa-server text-xs"></i>
+                                        </div>
+                                        <div class="flex-1">
+                                            <div class="text-xs font-bold text-slate-800 flex items-center justify-between">
+                                                <span>Omni Local</span>
+                                                <span class="text-[10px] font-medium text-emerald-600 bg-emerald-100 px-1.5 py-0.5 rounded">Secure</span>
+                                            </div>
+                                            <div class="text-[10px] text-slate-500 mt-0.5">Offline Privacy (DeepSeek-R1)</div>
+                                        </div>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div id="action-button-container">
+                                <button type="submit" id="execute-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl px-5 py-2.5 text-sm font-semibold flex items-center justify-center gap-2 shadow-sm transition min-w-[110px]">
+                                    <span>Execute</span>
+                                    <i class="fa-solid fa-paper-plane text-xs"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </main>
+
+    <div id="hr-modal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 shadow-2xl">
+            <div class="flex items-center justify-between mb-5">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600">
+                        <i class="fa-solid fa-user-lock text-lg"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-base font-bold text-slate-900">Job Retention Access</h3>
+                        <p class="text-xs font-medium text-slate-500">Role-Based Authorization Required</p>
+                    </div>
+                </div>
+                <button onclick="closeHRModal()" class="text-slate-400 hover:text-slate-600 bg-slate-50 p-2 rounded-lg transition"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <form onsubmit="submitHRVerification(event)" class="space-y-4">
+                <input type="password" id="hr_key_input" placeholder="Enter HR Admin Access Token..." required class="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition">
+                <button type="submit" class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-sm font-semibold text-white shadow-sm transition">Verify & Enter</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let currentRequest = null;
+
+        function toggleModelDropdown(event) {
+            event.stopPropagation();
+            const menu = document.getElementById('model-dropdown-menu');
+            menu.classList.toggle('hidden');
+        }
+
+        window.addEventListener('click', function(e) {
+            const menu = document.getElementById('model-dropdown-menu');
+            const btn = document.getElementById('model-picker-btn');
+            if (menu && !menu.contains(e.target) && !btn.contains(e.target)) {
+                menu.classList.add('hidden');
+            }
+        });
+
+        function selectModelMode(mode) {
+            const input = document.getElementById('selected_mode_input');
+            const pill = document.getElementById('selected-model-pill');
+            const headerLabel = document.getElementById('header-engine-label');
+            const headerIcon = document.getElementById('header-engine-icon');
+            const menu = document.getElementById('model-dropdown-menu');
+
+            input.value = mode;
+            localStorage.setItem('omnicheck_model_mode', mode);
+
+            if (mode === 'local') {
+                pill.innerHTML = `<i class="fa-solid fa-server text-emerald-500 text-[11px]"></i><span>Omni Local</span>`;
+                headerLabel.innerText = "Ollama (DeepSeek-R1 8B)";
+                headerIcon.className = "fa-solid fa-server text-emerald-500";
+            } else {
+                pill.innerHTML = `<i class="fa-solid fa-cloud text-blue-500 text-[11px]"></i><span>Omni Cloud</span>`;
+                headerLabel.innerText = "Groq + Serper Matrix";
+                headerIcon.className = "fa-solid fa-cloud text-blue-500";
+            }
+            menu.classList.add('hidden');
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const saved = localStorage.getItem('omnicheck_model_mode') || 'cloud';
+            selectModelMode(saved);
+
+            // FORCE AUTO-SCROLL ON PAGE LOAD
+            const chatContainer = document.getElementById('chat-stream-container');
+            if (chatContainer) {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        });
+
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            if (sidebar.classList.contains('w-[280px]')) {
+                sidebar.classList.remove('w-[280px]');
+                sidebar.classList.add('w-0', 'invisible', 'opacity-0');
+            } else {
+                sidebar.classList.remove('w-0', 'invisible', 'opacity-0');
+                sidebar.classList.add('w-[280px]');
+            }
+        }
+
+        function toggleRulebookDrawer() {
+            document.getElementById('rulebook-drawer').classList.toggle('hidden');
+        }
+
+        function handleFileSelect(input) {
+            const tray = document.getElementById('file-tray');
+            tray.innerHTML = '';
+            Array.from(input.files).forEach(file => {
+                const badge = document.createElement('div');
+                badge.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-slate-100 text-xs font-medium text-slate-700 border border-slate-200';
+                badge.innerHTML = `<i class="fa-solid fa-file-lines text-indigo-500"></i><span class="truncate max-w-[150px]">${escapeHtml(file.name)}</span>`;
+                tray.appendChild(badge);
+            });
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function filterChats(query) {
+            const items = document.querySelectorAll('.chat-item');
+            const q = query.toLowerCase().trim();
+            items.forEach(el => {
+                const title = el.getAttribute('data-title') || '';
+                el.style.display = title.includes(q) ? 'flex' : 'none';
+            });
+        }
+
+        document.getElementById('prompt-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (this.value.trim() !== '' && !currentRequest) {
+                    htmx.trigger('#chat-form', 'submit');
+                }
+            }
+        });
+
+        document.body.addEventListener('htmx:beforeRequest', function(evt) {
+            if (evt.detail.elt && evt.detail.elt.id === 'chat-form') {
+                currentRequest = evt.detail.xhr;
+                const promptInput = document.getElementById('prompt-input');
+                const promptVal = promptInput.value;
+                const activeMode = document.getElementById('selected_mode_input').value;
+                
+                const timeStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+                
+                const empty = document.getElementById('empty-state');
+                if (empty) empty.style.display = 'none';
+
+                const messagesList = document.getElementById('chat-messages-list');
+                const chatContainer = document.getElementById('chat-stream-container');
+
+                const userHtml = `
+                    <div class="flex justify-end mb-6">
+                        <div class="flex flex-col items-end">
+                            <div class="bg-indigo-50 text-slate-800 px-5 py-3 rounded-2xl rounded-tr-sm max-w-[80%] text-[15px] shadow-sm border border-indigo-100 whitespace-pre-wrap">${escapeHtml(promptVal)}</div>
+                            <div class="text-[10px] text-slate-400 mt-1 font-medium pr-1">${timeStr}</div>
+                        </div>
+                    </div>
+                `;
+                messagesList.insertAdjacentHTML('beforeend', userHtml);
+
+                const thinkingMessage = activeMode === 'local' 
+                    ? 'Engaging local offline engine for maximum privacy...' 
+                    : 'Routing through 3-Tier Cloud Matrix...';
+
+                const thinkingHtml = `
+                    <div class="ai-active-thinking flex items-start gap-4 mb-6">
+                        <img src="/static/logo.png" class="w-8 h-8 rounded-full aspect-square object-cover shadow-sm mt-1 shrink-0" alt="OC">
+                        <div class="flex flex-col items-start flex-1 max-w-[90%]">
+                            <div class="text-slate-500 leading-relaxed text-[14px] italic font-sans bg-white border border-slate-200 px-5 py-3.5 rounded-2xl rounded-tl-sm shadow-sm flex items-center gap-3">
+                                <i class="fa-solid fa-circle-notch fa-spin text-indigo-500"></i>
+                                <span>${thinkingMessage}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                messagesList.insertAdjacentHTML('beforeend', thinkingHtml);
+
+                promptInput.value = '';
+                document.getElementById('file-tray').innerHTML = '';
+
+                const btnContainer = document.getElementById('action-button-container');
+                btnContainer.innerHTML = `
+                    <button type="button" onclick="stopExecution()" class="bg-slate-800 hover:bg-slate-900 text-white rounded-xl px-5 py-2.5 text-sm font-semibold flex items-center justify-center gap-2 shadow-sm transition min-w-[110px]">
+                        <span>Stop</span>
+                        <i class="fa-solid fa-square text-[10px] text-rose-400"></i>
+                    </button>
+                `;
+                
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        });
+
+        document.body.addEventListener('htmx:beforeSwap', function() {
+            document.querySelectorAll('.ai-active-thinking').forEach(el => el.remove());
+        });
+
+        document.body.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.elt && evt.detail.elt.id === 'chat-form') {
+                currentRequest = null;
+                document.querySelectorAll('.ai-active-thinking').forEach(el => el.remove());
+
+                const btnContainer = document.getElementById('action-button-container');
+                btnContainer.innerHTML = `
+                    <button type="submit" id="execute-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl px-5 py-2.5 text-sm font-semibold flex items-center justify-center gap-2 shadow-sm transition min-w-[110px]">
+                        <span>Execute</span>
+                        <i class="fa-solid fa-paper-plane text-xs"></i>
+                    </button>
+                `;
+                
+                const chatContainer = document.getElementById('chat-stream-container');
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        });
+
+        function stopExecution() {
+            if (currentRequest) {
+                currentRequest.abort();
+                currentRequest = null;
+                document.querySelectorAll('.ai-active-thinking').forEach(el => {
+                    el.innerHTML = `
+                        <img src="/static/logo.png" class="w-8 h-8 rounded-full aspect-square object-cover shadow-sm mt-1 shrink-0 opacity-40" alt="OC">
+                        <div class="text-rose-600 bg-rose-50 border border-rose-200 text-xs px-4 py-2.5 rounded-xl font-medium">
+                            Response stopped by user.
+                        </div>
+                    `;
+                    el.classList.remove('ai-active-thinking');
+                });
+                const btnContainer = document.getElementById('action-button-container');
+                btnContainer.innerHTML = `
+                    <button type="submit" id="execute-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl px-5 py-2.5 text-sm font-semibold flex items-center justify-center gap-2 shadow-sm transition min-w-[110px]">
+                        <span>Execute</span>
+                        <i class="fa-solid fa-paper-plane text-xs"></i>
+                    </button>
+                `;
+            }
+        }
+
+        async function createNewChat() {
+            const res = await fetch('/api/sessions/new', { method: 'POST' });
+            const data = await res.json();
+            window.location.href = `/?session_id=${data.id}`;
+        }
+
+        function loadSession(id) {
+            window.location.href = `/?session_id=${id}`;
+        }
+
+        async function pinSession(id) {
+            await fetch(`/api/sessions/${id}/pin`, { method: 'POST' });
+            window.location.reload();
+        }
+
+        async function renameSession(id) {
+            const newTitle = prompt("Enter new chat title:");
+            if (newTitle && newTitle.trim() !== "") {
+                const formData = new FormData();
+                formData.append('title', newTitle);
+                await fetch(`/api/sessions/${id}/rename`, { method: 'POST', body: formData });
+                window.location.reload();
+            }
+        }
+
+        function openHRModal() { document.getElementById('hr-modal').classList.remove('hidden'); }
+        function closeHRModal() { document.getElementById('hr-modal').classList.add('hidden'); }
+        
+        async function submitHRVerification(e) {
+            e.preventDefault();
+            const key = document.getElementById('hr_key_input').value;
+            const formData = new FormData();
+            formData.append('access_key', key);
+            const res = await fetch('/api/auth/verify-hr', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok && data.status === 'granted') {
+                window.location.href = data.redirect;
+            } else {
+                alert("Invalid Role Authorization Key.");
+            }
+        }
+    </script>
+</body>
+</html>
