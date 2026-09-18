@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMNICheck - Compliance Engine</title>
+    <link rel="icon" type="image/png" href="/static/logo.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans min-h-screen p-8">
+
+    <div class="max-w-5xl mx-auto">
+        <div class="flex items-center justify-between mb-8">
+            <h1 class="text-3xl font-bold text-slate-900">Module 1: Compliance & Investigation</h1>
+            <a href="/" class="text-indigo-600 hover:underline font-medium">&larr; Back to Main AI</a>
+        </div>
+
+        <!-- Upload Dashboard -->
+        <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-8">
+            <form id="compliance-form" class="space-y-6">
+                <div>
+                    <label class="block text-sm font-semibold mb-2">Investigation Objective</label>
+                    <input type="text" id="objective" value="General Compliance Check" class="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none">
+                </div>
+                
+                <div class="grid grid-cols-2 gap-6">
+                    <div class="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center hover:bg-slate-50 transition">
+                        <label class="block text-sm font-semibold mb-2">Target Documents (Up to 100k)</label>
+                        <input type="file" id="target-files" multiple class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
+                    </div>
+                    <div class="border-2 border-dashed border-slate-300 rounded-xl p-6 text-center hover:bg-slate-50 transition">
+                        <label class="block text-sm font-semibold mb-2">Custom Rulebook (Optional)</label>
+                        <input type="file" id="rulebook-file" class="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100">
+                    </div>
+                    <div class="col-span-2 border-2 border-dashed border-slate-300 rounded-xl p-6 hover:bg-slate-50 transition">
+                        <label class="block text-sm font-semibold mb-2 text-center">Or Target Public URLs (Images/PDFs)</label>
+                        <input type="text" id="target-urls" placeholder="https://example.com/invoice.jpg, https://example.com/data.pdf" class="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-sm text-center">
+                    </div>
+                </div>
+
+                <button type="submit" id="submit-btn" class="w-full bg-indigo-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-indigo-700 transition">
+                    Start Mass Investigation
+                </button>
+            </form>
+
+            <!-- Live Progress Bar -->
+            <div id="progress-container" class="hidden mt-8">
+                <div class="flex justify-between text-sm font-semibold mb-2">
+                    <span id="status-text" class="text-indigo-600">Initializing workers...</span>
+                    <span id="status-count">0 / 0</span>
+                </div>
+                <div class="w-full bg-slate-200 rounded-full h-3">
+                    <div id="progress-bar" class="bg-indigo-600 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI Report Output -->
+        <div id="results-container" class="hidden bg-white rounded-xl shadow-sm border border-slate-200 p-6">
+            <h2 class="text-xl font-bold mb-4 border-b pb-2">Investigation Reports</h2>
+            <div id="reports-list" class="space-y-8 prose prose-slate max-w-none"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('compliance-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const btn = document.getElementById('submit-btn');
+            const progressContainer = document.getElementById('progress-container');
+            const resultsContainer = document.getElementById('results-container');
+            
+            btn.disabled = true;
+            btn.innerText = "Uploading to Message Broker...";
+            progressContainer.classList.remove('hidden');
+            resultsContainer.classList.add('hidden');
+
+            const formData = new FormData();
+            formData.append('objective', document.getElementById('objective').value);
+            
+            const targetFiles = document.getElementById('target-files').files;
+            const targetUrls = document.getElementById('target-urls').value;
+            
+            if (targetFiles.length === 0 && !targetUrls.trim()) {
+                alert("Please upload a document or provide a URL.");
+                btn.disabled = false;
+                btn.innerText = "Start Mass Investigation";
+                return;
+            }
+
+            for (let i = 0; i < targetFiles.length; i++) {
+                formData.append('files', targetFiles[i]);
+            }
+            if (targetUrls.trim()) formData.append('urls', targetUrls);
+
+            const rulebook = document.getElementById('rulebook-file').files[0];
+            if (rulebook) formData.append('rulebook', rulebook);
+
+            // 1. Send files to the API
+            const response = await fetch('/api/compliance/process-documents', {
+                method: 'POST',
+                body: formData
+            });
+            
+            const data = await response.json();
+            
+            if (data.task_id) {
+                btn.innerText = "Processing Background Queue...";
+                pollTaskStatus(data.task_id);
+            }
+        });
+
+        // 2. Poll the Celery Worker every 2 seconds
+        async function pollTaskStatus(taskId) {
+            const interval = setInterval(async () => {
+                const res = await fetch(`/api/compliance/task-status/${taskId}`);
+                const data = await res.json();
+
+                if (data.status === 'PROGRESS' && data.progress) {
+                    const current = data.progress.current || 0;
+                    const total = data.progress.total || 1;
+                    const percentage = (current / total) * 100;
+                    
+                    document.getElementById('status-text').innerText = `Extracting & Analyzing: ${data.progress.file || '...'}`;
+                    document.getElementById('status-count').innerText = `${current} / ${total}`;
+                    document.getElementById('progress-bar').style.width = `${percentage}%`;
+                    
+                } else if (data.status === 'SUCCESS') {
+                    clearInterval(interval);
+                    document.getElementById('status-text').innerText = "Investigation Complete!";
+                    document.getElementById('progress-bar').style.width = "100%";
+                    document.getElementById('submit-btn').innerText = "Start New Investigation";
+                    document.getElementById('submit-btn').disabled = false;
+                    
+                    renderReports(data.result.results);
+                } else if (data.status === 'FAILURE') {
+                    clearInterval(interval);
+                    document.getElementById('status-text').innerText = "Task Failed in Background.";
+                }
+            }, 2000);
+        }
+
+        // 3. Render the Markdown Report
+        function renderReports(resultsArray) {
+            const list = document.getElementById('reports-list');
+            list.innerHTML = "";
+            document.getElementById('results-container').classList.remove('hidden');
+
+            resultsArray.forEach(res => {
+                const div = document.createElement('div');
+                div.className = "bg-slate-50 p-5 rounded-lg border border-slate-200";
+                
+                const header = document.createElement('h3');
+                header.className = "text-lg font-bold text-slate-800 mb-3";
+                header.innerText = `File: ${res.file}`;
+                
+                const body = document.createElement('div');
+                body.className = "ai-rendered-response"; // Matches your main.py CSS
+                body.innerHTML = marked.parse(res.findings);
+                
+                div.appendChild(header);
+                div.appendChild(body);
+                list.appendChild(div);
+            });
+        }
+    </script>
+    <style>
+        /* Custom Markdown Table Styling */
+        .ai-rendered-response table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        .ai-rendered-response th, .ai-rendered-response td { border: 1px solid #cbd5e1; padding: 0.75rem; text-align: left; font-size: 0.875rem;}
+        .ai-rendered-response th { background-color: #e2e8f0; font-weight: bold; }
+    </style>
+</body>
+</html>

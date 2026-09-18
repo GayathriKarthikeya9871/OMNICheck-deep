@@ -5,9 +5,10 @@ from dotenv import load_dotenv
 _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _env_path = os.path.join(_backend_dir, ".env")
 load_dotenv(_env_path)
-
+from app.services.module1_compliance.router import compliance_router
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, HTTPException
+from typing import List, Optional
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -64,6 +65,7 @@ app = FastAPI(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+app.include_router(compliance_router, prefix="/api/compliance", tags=["Module 1: Compliance"])
 
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").replace("localhost", "127.0.0.1")
 OLLAMA_LITE_MODEL = os.getenv("OLLAMA_LITE_MODEL", "qwen2.5:3b")
@@ -126,6 +128,18 @@ async def get_app_root(request: Request, session_id: str = None, db: Session = D
         db.commit()
         db.refresh(new_sess)
         return RedirectResponse(url=f"/?session_id={new_sess.id}")
+
+    # --- NEW: ABANDONED SESSION CLEANUP ---
+    other_sessions = db.query(ChatSession).filter(ChatSession.id != session_id).all()
+    cleanup_needed = False
+    for s in other_sessions:
+        if not db.query(ChatMessage).filter(ChatMessage.session_id == s.id).first():
+            db.delete(s)
+            cleanup_needed = True
+    
+    if cleanup_needed:
+        db.commit()
+    # --------------------------------------
 
     sessions = db.query(ChatSession).order_by(ChatSession.is_pinned.desc(), ChatSession.updated_at.desc()).all()
     active_session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
@@ -325,9 +339,9 @@ async def handle_chat_message(
     session_id: str = Form(...),
     prompt: str = Form(...),
     selected_mode: str = Form("cloud"),
-    external_url: str = Form(None),
-    rulebook_text: str = Form(None),
-    files: list[UploadFile] | None = File(None),
+    external_url: Optional[str] = Form(None),
+    rulebook_text: Optional[str] = Form(None),
+    files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db)
 ):
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
@@ -368,18 +382,64 @@ async def handle_chat_message(
                 ext = safe_filename.lower().split('.')[-1]
 
                 try:
-                    if ext == "txt":
-                        with open(save_path, "r", encoding="utf-8") as f:
-                            extracted_doc_text += f"\n--- Content of {safe_filename} ---\n{f.read()[:5000]}\n"
+                    text = ""
+                    ext = safe_filename.lower().split('.')[-1]
+
+                    # 1. Jupyter Notebook Extraction
+                    if ext == "ipynb":
+                        import json
+                        with open(save_path, "r", encoding="utf-8", errors="ignore") as f:
+                            try:
+                                nb = json.load(f)
+                                cells = ["".join(cell.get("source", [])) for cell in nb.get("cells", []) if cell.get("cell_type") in ["code", "markdown"]]
+                                text = "\n\n".join(cells)
+                            except Exception:
+                                f.seek(0)
+                                text = f.read()
+
+                    # 2. PDF Documents
                     elif ext == "pdf":
                         with pdfplumber.open(save_path) as pdf:
                             text = "".join(page.extract_text() + "\n" for page in pdf.pages if page.extract_text())
-                            extracted_doc_text += f"\n--- Content of {safe_filename} ---\n{text[:5000]}\n"
+                            
+                    # 3. Word Documents
                     elif ext == "docx":
                         doc = docx.Document(save_path)
                         text = "\n".join([p.text for p in doc.paragraphs])
-                        extracted_doc_text += f"\n--- Content of {safe_filename} ---\n{text[:5000]}\n"
-                except Exception:
+                        
+                    # 4. Audio & Video Transcription (via Groq Whisper)
+                    elif ext in ["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"]:
+                        if GROQ_KEYS and os.path.getsize(save_path) < 25 * 1024 * 1024:
+                            try:
+                                async with httpx.AsyncClient(timeout=60.0) as ac:
+                                    with open(save_path, "rb") as media_file:
+                                        resp = await ac.post(
+                                            "https://api.groq.com/openai/v1/audio/transcriptions",
+                                            headers={"Authorization": f"Bearer {GROQ_KEYS[0]}"},
+                                            data={"model": "whisper-large-v3"},
+                                            files={"file": (safe_filename, media_file)}
+                                        )
+                                        if resp.status_code == 200:
+                                            text = f"[Transcribed Media Content]:\n{resp.json().get('text', '')}"
+                                        else:
+                                            text = f"[System Note: Transcription Failed - {resp.status_code}]"
+                            except Exception as e:
+                                text = f"[System Note: Media Error - {str(e)}]"
+                        else:
+                            text = "[System Note: Media file exceeds 25MB API limit or API key is missing.]"
+
+                    # 5. Universal Catch-All (For EVERY other text, code, or data file)
+                    else:
+                        try:
+                            with open(save_path, "r", encoding="utf-8") as f:
+                                text = f.read()
+                        except UnicodeDecodeError:
+                            text = f"[System Note: {safe_filename} is an unreadable binary format.]"
+
+                    if text.strip():
+                        extracted_doc_text += f"\n--- Content of {safe_filename} ---\n{text[:25000]}\n"
+                except Exception as e:
+                    print(f"Error extracting {safe_filename}: {e}")
                     pass
 
                 doc = UploadedDocument(

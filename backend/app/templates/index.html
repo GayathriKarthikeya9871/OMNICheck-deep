@@ -36,6 +36,13 @@
         </div>
 
         <div class="px-3 space-y-2 mt-1">
+            <a href="/api/compliance/portal" class="w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-[#131b2e] hover:bg-[#1a253f] text-xs font-semibold text-emerald-300 border border-emerald-900/40 transition group">
+                <div class="flex items-center gap-2.5">
+                    <i class="fa-solid fa-shield-halved text-emerald-400"></i>
+                    <span>Compliance Module</span>
+                </div>
+            </a>
+
             <button onclick="openHRModal()" class="w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-[#131b2e] hover:bg-[#1a253f] text-xs font-semibold text-indigo-300 border border-indigo-900/40 transition group">
                 <div class="flex items-center gap-2.5">
                     <i class="fa-solid fa-user-shield text-indigo-400"></i>
@@ -141,7 +148,7 @@
 
         <div class="p-4 md:p-6 bg-slate-50 shrink-0 z-10">
             <div class="max-w-4xl mx-auto relative">
-                <form id="chat-form" hx-post="/api/chat/send" hx-target="#chat-messages-list" hx-swap="beforeend" enctype="multipart/form-data" class="bg-white border border-slate-300 rounded-2xl p-3 shadow-md focus-within:border-indigo-500 focus-within:ring-1 focus-within:ring-indigo-500 transition-all relative">
+                <form id="chat-form" hx-post="/api/chat/send" hx-target="#chat-messages-list" hx-swap="beforeend" hx-encoding="multipart/form-data" enctype="multipart/form-data" class="bg-white border border-slate-300 rounded-2xl p-3 shadow-md focus-within:border-indigo-500 focus-within:ring-1 focus-within:ring-indigo-500 transition-all relative">
                     <input type="hidden" name="session_id" id="session_id_input" value="{{ active_session.id if active_session else '' }}">
                     <input type="hidden" name="selected_mode" id="selected_mode_input" value="cloud">
 

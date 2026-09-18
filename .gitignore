@@ -4,3 +4,9 @@ __pycache__/
 .env
 .vscode/
 *.db
+backend/app/uploads/
+backend/uploads/
+enterprise_test_data/
+micro_test/
+test_data/
+*.zip
