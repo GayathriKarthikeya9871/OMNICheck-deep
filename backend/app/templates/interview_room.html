@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMNI-Check | Secure AI Interview</title>
+    <link rel="icon" type="image/png" href="/static/logo.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Load face-api.js for Edge Proctoring -->
+    <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        #chat-stream::-webkit-scrollbar { width: 4px; }
+        #chat-stream::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        textarea::-webkit-scrollbar { width: 4px; }
+        textarea::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-200 h-screen overflow-hidden flex flex-col">
+
+    <!-- Navbar -->
+    <nav class="h-14 border-b border-slate-800 bg-slate-950 px-6 flex items-center justify-between shrink-0 shadow-sm z-20">
+        <div class="flex items-center gap-3">
+            <div class="w-6 h-6 rounded bg-indigo-600 flex items-center justify-center text-xs shadow-sm">
+                <i class="fa-solid fa-shield-halved text-white"></i>
+            </div>
+            <span class="font-bold text-white tracking-wide">OMNI-Check Secure Room</span>
+            <span class="text-[10px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20 font-bold tracking-widest ml-2 uppercase">Live Record</span>
+        </div>
+        <div class="flex items-center gap-4 text-sm font-semibold">
+            <div id="connection-status" class="flex items-center gap-2 text-amber-400">
+                <i class="fa-solid fa-circle-notch fa-spin"></i> Connecting to AI Matrix...
+            </div>
+            <button onclick="endInterview()" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-1.5 rounded-lg transition shadow-sm">
+                End Interview
+            </button>
+        </div>
+    </nav>
+
+    <!-- Candidate Lobby (Pre-Interview Checks) -->
+    <div id="candidate-lobby" class="flex-1 flex items-center justify-center bg-slate-900 absolute inset-0 z-50">
+        <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl max-w-lg w-full border border-slate-700 text-center">
+            <div class="w-16 h-16 rounded-full bg-indigo-600 flex items-center justify-center text-2xl shadow-sm mx-auto mb-6">
+                <i class="fa-solid fa-clipboard-user text-white"></i>
+            </div>
+            <h2 class="text-2xl font-bold text-white mb-2">Welcome to your Interview</h2>
+            <p class="text-slate-400 text-sm mb-8">Role: {{ assessment.job_role }}</p>
+
+            {% if not assessment.resume_text %}
+            <div class="text-left bg-slate-900 p-6 rounded-xl border border-slate-700">
+                <h3 class="text-white font-bold mb-2"><i class="fa-solid fa-file-arrow-up text-indigo-400 mr-2"></i>Step 1: Submit Resume</h3>
+                <p class="text-xs text-slate-400 mb-4">Upload your resume file or paste the text below. This allows the AI to tailor the interview to your specific background.</p>
+                <form action="/api/hr/submit_resume/{{employee_id}}" method="POST" enctype="multipart/form-data">
+                    <div class="mb-3 text-left">
+                        <label class="block text-xs font-bold text-slate-300 mb-1">Upload Resume (.txt or .pdf)</label>
+                        <input type="file" name="resume_file" accept=".txt,.pdf" class="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-500/20 file:text-indigo-300 hover:file:bg-indigo-500/30 cursor-pointer">
+                    </div>
+                    <div class="mb-4 text-left">
+                        <label class="block text-xs font-bold text-slate-300 mb-1">OR Paste Resume Text</label>
+                        <textarea name="resume_text" rows="4" placeholder="Paste your full resume here if not uploading a file..." class="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none text-white"></textarea>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-lg transition shadow-sm">Submit Resume</button>
+                </form>
+            </div>
+            {% else %}
+            <div class="text-left bg-slate-900 p-6 rounded-xl border border-slate-700 mb-6">
+                <h3 class="text-white font-bold mb-2"><i class="fa-solid fa-video text-emerald-400 mr-2"></i>Step 2: Hardware & Environment</h3>
+                <ul class="text-xs text-slate-400 space-y-2 mb-0">
+                    <li><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Resume Submitted successfully</li>
+                    <li><i class="fa-solid fa-circle-info text-indigo-400 mr-2"></i> Microphone and Camera permissions are required.</li>
+                    <li><i class="fa-solid fa-expand text-indigo-400 mr-2"></i> The interview must be completed in Full Screen mode.</li>
+                    <li><i class="fa-solid fa-triangle-exclamation text-rose-400 mr-2"></i> Exiting Full Screen 3 times will auto-submit your test.</li>
+                </ul>
+            </div>
+            <button id="start-interview-btn" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 rounded-lg transition shadow-sm text-lg flex items-center justify-center gap-3">
+                <i class="fa-solid fa-play"></i> Enable Hardware & Start
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- HackerRank Strike Overlay -->
+    <div id="strike-overlay" class="hidden absolute inset-0 bg-slate-900/95 backdrop-blur-md z-[100] flex flex-col items-center justify-center text-center px-6">
+        <div class="w-24 h-24 bg-rose-600/20 text-rose-500 rounded-full flex items-center justify-center text-5xl mb-6 shadow-[0_0_50px_rgba(225,29,72,0.3)]">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+        </div>
+        <h1 class="text-4xl font-black text-white mb-4">Security Violation</h1>
+        <p id="strike-message" class="text-xl text-slate-300 mb-8 max-w-2xl leading-relaxed">You have left the interview window or exited full-screen. This has been logged.</p>
+        <p id="strike-count-display" class="text-rose-400 font-bold mb-8 uppercase tracking-widest"></p>
+        <button id="return-fullscreen-btn" class="bg-rose-600 hover:bg-rose-700 text-white font-bold py-4 px-10 rounded-xl transition shadow-lg text-lg flex items-center gap-3">
+            <i class="fa-solid fa-expand"></i> Acknowledge & Return to Full Screen
+        </button>
+    </div>
+
+    <!-- Main Workspace -->
+    <main id="interview-workspace" class="flex-1 flex overflow-hidden hidden">
+        
+        <!-- Left Panel: Video & Proctoring -->
+        <div class="w-[320px] bg-slate-950 border-r border-slate-800 flex flex-col shrink-0 relative">
+            <div class="p-4 border-b border-slate-800">
+                <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Live Proctoring Feed</h3>
+                <div class="relative rounded-xl overflow-hidden bg-black aspect-video border border-slate-700 shadow-inner">
+                    <video id="webcam" autoplay muted playsinline class="w-full h-full object-cover transform -scale-x-100"></video>
+                    <!-- Overlay Canvas for Face Tracking -->
+                    <canvas id="overlay" class="absolute top-0 left-0 w-full h-full z-10 transform -scale-x-100"></canvas>
+                </div>
+            </div>
+            
+            <div class="p-4 flex-1 overflow-y-auto">
+                <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Integrity Log</h3>
+                <div id="proctor-log" class="space-y-2 text-xs">
+                    <div class="text-slate-500 italic">Initializing vision models...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Panel: AI Interview Stream -->
+        <div class="flex-1 flex flex-col relative bg-slate-900">
+            <div id="chat-stream" class="flex-1 overflow-y-auto p-6 space-y-6">
+                <!-- Chat bubbles will be injected here -->
+            </div>
+
+            <!-- Input Area -->
+            <div class="p-4 bg-slate-950 border-t border-slate-800 shrink-0">
+                <div class="max-w-4xl mx-auto flex items-end gap-3">
+                    <button id="mic-btn" class="w-12 h-12 rounded-full bg-slate-800 hover:bg-indigo-600 border border-slate-700 hover:border-indigo-500 text-slate-400 hover:text-white flex items-center justify-center transition shadow-sm shrink-0 mb-1">
+                        <i class="fa-solid fa-microphone text-lg"></i>
+                    </button>
+                    
+                    <div class="flex-1 relative bg-slate-900 rounded-xl border border-slate-700 focus-within:border-indigo-500 transition shadow-sm flex items-end pr-2 py-1">
+                        <textarea id="chat-input" rows="3" placeholder="Type your answer, or use the microphone..." class="w-full bg-transparent text-white px-4 py-2.5 focus:outline-none text-sm placeholder-slate-500 resize-none overflow-y-auto leading-relaxed"></textarea>
+                        <button id="send-btn" class="text-indigo-400 hover:text-indigo-300 p-3 font-bold text-sm transition shrink-0">
+                            <i class="fa-solid fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // 1. Core Variables
+        const employeeId = "{{ employee_id }}";
+        const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+        const wsUrl = `${wsProtocol}://${window.location.host}/api/hr/ws/interview/${employeeId}`;
+        let ws;
+
+        const chatStream = document.getElementById('chat-stream');
+        const chatInput = document.getElementById('chat-input');
+        const sendBtn = document.getElementById('send-btn');
+        const micBtn = document.getElementById('mic-btn');
+        const proctorLog = document.getElementById('proctor-log');
+        
+        let reviewTimer = null;
+        let typingTimer = null;
+        let reviewCountdown = 10;
+        let typingCountdown = 60;
+        let sessionFinalText = '';
+        let originalMaxLength = 0;
+
+        // Web Speech APIs
+        const synth = window.speechSynthesis;
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = SpeechRecognition ? new SpeechRecognition() : null;
+
+        // 2. WebSocket Initialization
+        function connectWebSocket() {
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                document.getElementById('connection-status').innerHTML = `<i class="fa-solid fa-circle-check"></i> Encrypted Connection Active`;
+                document.getElementById('connection-status').className = "flex items-center gap-2 text-emerald-400";
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === "text") {
+                    if (data.content.trim() === "") return; // Drop empty token bubbles
+                    appendMessage('ai', data.content);
+                    speakText(data.content);
+                } else if (data.type === "error") {
+                    appendMessage('ai', data.content, true);
+                }
+            };
+
+            ws.onclose = () => {
+                document.getElementById('connection-status').innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Connection Lost`;
+                document.getElementById('connection-status').className = "flex items-center gap-2 text-rose-500";
+            };
+        }
+
+        // 3. Chat Functions
+        function appendMessage(sender, text, isError = false) {
+            const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+            let html = "";
+            
+            if (sender === 'user') {
+                html = `
+                <div class="flex justify-end">
+                    <div class="flex flex-col items-end max-w-[80%]">
+                        <div class="bg-indigo-600 text-white px-5 py-3 rounded-2xl rounded-tr-sm text-[15px] shadow-sm whitespace-pre-wrap">${text}</div>
+                        <span class="text-[10px] text-slate-500 mt-1">${time}</span>
+                    </div>
+                </div>`;
+            } else {
+                const errorStyle = isError ? "border-rose-500/50 bg-rose-500/10 text-rose-200" : "border-slate-700 bg-slate-800 text-slate-200";
+                html = `
+                <div class="flex items-start gap-4 max-w-[85%]">
+                    <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center shrink-0 mt-1 shadow-sm">
+                        <i class="fa-solid fa-robot text-xs text-white"></i>
+                    </div>
+                    <div class="flex flex-col items-start w-full">
+                        <div class="${errorStyle} border px-5 py-4 rounded-2xl rounded-tl-sm text-[15px] shadow-sm whitespace-pre-wrap w-full">${text}</div>
+                        <span class="text-[10px] text-slate-500 mt-1 pl-1">${time}</span>
+                    </div>
+                </div>`;
+            }
+            
+            chatStream.insertAdjacentHTML('beforeend', html);
+            chatStream.scrollTop = chatStream.scrollHeight;
+        }
+
+        function startReviewTimer() {
+            reviewCountdown = 10;
+            micBtn.style.display = 'none'; // Hide mic
+            chatInput.removeAttribute('maxLength'); // No limits during review
+            
+            chatInput.placeholder = `Reviewing... Auto-sending in ${reviewCountdown}s. Minor edits only.`;
+            sendBtn.innerHTML = `Send (${reviewCountdown}s)`;
+            sendBtn.classList.add('bg-indigo-600', 'text-white', 'hover:bg-indigo-500');
+            sendBtn.classList.remove('text-indigo-400', 'hover:text-indigo-300');
+
+            reviewTimer = setInterval(() => {
+                reviewCountdown--;
+                if (reviewCountdown <= 0) {
+                    sendMessage();
+                } else {
+                    sendBtn.innerHTML = `Send (${reviewCountdown}s)`;
+                    chatInput.placeholder = `Reviewing... Auto-sending in ${reviewCountdown}s. Edit text now if needed.`;
+                }
+            }, 1000);
+        }
+
+        function clearTimers() {
+            if (reviewTimer) clearInterval(reviewTimer);
+            if (typingTimer) clearInterval(typingTimer);
+            reviewTimer = null;
+            typingTimer = null;
+            
+            chatInput.removeAttribute('maxLength');
+            micBtn.style.display = 'flex'; // Restore mic
+            chatInput.placeholder = "Type your answer, or use the microphone...";
+            
+            sendBtn.innerHTML = `<i class="fa-solid fa-paper-plane"></i>`;
+            sendBtn.classList.remove('bg-indigo-600', 'text-white', 'hover:bg-indigo-500');
+            sendBtn.classList.add('text-indigo-400', 'hover:text-indigo-300');
+        }
+
+        function sendMessage() {
+            clearTimers(); // Stop all timers
+            const text = chatInput.value.trim();
+            if (!text || ws.readyState !== WebSocket.OPEN) return;
+            
+            appendMessage('user', text);
+            ws.send(JSON.stringify({ type: "candidate_response", content: text }));
+            chatInput.value = '';
+            sessionFinalText = ''; // Reset memory
+            
+            if(synth.speaking) synth.cancel();
+        }
+
+        sendBtn.addEventListener('click', sendMessage);
+        
+        chatInput.addEventListener('input', () => {
+            // Typing Timer (Max 60s to answer by typing)
+            if (!typingTimer && chatInput.value.length > 0 && !micBtn.classList.contains('bg-rose-600')) {
+                typingCountdown = 60;
+                typingTimer = setInterval(() => {
+                    typingCountdown--;
+                    sendBtn.innerHTML = `Send (${typingCountdown}s)`;
+                    if (typingCountdown <= 0) sendMessage();
+                }, 1000);
+            }
+        });
+
+        chatInput.addEventListener('keydown', (e) => { 
+            if (e.key === 'Enter' && !e.shiftKey) { 
+                e.preventDefault(); 
+                sendMessage(); 
+            } 
+        });
+
+        // 4. Voice Interaction (Speech-to-Text & Text-to-Speech)
+        function speakText(text) {
+            if (!synth) return;
+            synth.cancel();
+            
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.05;
+            utterance.pitch = 1.0;
+            
+            const voices = synth.getVoices();
+            const preferredVoice = voices.find(v => v.name.includes("Google US") || v.name.includes("Samantha") || v.lang === "en-US");
+            if (preferredVoice) utterance.voice = preferredVoice;
+            
+            synth.speak(utterance);
+        }
+
+        if (recognition) {
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+
+            micBtn.addEventListener('click', () => {
+                if (micBtn.classList.contains('bg-rose-600')) {
+                    // Turn Mic OFF and start 10s review timer
+                    micBtn.classList.remove('bg-rose-600', 'animate-pulse');
+                    micBtn.classList.add('bg-slate-800', 'hover:bg-indigo-600');
+                    recognition.stop();
+                    startReviewTimer();
+                } else {
+                    // Turn Mic ON
+                    try {
+                        clearTimers();
+                        // Lock in any existing text with a space so it doesn't mash words together
+                        sessionFinalText = chatInput.value + (chatInput.value ? " " : ""); 
+                        recognition.start();
+                        micBtn.classList.remove('bg-slate-800', 'hover:bg-indigo-600');
+                        micBtn.classList.add('bg-rose-600', 'animate-pulse');
+                        chatInput.placeholder = "Listening... Click mic again to finish.";
+                    } catch(e) {}
+                }
+            });
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        // Append finalized speech chunks immediately to the memory
+                        sessionFinalText += event.results[i][0].transcript + ' ';
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+                
+                chatInput.value = sessionFinalText + interimTranscript;
+                // Auto-scroll to the bottom so you can see your long answers!
+                chatInput.scrollTop = chatInput.scrollHeight;
+            };
+
+            recognition.onend = () => {
+                // Fix: If the mic is STILL supposed to be on, the browser auto-paused it.
+                if (micBtn.classList.contains('bg-rose-600')) {
+                    // Save exactly what is on the screen right now before restarting
+                    sessionFinalText = chatInput.value + (chatInput.value && !chatInput.value.endsWith(" ") ? " " : "");
+                    try { recognition.start(); } catch(e) {}
+                } else {
+                    chatInput.placeholder = "Type your answer, or use the microphone...";
+                }
+            };
+        } else {
+            micBtn.style.display = "none";
+        }
+
+        // 5. Highly Sensitive Edge AI Proctoring
+        async function initProctoring() {
+            const video = document.getElementById('webcam');
+            logProctorEvent("info", "Loading biometric models via Edge Compute...");
+
+            const MODEL_URL = 'https://vladmandic.github.io/face-api/model/';
+            try {
+                await Promise.all([
+                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+                    faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL)
+                ]);
+                logProctorEvent("success", "Biometric detector active.");
+            } catch(e) {
+                logProctorEvent("error", "Failed to load vision models.");
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                video.srcObject = stream;
+            } catch (err) {
+                logProctorEvent("error", `Webcam Error: ${err.name}`);
+                return;
+            }
+
+            video.addEventListener('play', () => {
+                let consecutiveNoFaceCount = 0;
+
+                setInterval(async () => {
+                    if (ws.readyState !== WebSocket.OPEN) return;
+                    if (video.paused || video.ended || !video.videoWidth) return;
+
+                    const detectorOptions = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.28 });
+                    const detections = await faceapi.detectAllFaces(video, detectorOptions).withFaceLandmarks(true);
+
+                    if (detections.length === 0) {
+                        consecutiveNoFaceCount++;
+                        if (consecutiveNoFaceCount >= 2) {
+                            logProctorEvent("warning", "No face detected in frame.");
+                            reportIntegrityEvent("Candidate left camera frame.");
+                        }
+                    } else if (detections.length > 1) {
+                        consecutiveNoFaceCount = 0;
+                        logProctorEvent("warning", `Multiple faces detected (${detections.length}).`);
+                        reportIntegrityEvent(`Multiple unauthorized individuals detected (${detections.length}).`);
+                    } else {
+                        consecutiveNoFaceCount = 0;
+                        // Eye-tracking removed. Only tracks if candidate fully leaves frame or multiple faces appear.
+                    }
+                }, 1500); 
+            });
+        }
+
+        // 6. Browser-Level Proctoring (HackerRank Style)
+        let fullscreenStrikes = 0;
+        let interviewActive = false;
+        let lastStrikeTime = 0;
+
+        function triggerStrike(reason) {
+            if (!interviewActive) return; // Ignore strikes in the lobby
+
+            // Fix: Prevent double strikes if 'blur' and 'visibilitychange' fire simultaneously
+            const now = Date.now();
+            if (now - lastStrikeTime < 2000) return;
+            lastStrikeTime = now;
+
+            fullscreenStrikes++;
+            if (fullscreenStrikes >= 3) {
+                reportIntegrityEvent(`FATAL STRIKE 3: ${reason}. Auto-terminated.`);
+                endInterview(true); // Force end without asking confirmation
+            } else {
+                reportIntegrityEvent(`STRIKE ${fullscreenStrikes}: ${reason}.`);
+                logProctorEvent("error", `STRIKE ${fullscreenStrikes}: ${reason}`);
+                
+                document.getElementById('strike-message').innerText = reason;
+                document.getElementById('strike-count-display').innerText = `Strike ${fullscreenStrikes} of 3`;
+                document.getElementById('strike-overlay').classList.remove('hidden');
+            }
+        }
+
+        function initBrowserProctoring() {
+            logProctorEvent("info", "Browser environment monitoring active.");
+
+            // Handles Tab Switching & Minimizing
+            document.addEventListener("visibilitychange", () => {
+                if (document.hidden) {
+                    triggerStrike("Candidate switched tabs or minimized the window");
+                }
+            });
+
+            // Handles Opening other apps over the browser
+            window.addEventListener("blur", () => {
+                triggerStrike("Browser window lost focus");
+            });
+
+            // Handles Exiting Fullscreen via Escape key
+            document.addEventListener('fullscreenchange', () => {
+                if (!document.fullscreenElement && interviewActive) {
+                    triggerStrike("Candidate exited Full-Screen mode");
+                }
+            });
+
+            ['copy', 'paste', 'cut'].forEach(event => {
+                document.addEventListener(event, (e) => {
+                    if (interviewActive) {
+                        e.preventDefault();
+                        logProctorEvent("error", `Clipboard action '${event}' blocked.`);
+                        reportIntegrityEvent(`Attempted to ${event} text.`);
+                    }
+                });
+            });
+
+            document.addEventListener('contextmenu', (e) => {
+                if (interviewActive) {
+                    e.preventDefault();
+                    logProctorEvent("warning", "Right-click is disabled.");
+                    reportIntegrityEvent("Attempted to open context menu.");
+                }
+            });
+        }
+
+        function logProctorEvent(type, message) {
+            const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            let color = "text-slate-400";
+            if(type === "warning") color = "text-amber-400";
+            if(type === "error") color = "text-rose-400";
+            if(type === "success") color = "text-emerald-400";
+
+            proctorLog.innerHTML = `<div class="${color} py-1 border-b border-slate-800/50"><span class="text-slate-600 text-[10px] mr-2">${time}</span> ${message}</div>` + proctorLog.innerHTML;
+        }
+
+        function reportIntegrityEvent(incidentStr) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "proctor_alert", content: incidentStr }));
+            }
+        }
+
+        function endInterview(force = false) {
+            if (force || confirm("Are you sure you want to conclude the assessment?")) {
+                interviewActive = false;
+                if(ws) ws.close();
+                window.location.href = "/api/hr/portal";
+            }
+        }
+
+        document.getElementById('start-interview-btn')?.addEventListener('click', async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                stream.getTracks().forEach(track => track.stop());
+            } catch(e) {
+                alert("You must allow Camera & Microphone access to proceed.");
+                return;
+            }
+
+            try {
+                await document.documentElement.requestFullscreen();
+            } catch(e) {
+                alert("Your browser blocked full-screen mode. Please try again or switch browsers.");
+                return;
+            }
+
+            document.getElementById('candidate-lobby').classList.add('hidden');
+            document.getElementById('interview-workspace').classList.remove('hidden');
+            interviewActive = true; // Enable strikes ONLY after entering fullscreen
+            
+            synth.onvoiceschanged = () => synth.getVoices();
+            connectWebSocket();
+            initProctoring();
+            initBrowserProctoring(); 
+        });
+
+        // Handles returning to fullscreen from the Strike Overlay
+        document.getElementById('return-fullscreen-btn').addEventListener('click', async () => {
+            try {
+                await document.documentElement.requestFullscreen();
+                document.getElementById('strike-overlay').classList.add('hidden');
+                logProctorEvent("info", "Candidate returned to full-screen mode.");
+            } catch(e) {
+                alert("You must allow full-screen to continue.");
+            }
+        });
+    </script>
+</body>
+</html>

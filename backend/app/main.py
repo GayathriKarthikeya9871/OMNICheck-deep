@@ -6,6 +6,7 @@ _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _env_path = os.path.join(_backend_dir, ".env")
 load_dotenv(_env_path)
 from app.services.module1_compliance.router import compliance_router
+from app.services.module2_hr.router import hr_router
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, HTTPException
 from typing import List, Optional
@@ -66,6 +67,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 app.include_router(compliance_router, prefix="/api/compliance", tags=["Module 1: Compliance"])
+app.include_router(hr_router, prefix="/api/hr", tags=["Module 2: HR Surveillance"])
 
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").replace("localhost", "127.0.0.1")
 OLLAMA_LITE_MODEL = os.getenv("OLLAMA_LITE_MODEL", "qwen2.5:3b")

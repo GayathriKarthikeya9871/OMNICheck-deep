@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interview Report - {{ assessment.employee_name }}</title>
+    <link rel="icon" type="image/png" href="/static/logo.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 p-8">
+    <div class="max-w-5xl mx-auto">
+        
+        <div class="flex items-center justify-between mb-8">
+            <h1 class="text-3xl font-bold text-slate-900">AI Interview Report</h1>
+            <a href="/api/hr/portal" class="text-indigo-600 hover:underline font-medium">&larr; Back to Portal</a>
+        </div>
+
+        <!-- Header Card -->
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 mb-8 flex justify-between items-center">
+            <div>
+                <h2 class="text-2xl font-black text-slate-900">{{ assessment.employee_name }}</h2>
+                <p class="text-slate-500 mt-1"><i class="fa-solid fa-briefcase mr-2"></i>{{ assessment.job_role }}</p>
+                <div class="mt-4 flex gap-4">
+                    <span class="bg-slate-100 text-slate-600 px-3 py-1 rounded-md text-sm font-bold">
+                        Decision: {{ assessment.hr_decision }}
+                    </span>
+                    <span class="bg-slate-100 text-slate-600 px-3 py-1 rounded-md text-sm font-bold">
+                        Integrity: {{ assessment.proctoring_status }}
+                    </span>
+                </div>
+            </div>
+            <div class="text-center">
+                <div class="text-5xl font-black text-indigo-600 mb-1">{{ assessment.overall_suitability | int }}%</div>
+                <div class="text-xs font-bold text-slate-400 uppercase tracking-wider">Overall Score</div>
+            </div>
+        </div>
+
+        <!-- Competency Radar -->
+        <div class="grid grid-cols-4 gap-4 mb-8">
+            {% for skill, score in assessment.competency_scores.items() %}
+            <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 text-center">
+                <div class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">{{ skill }}</div>
+                <div class="text-3xl font-black text-slate-800">{{ score }}/100</div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- Detailed Q&A Breakdown -->
+        <h3 class="text-xl font-bold text-slate-800 mb-4">Detailed Question Breakdown</h3>
+        <div class="space-y-6">
+            {% for q in assessment.qa_report %}
+            <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                <div class="bg-slate-100 p-4 border-b border-slate-200 flex justify-between items-start">
+                    <div class="font-bold text-slate-800 max-w-3xl"><span class="text-indigo-600 mr-2">Q:</span>{{ q.question }}</div>
+                    <div class="bg-indigo-600 text-white font-bold px-3 py-1 rounded-full text-sm shrink-0">{{ q.score_out_of_10 }}/10</div>
+                </div>
+                <div class="p-5 grid grid-cols-2 gap-6">
+                    <div>
+                        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Candidate's Answer</div>
+                        <p class="text-sm text-slate-700 leading-relaxed">{{ q.candidate_answer }}</p>
+                    </div>
+                    <div class="bg-emerald-50 rounded-lg p-4 border border-emerald-100">
+                        <div class="text-xs font-bold text-emerald-600 uppercase tracking-wider mb-2">Ideal Expected Answer</div>
+                        <p class="text-sm text-emerald-800 leading-relaxed">{{ q.ideal_answer }}</p>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+            
+            {% if not assessment.qa_report %}
+            <div class="bg-white p-8 text-center rounded-xl border border-slate-200 text-slate-500">
+                No Q&A data available. The interview may have been aborted or terminated via Security Strikes before answers were recorded.
+            </div>
+            {% endif %}
+        </div>
+
+    </div>
+</body>
+</html>
