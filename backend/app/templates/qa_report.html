@@ -10,6 +10,13 @@
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
+        @media print {
+            body { background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            .print\:hidden { display: none !important; }
+            .shadow-sm { box-shadow: none !important; }
+            .border { border-color: #e2e8f0 !important; }
+            .break-inside-avoid { break-inside: avoid; page-break-inside: avoid; }
+        }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 p-8">
@@ -17,7 +24,12 @@
         
         <div class="flex items-center justify-between mb-8">
             <h1 class="text-3xl font-bold text-slate-900">AI Interview Report</h1>
-            <a href="/api/hr/portal" class="text-indigo-600 hover:underline font-medium">&larr; Back to Portal</a>
+            <div class="flex items-center gap-4">
+                <button onclick="window.print()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-sm transition flex items-center gap-2 print:hidden">
+                    <i class="fa-solid fa-download"></i> Download PDF
+                </button>
+                <a href="/api/hr/portal" class="text-indigo-600 hover:underline font-medium print:hidden">&larr; Back to Portal</a>
+            </div>
         </div>
 
         <!-- Header Card -->
@@ -54,7 +66,7 @@
         <h3 class="text-xl font-bold text-slate-800 mb-4">Detailed Question Breakdown</h3>
         <div class="space-y-6">
             {% for q in assessment.qa_report %}
-            <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid">
                 <div class="bg-slate-100 p-4 border-b border-slate-200 flex justify-between items-start">
                     <div class="font-bold text-slate-800 max-w-3xl"><span class="text-indigo-600 mr-2">Q:</span>{{ q.question }}</div>
                     <div class="bg-indigo-600 text-white font-bold px-3 py-1 rounded-full text-sm shrink-0">{{ q.score_out_of_10 }}/10</div>

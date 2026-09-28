@@ -177,11 +177,22 @@
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 if (data.type === "text") {
-                    if (data.content.trim() === "") return; // Drop empty token bubbles
+                    if (data.content.trim() === "") return; 
+                    
+                    // Catch the Early Termination Trigger
+                    if (data.content.includes("[END_INTERVIEW]")) {
+                        endInterview(true);
+                        return;
+                    }
+                    
+                    chatInput.placeholder = "Type your answer, or use the microphone...";
                     appendMessage('ai', data.content);
                     speakText(data.content);
+                } else if (data.type === "user_text") {
+                    appendMessage('user', data.content);
                 } else if (data.type === "error") {
                     appendMessage('ai', data.content, true);
+                    chatInput.placeholder = "Type your answer, or use the microphone...";
                 }
             };
 
@@ -263,9 +274,11 @@
             const text = chatInput.value.trim();
             if (!text || ws.readyState !== WebSocket.OPEN) return;
             
-            appendMessage('user', text);
-            ws.send(JSON.stringify({ type: "candidate_response", content: text }));
+            // Do NOT append the message yet. Show processing state while the AI cleans the grammar.
             chatInput.value = '';
+            chatInput.placeholder = "Processing and cleaning transcript...";
+            
+            ws.send(JSON.stringify({ type: "candidate_response", content: text }));
             sessionFinalText = ''; // Reset memory
             
             if(synth.speaking) synth.cancel();
@@ -311,7 +324,7 @@
         if (recognition) {
             recognition.continuous = true;
             recognition.interimResults = true;
-            recognition.lang = 'en-US';
+            recognition.lang = 'en-IN';
 
             micBtn.addEventListener('click', () => {
                 if (micBtn.classList.contains('bg-rose-600')) {
@@ -504,8 +517,12 @@
         function endInterview(force = false) {
             if (force || confirm("Are you sure you want to conclude the assessment?")) {
                 interviewActive = false;
-                if(ws) ws.close();
-                window.location.href = "/api/hr/portal";
+                // Wait 1 second to ensure final proctoring logs (like Strike 3) are sent via WebSocket
+                setTimeout(() => {
+                    if(ws) ws.close();
+                    // SECURE REDIRECT: Send candidate to the exit screen, NOT the HR Portal
+                    window.location.href = "/api/hr/completed";
+                }, 1000);
             }
         }
 
