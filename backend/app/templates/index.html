@@ -7,6 +7,8 @@
     <link rel="icon" type="image/png" href="/static/logo.png">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/htmx.org@1.9.11"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -16,6 +18,23 @@
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
         #sidebar::-webkit-scrollbar-thumb { background: #1E293B; }
+        .md-content > :first-child { margin-top: 0; }
+        .md-content > :last-child { margin-bottom: 0; }
+        .md-content p { margin: 0.5em 0; }
+        .md-content a { color: #4f46e5; text-decoration: underline; word-break: break-word; }
+        .md-content a:hover { color: #3730a3; }
+        .md-content ul { list-style: disc; padding-left: 1.5em; margin: 0.5em 0; }
+        .md-content ol { list-style: decimal; padding-left: 1.5em; margin: 0.5em 0; }
+        .md-content h1, .md-content h2, .md-content h3, .md-content h4 { font-weight: 600; margin: 0.9em 0 0.4em; }
+        .md-content h1 { font-size: 1.25em; } .md-content h2 { font-size: 1.15em; } .md-content h3, .md-content h4 { font-size: 1.05em; }
+        .md-content code { background: #f1f5f9; border-radius: 4px; padding: 0.1em 0.35em; font-size: 0.9em; }
+        .md-content pre { background: #f1f5f9; border-radius: 8px; padding: 0.75em 1em; overflow-x: auto; margin: 0.5em 0; }
+        .md-content pre code { background: transparent; padding: 0; }
+        .md-content blockquote { border-left: 3px solid #cbd5e1; padding-left: 1em; color: #475569; margin: 0.5em 0; }
+        .md-content table { display: block; overflow-x: auto; border-collapse: collapse; margin: 0.5em 0; }
+        .md-content th, .md-content td { border: 1px solid #e2e8f0; padding: 0.35em 0.7em; text-align: left; vertical-align: top; }
+        .md-content th { background: #f8fafc; font-weight: 600; }
+        .md-content hr { border: 0; border-top: 1px solid #e2e8f0; margin: 1em 0; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 antialiased h-screen overflow-hidden flex">
@@ -128,7 +147,7 @@
                         <div class="flex items-start gap-4 mb-6">
                             <img src="/static/logo.png" class="w-8 h-8 rounded-full aspect-square object-cover shadow-sm mt-1 shrink-0" alt="OC">
                             <div class="flex flex-col items-start flex-1 max-w-[90%]">
-                                <div class="text-slate-800 leading-relaxed text-[15px] whitespace-pre-wrap font-sans bg-white border border-slate-200 px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm w-full">{{ m.content }}</div>
+                                <div class="md-render text-slate-800 leading-relaxed text-[15px] whitespace-pre-wrap font-sans bg-white border border-slate-200 px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm w-full">{{ m.content }}</div>
                                 <div class="text-[10px] text-slate-400 mt-1 font-medium pl-1">{{ m.created_at.strftime('%I:%M %p') }}</div>
                             </div>
                         </div>
@@ -487,6 +506,54 @@
                 alert("Invalid Role Authorization Key.");
             }
         }
+    </script>
+
+    <script>
+        // Assistant messages -> Markdown -> DOMPurify -> DOM. User messages are never touched (plain text).
+        (function () {
+            const ASSISTANT_BUBBLE = '#chat-messages-list .md-render, #chat-messages-list div.rounded-tl-sm.w-full';
+            let hooked = false;
+
+            function libsReady() { return typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined'; }
+
+            function hookLinks() {
+                if (hooked) return;
+                hooked = true;
+                DOMPurify.addHook('afterSanitizeAttributes', function (node) {
+                    if (node.tagName === 'A' && node.hasAttribute('href')) {
+                        node.setAttribute('target', '_blank');
+                        node.setAttribute('rel', 'noopener noreferrer nofollow');
+                    }
+                });
+            }
+
+            function toSafeHtml(markdownText) {
+                const rawHtml = marked.parse(markdownText, { gfm: true, breaks: true, async: false });
+                return DOMPurify.sanitize(rawHtml, {
+                    FORBID_TAGS: ['img', 'style', 'form', 'input', 'button', 'textarea', 'select'],
+                    FORBID_ATTR: ['style']
+                });
+            }
+
+            function renderAssistantMessages() {
+                if (!libsReady()) return;  // CDN blocked: messages stay as the original escaped plain text
+                hookLinks();
+                document.querySelectorAll(ASSISTANT_BUBBLE).forEach(function (el) {
+                    if (el.dataset.mdDone || el.closest('.ai-active-thinking') || el.children.length > 0) return;
+                    const text = el.textContent;  // raw Markdown (server output is HTML-escaped text)
+                    if (!text || !text.trim()) return;
+                    el.innerHTML = toSafeHtml(text);  // sanitized above; never raw model output
+                    el.classList.remove('whitespace-pre-wrap');
+                    el.classList.add('md-content');
+                    el.dataset.mdDone = '1';
+                });
+            }
+
+            renderAssistantMessages();  // saved messages (m.content)
+            document.body.addEventListener('htmx:afterSwap', function (evt) {  // newly received responses
+                if (evt.detail && evt.detail.target && evt.detail.target.id === 'chat-messages-list') renderAssistantMessages();
+            });
+        })();
     </script>
 </body>
 </html>

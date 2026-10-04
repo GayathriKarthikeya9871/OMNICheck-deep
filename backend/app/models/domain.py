@@ -53,7 +53,6 @@ class EmployeeAssessment(Base):
     department = Column(String)
     status = Column(String, default="Pending")
     
-    # New Columns for Interview Context & Results
     resume_text = Column(Text, nullable=True)
     jd_text = Column(Text, nullable=True)
     qa_report = Column(JSON, nullable=True)
@@ -63,8 +62,6 @@ class EmployeeAssessment(Base):
     proctoring_status = Column(String, default="Clean")
     hr_decision = Column(String, default="Pending")
     created_at = Column(DateTime, default=datetime.utcnow)
-
-# --- MODULE 2: HR & RETENTION MODELS ---
 
 class JobRequirement(Base):
     __tablename__ = "job_requirements"
@@ -94,9 +91,41 @@ class ActivityLog(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     employee_id = Column(String, ForeignKey("employees.id"))
-    event_category = Column(String, index=True) # e.g., PROCTOR_FLAG, RESUME_UPLOAD
+    event_category = Column(String, index=True)
     description = Column(Text)
     risk_weight = Column(Integer, default=1)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
     employee = relationship("Employee", back_populates="activity_logs")
+
+# --- RESEARCH LAYER 2: COMPLIANCE EVIDENCE GRAPH MODELS ---
+
+class InvestigationRecord(Base):
+    __tablename__ = "investigation_records"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    objective = Column(String)
+    rulebook_text = Column(Text, nullable=True)
+    baseline_v1_result = Column(Text, nullable=True)
+    research_v2_result = Column(Text, nullable=True)
+    metrics = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class EvidenceNode(Base):
+    __tablename__ = "evidence_nodes"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    investigation_id = Column(String, ForeignKey("investigation_records.id"))
+    node_id = Column(String, index=True)
+    node_type = Column(String) # e.g., Document, Entity, Claim, Policy
+    properties = Column(JSON) # Stores provenance metadata
+
+class EvidenceEdge(Base):
+    __tablename__ = "evidence_edges"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    investigation_id = Column(String, ForeignKey("investigation_records.id"))
+    source_id = Column(String, index=True)
+    target_id = Column(String, index=True)
+    relation = Column(String) # e.g., DERIVED_FROM, SUPPORTS, CONTRADICTS
+    properties = Column(JSON, nullable=True)
