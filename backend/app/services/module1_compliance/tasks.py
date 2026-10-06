@@ -92,6 +92,18 @@ except ImportError:
 # Only these are retried by Celery. Everything else = permanent (bad input, bug) -> fail once, no retry.
 TRANSIENT_ERRORS = (requests.exceptions.RequestException, ConnectionError, TimeoutError) + _DB_TRANSIENT_ERRORS
 
+# --- Policy compiler integration: LLM-compiled structured rules executed by the deterministic rule_engine (separate modules).
+# If the modules cannot be imported the legacy policy DSL evaluator below keeps working unchanged.
+COMPILED_POLICY_ENABLED = os.getenv("COMPILED_POLICY_ENABLED", "true").lower() == "true"
+COMPILED_POLICY_STRICT_UNITS = os.getenv("COMPILED_POLICY_STRICT_UNITS", "true").lower() == "true"  # unit-less fact => INDETERMINATE, never assumed
+try:
+    from .policy_compiler import compile_policy as _compile_policy, CompilationError as _CompilationError, DEFAULT_MIN_CONFIDENCE as _COMPILER_MIN_CONFIDENCE
+    from .rule_engine import evaluate_policy as _evaluate_compiled_rules
+    HAS_POLICY_COMPILER = True
+except ImportError as _pc_err:
+    HAS_POLICY_COMPILER = False
+    logger.warning(f"Policy compiler / rule engine not importable ({_pc_err}); legacy policy DSL only.")
+
 
 class PermanentTaskError(Exception):
     """Raised for malformed input. Never retried."""
@@ -1303,7 +1315,8 @@ class RiskNodeSchema(GraphNodeSchema): type: str = "Risk"; severity: str; rule_i
 #   Entity/Transaction/Evidence --VIOLATES|SATISFIES--> PolicyRule   (deterministic rule engine)
 #   Decision --EVALUATES--> PolicyRule   Decision --BELONGS_TO--> Policy   Decision --HAS_RISK--> Risk
 #   PolicyRule --BELONGS_TO--> Policy
-ALLOWED_RELATIONS = ["DERIVED_FROM", "LINKED_FROM", "SUPPORTS", "CONTRADICTS", "VIOLATES", "SATISFIES", "EVALUATES", "HAS_RISK", "BELONGS_TO"]
+ALLOWED_RELATIONS = ["DERIVED_FROM", "LINKED_FROM", "SUPPORTS", "CONTRADICTS", "VIOLATES", "SATISFIES", "EVALUATES", "HAS_RISK", "BELONGS_TO", "CROSS_DOCUMENT_LINK"]
+#   Document --CROSS_DOCUMENT_LINK--> Document   (Phase A cross-document linking; see link_cross_documents. Not traversed by V2 retrieval; makes no compliance decision)
 
 ALLOWED_NODE_TYPES = ["Document", "Evidence", "Entity", "Transaction", "Policy", "PolicyRule", "Claim", "Decision", "Risk"]
 
@@ -2299,6 +2312,196 @@ def _gate_basis(G: nx.MultiDiGraph, nodes: List[str]) -> Tuple[List[str], List[T
         else: withheld.append((n, why))
     return keep, withheld
 
+# =====================================================================================================================
+# COMPILED POLICY: rulebook text -> policy_compiler (LLM interprets, deterministic validation) -> graph-derived facts/evidence ->
+# rule_engine (deterministic). Results live ON the existing PolicyRule / Decision / Policy nodes (no parallel policy graph).
+# The legacy DSL evaluator (evaluate_policy_rules) is kept: it decides every rule the compiler path cannot determine.
+# =====================================================================================================================
+_COMPILED_TXN_ENTITIES = ("transaction", "transactions", "expense", "expenses", "payment", "payments")
+_COMPILED_ENTITY_MAP = {"GovID": ("govid", "gov_id", "government_id"), "Phone": ("phone", "phone_number")}
+_COMPILED_TO_LEGACY = {"VIOLATION": "VIOLATION", "COMPLIANT": "SATISFIED", "NOT_APPLICABLE": "NOT_APPLICABLE", "EXEMPT": "NOT_APPLICABLE", "ACTION_REQUIRED": "INCONCLUSIVE"}
+_COMPILED_PRIORITY = ["VIOLATION", "ACTION_REQUIRED", "INDETERMINATE", "COMPLIANT", "EXEMPT", "NOT_APPLICABLE"]  # INDETERMINATE outranks a pass: a pass is never claimed over unchecked records
+_COMPILED_SEV = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+_COMPILED_REPORT_KEYS = ("evaluation_engine", "compiled_verdict", "legacy_verdict", "compiled_rules", "compiled_missing_facts", "supporting_evidence_ids", "contradicting_evidence_ids", "rulebook_provenance")
+
+def _ws_norm(s: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+def _compiled_source_span(text: str, clause: Optional[str]) -> Optional[List[int]]:
+    """[start, end) offsets of the clause inside the text handed to the compiler (whitespace-tolerant), else None."""
+    if not clause or not clause.strip(): return None
+    m = re.search(r"\s+".join(re.escape(tok) for tok in clause.split()), text)
+    return [m.start(), m.end()] if m else None
+
+def graph_to_rule_inputs(G: nx.MultiDiGraph) -> Dict[str, Any]:
+    """Smallest adapter: existing STRUCTURED graph data -> rule_engine inputs. Nothing is read from raw text and nothing is defaulted.
+    facts: Transaction nodes (role TRANSACTION only: policy limits and UNCLEAR amounts are excluded) with amount/currency and the attributes the
+    pipeline already extracted unambiguously (ref_id, date, vendor, person, expense_type), under the entity names transaction/expense/payment(s);
+    GovID / Phone Entity nodes only when a validity result exists (GovID: only when validation is fully configured).
+    Any other entity/field a compiled rule asks for is simply absent -> the engine answers INDETERMINATE.
+    evidence: only Evidence nodes that carry an explicit structured `evidence_type`; the pipeline sets none today, so evidence is NOT supplied
+    (rules that require evidence become INDETERMINATE instead of a fabricated 'missing evidence' violation).
+    Also returns node_ids[entity] aligned with each fact list so record results map back to graph nodes."""
+    facts: Dict[str, Any] = {}
+    node_ids: Dict[str, List[str]] = {}
+    txns = [(n, d) for n, d in _nodes_of_type(G, "Transaction") if d.get("amount_role") == ROLE_TXN and isinstance(d.get("amount"), (int, float))]
+    if txns:
+        recs: List[Dict[str, Any]] = []
+        for _, d in txns:
+            cur = d.get("currency") if d.get("currency") in _KNOWN_CURRENCIES else None
+            rec: Dict[str, Any] = {"amount": ({"value": d["amount"], "unit": cur} if cur else d["amount"])}
+            if cur: rec["currency"] = cur
+            for k in _ATTR_KEYS:
+                v = (d.get("attributes") or {}).get(k)
+                if v: rec[k] = v
+            recs.append(rec)
+        for alias in _COMPILED_TXN_ENTITIES:
+            facts[alias], node_ids[alias] = recs, [n for n, _ in txns]
+    for etype, aliases in _COMPILED_ENTITY_MAP.items():
+        if etype == "GovID" and not govid_validation_config()["complete"]: continue
+        ents = [(n, d) for n, d in _nodes_of_type(G, "Entity", etype) if d.get("is_valid") is not None]
+        if not ents: continue
+        recs = [{"is_valid": bool(d["is_valid"])} for _, d in ents]
+        for alias in aliases:
+            facts[alias], node_ids[alias] = recs, [n for n, _ in ents]
+    typed = [{"type": d["evidence_type"], "evidence_id": n, "file": d.get("source_file"), "location": d.get("source_location")}
+             for n, d in _investigation_evidence(G) if d.get("evidence_type")]
+    return {"facts": facts, "evidence": (typed or None), "node_ids": node_ids, "strict_units": COMPILED_POLICY_STRICT_UNITS, "evaluation_date": None, "fx_rates": None}
+
+def _compiled_top(entries: List[Dict[str, Any]]) -> Optional[str]:
+    vs = {(e.get("result") or {}).get("verdict") for e in entries if e.get("result")}
+    if not vs: return None
+    return next((v for v in _COMPILED_PRIORITY if v in vs), "INDETERMINATE")
+
+def _compiled_entry_result(entry: Dict[str, Any], rrs: List[Dict[str, Any]], node_ids: Dict[str, List[str]], eval_error: Optional[str]) -> Dict[str, Any]:
+    if entry["status"] != "VALID":  # NEEDS_REVIEW is never executed
+        return {"executed": False, "verdict": "INDETERMINATE", "counts": {}, "missing_facts": [], "violating_node_ids": [], "satisfying_node_ids": [],
+                "reasons": ["NEEDS_REVIEW compiled rule: NOT executed (ambiguous or low confidence): " + "; ".join(entry.get("ambiguities") or entry.get("issues") or ["see issues"])]}
+    if eval_error or not rrs:
+        return {"executed": False, "verdict": "INDETERMINATE", "counts": {}, "missing_facts": [], "violating_node_ids": [], "satisfying_node_ids": [],
+                "reasons": [f"compiled rule engine did not produce a result: {eval_error or 'no result returned'}"]}
+    counts = Counter(r["verdict"] for r in rrs)
+    top = next((v for v in _COMPILED_PRIORITY if counts.get(v)), "INDETERMINATE")
+    ids = node_ids.get(((entry["compiled_rule"].get("entity")) or "").lower()) or []
+    def _nodes(v: str) -> List[str]:
+        return list(dict.fromkeys(ids[r["record_index"]] for r in rrs if r["verdict"] == v and isinstance(r.get("record_index"), int) and r["record_index"] < len(ids)))
+    sev = max((r["severity"] for r in rrs if r["verdict"] == "VIOLATION" and r.get("severity")), key=lambda s_: _COMPILED_SEV.get(s_, 0), default=None)
+    return {"executed": True, "verdict": top, "counts": dict(counts), "missing_facts": sorted({m for r in rrs for m in r.get("missing_facts", [])}),
+            "reasons": list(dict.fromkeys(x for r in rrs for x in r.get("reasons", [])))[:10],
+            "exception_applied": next((r["exception_applied"] for r in rrs if r.get("exception_applied")), None),
+            "action_required": next((r["action_required"] for r in rrs if r.get("action_required")), None), "severity": sev,
+            "violating_node_ids": _nodes("VIOLATION"), "satisfying_node_ids": _nodes("COMPLIANT"),
+            "record_results": [{"record_index": r.get("record_index"), "verdict": r["verdict"], "missing_facts": r.get("missing_facts", [])} for r in rrs[:50]]}
+
+def apply_compiled_policy(G: nx.MultiDiGraph, rulebook_text: str) -> Optional[Dict[str, Any]]:
+    """Compile the (already extracted) rulebook text, attach each compiled rule to its existing PolicyRule node (with rulebook provenance), and
+    execute VALID rules deterministically against facts/evidence derived from the graph. NEEDS_REVIEW rules are never executed. Call BEFORE
+    evaluate_policy_rules, which then uses the results as authoritative where determinate. Never raises into the caller's pipeline."""
+    rule_nodes, pols = _nodes_of_type(G, "PolicyRule"), _nodes_of_type(G, "Policy")
+    if not (COMPILED_POLICY_ENABLED and HAS_POLICY_COMPILER and rule_nodes and pols and (rulebook_text or "").strip()): return None
+    pol_id, pol = pols[0]
+    rb_doc = G.nodes.get(pol.get("source_document_id"), {})
+    rulebook = {"filename": pol.get("source_file"), "document_id": pol.get("source_document_id"), "sha256": rb_doc.get("file_hash"),
+                "span_basis": "character offsets in the redacted extracted rulebook text passed to the compiler"}
+    summary: Dict[str, Any] = {"status": "NOT_COMPILED", "rulebook": rulebook,
+                               "engine": "policy_compiler (LLM interprets rule text) + rule_engine (deterministic; the only executor)"}
+    G.nodes[pol_id]["compiled_policy"] = summary
+    text = redact_pii(rulebook_text)
+    try:
+        result = _compile_policy(text, None, _COMPILER_MIN_CONFIDENCE)
+    except ValueError as e:  # e.g. rulebook too long: never truncated silently
+        summary["error"] = f"not compiled: {e}"; return summary
+    except _CompilationError as e:
+        summary["error"] = f"policy could not be compiled: {e}"; return summary
+    except Exception as e:
+        logger.exception("Policy compilation crashed (continuing with legacy engine)")
+        summary["error"] = f"unexpected compilation error: {str(e)[:200]}"; return summary
+
+    lines = [(n, _ws_norm(redact_pii(d.get("original_text") or d.get("condition") or ""))) for n, d in rule_nodes]
+    lines = [(n, ln) for n, ln in lines if len(ln) >= 8]
+    inputs = graph_to_rule_inputs(G)
+    valid = [cr for cr in result.rules if cr.status == "VALID"]  # NEEDS_REVIEW rules are not even passed to the engine
+    by_rule: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    eval_error: Optional[str] = None
+    ev: Optional[Dict[str, Any]] = None
+    if valid:
+        try:
+            ev = _evaluate_compiled_rules(valid, inputs["facts"], inputs["evidence"], inputs["evaluation_date"], False, inputs["fx_rates"], inputs["strict_units"])
+            for rr in ev["rule_results"]: by_rule[rr["rule_id"]].append(rr)
+        except Exception as e:
+            logger.exception("Compiled rule evaluation failed (legacy engine continues)")
+            eval_error = str(e)[:300]
+
+    unmapped: List[Dict[str, Any]] = []
+    for cr in result.rules:
+        src = _ws_norm(cr.source_text)
+        host, basis = None, None
+        inside = [n for n, ln in lines if src and src in ln]
+        if inside:
+            host, basis = inside[0], "clause_within_rule_line" + ("" if len(inside) == 1 else f" (first of {len(inside)} matching lines)")
+        else:
+            within = [(n, ln) for n, ln in lines if src and ln in src]
+            if within: host, basis = max(within, key=lambda x: len(x[1]))[0], "rule_line_within_clause"
+        rd = G.nodes[host] if host else {}
+        entry = {"rule_id": cr.rule_id, "policy_id": cr.policy_id, "status": cr.status, "rule_type": cr.rule_type.value, "severity": cr.severity.value, "confidence": cr.confidence,
+                 "expression": cr.expression, "source_text": cr.source_text, "source_span": _compiled_source_span(text, cr.source_text), "ambiguities": cr.ambiguities, "issues": cr.issues,
+                 "mapping_basis": basis, "compiled_rule": cr.model_dump(mode="json"),
+                 "rulebook": {**rulebook, "location": rd.get("source_location"), "line": rd.get("source_line"), "evidence_id": rd.get("source_evidence_id")}}
+        entry["result"] = _compiled_entry_result(entry, by_rule.get(cr.rule_id, []), inputs["node_ids"], eval_error)
+        if host: G.nodes[host].setdefault("compiled_rules", []).append(entry)
+        else: unmapped.append({k: entry[k] for k in ("rule_id", "status", "expression", "source_text", "source_span")} | {"verdict": entry["result"]["verdict"]})
+    summary.update(status=result.status, policy_id=result.policy_id, stats=result.stats, ambiguous_policy=result.ambiguous_policy, ambiguity_reasons=result.ambiguity_reasons[:20],
+                   needs_review_not_executed=[cr.rule_id for cr in result.rules if cr.status != "VALID"],
+                   rejected=[{"errors": x.errors, "source_text": x.source_text} for x in result.rejected][:20], unparsed_statements=result.unparsed_statements[:20],
+                   unmapped_rules=unmapped, evaluation_error=eval_error,
+                   inputs={"fact_entities": sorted(inputs["facts"]), "records": {k: len(v) for k, v in inputs["node_ids"].items()},
+                           "evidence_supplied": inputs["evidence"] is not None,
+                           "evidence_note": ("typed Evidence nodes supplied" if inputs["evidence"] is not None else "no Evidence node carries a structured evidence_type: evidence NOT supplied; evidence-requiring rules are INDETERMINATE"),
+                           "evaluation_date": (ev or {}).get("evaluation_date"), "evaluation_date_source": "engine default (today, UTC): no evaluation date is available to the pipeline",
+                           "fx_rates": "none available: cross-currency comparisons are INDETERMINATE", "strict_units": inputs["strict_units"]})
+    return summary
+
+def _compiled_node_result(rd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Authoritative compiled result for a PolicyRule node, or None (no compiled rule, NEEDS_REVIEW, or INDETERMINATE: legacy result stays authoritative)."""
+    entries = [e for e in (rd.get("compiled_rules") or []) if (e.get("result") or {}).get("executed") and e["result"]["verdict"] != "INDETERMINATE"]
+    if not entries: return None
+    raw = _compiled_top(entries)
+    viol = list(dict.fromkeys(n for e in entries for n in e["result"]["violating_node_ids"]))  # record-level outcomes of every determinate entry
+    sat = [n for n in dict.fromkeys(n for e in entries for n in e["result"]["satisfying_node_ids"]) if n not in viol]
+    parts = []
+    for e in entries:
+        r = e["result"]
+        parts.append(f"{e['expression']} => {r['verdict']} (records: {r.get('counts')}" + (f"; {'; '.join(r['reasons'][:3])}" if r.get("reasons") else "") + (f"; action required: {r['action_required']}" if r.get("action_required") else "") + ")")
+    sevs = [e["result"].get("severity") for e in entries if e["result"]["verdict"] == "VIOLATION" and e["result"].get("severity")]
+    sev = max(sevs, key=lambda s_: _COMPILED_SEV.get(s_, 0)).upper() if sevs else ("MEDIUM" if raw == "VIOLATION" else None)
+    return {"verdict": _COMPILED_TO_LEGACY[raw], "raw_verdict": raw, "violating": viol, "satisfying": sat, "severity": sev,
+            "rationale": "COMPILED RULE (rulebook text interpreted by an LLM, executed by the deterministic rule engine; authoritative for this rule): " + " | ".join(parts)}
+
+def _decision_evidence_ids(G: nx.MultiDiGraph, nodes: List[str]) -> List[str]:
+    return list(dict.fromkeys(e for n in nodes for e in _supporting_evidence_ids(G, n) if not G.nodes[e].get("context_only") and not _is_policy_source_evidence(G.nodes[e])))
+
+def _compiled_decision_fields(G: nx.MultiDiGraph, rd: Dict[str, Any], legacy: Dict[str, Any], comp: Optional[Dict[str, Any]], verdict: str,
+                              used_ev: List[str], viol: List[str], sat: List[str]) -> Dict[str, Any]:
+    """Attributes that keep legacy and compiled results distinguishable on the Decision node (plus evidence for/against and rulebook provenance)."""
+    entries = rd.get("compiled_rules") or []
+    opposite = sat if verdict == "VIOLATION" else viol if verdict == "SATISFIED" else []
+    f: Dict[str, Any] = {
+        "evaluation_engine": "compiled_rule_engine" if comp else "legacy_dsl",
+        "legacy_verdict": legacy["verdict"], "legacy_rationale": legacy["rationale"], "legacy_recognized": legacy["parsed"], "legacy_unevaluated_reason": legacy["unevaluated_reason"],
+        "compiled_verdict": _compiled_top(entries),
+        "compiled_rules": [{**{k: e.get(k) for k in ("rule_id", "status", "rule_type", "severity", "confidence", "expression", "source_text", "source_span", "mapping_basis")},
+                            "verdict": (e.get("result") or {}).get("verdict"), "executed": (e.get("result") or {}).get("executed"),
+                            "missing_facts": (e.get("result") or {}).get("missing_facts"), "reasons": ((e.get("result") or {}).get("reasons") or [])[:5]} for e in entries],
+        "compiled_missing_facts": sorted({m for e in entries for m in ((e.get("result") or {}).get("missing_facts") or [])}),
+        "supporting_evidence_ids": list(used_ev), "contradicting_evidence_ids": [e for e in _decision_evidence_ids(G, opposite) if e not in used_ev],
+        "rulebook_provenance": {"file": rd.get("source_file"), "location": rd.get("source_location"), "line": rd.get("source_line"), "document_id": rd.get("source_document_id"),
+                                "evidence_id": rd.get("source_evidence_id"), "rulebook_sha256": G.nodes.get(rd.get("source_document_id"), {}).get("file_hash"),
+                                "compiled_source_spans": [e.get("source_span") for e in entries]}}
+    if comp:
+        f["legacy_disagrees"] = legacy["verdict"] in ("VIOLATION", "SATISFIED") and legacy["verdict"] != verdict
+        f["compiled_verdict_downgraded"] = verdict != _COMPILED_TO_LEGACY.get(comp["raw_verdict"])
+    return f
+
 def evaluate_policy_rules(G: nx.MultiDiGraph) -> List[str]:
     """Evaluate every PolicyRule once. Creates Decision (+Risk on VIOLATION) nodes and VIOLATES/SATISFIES/
     EVALUATES/SUPPORTS/HAS_RISK/BELONGS_TO edges. Idempotent per rule. Returns new Decision node ids."""
@@ -2330,10 +2533,30 @@ def evaluate_policy_rules(G: nx.MultiDiGraph) -> List[str]:
             _gaps = extraction_gaps(G)
             if _gaps and verdict in ("VIOLATION", "SATISFIED", "NOT_APPLICABLE"):
                 rationale += f" WARNING: extraction incomplete for {len(_gaps)} document(s); result covers extracted data only."
+        _legacy = {"verdict": verdict, "rationale": rationale, "parsed": spec is not None, "unevaluated_reason": uneval_reason}  # legacy DSL result, always preserved on the Decision
+        _comp = _compiled_node_result(rd)  # determinate result of the deterministic compiled-rule engine (None -> legacy stays authoritative)
+        if _comp is not None:
+            verdict, rationale, severity, uneval_reason = _comp["verdict"], _comp["rationale"], _comp["severity"], None
+            viol, sat = list(_comp["violating"]), list(_comp["satisfying"])
+            _hv, _hs = bool(viol), bool(sat)
+            viol, _w1 = _gate_basis(G, viol)  # same basis gate as legacy: no VIOLATES / SATISFIES edge without non-heuristic evidence tracing to a source Document
+            sat, _w2 = _gate_basis(G, sat)
+            if _w1 or _w2:
+                rationale += f" {len(_w1) + len(_w2)} basis node(s) were NOT linked (VIOLATES/SATISFIES withheld: no qualifying supporting evidence)."
+            if verdict == "VIOLATION" and not viol:
+                verdict, rationale = "INCONCLUSIVE", rationale + " No violating node has qualifying evidence, so no violation was assigned."
+            elif verdict == "SATISFIED" and not sat and not _hv:
+                verdict, rationale = "INCONCLUSIVE", rationale + " No satisfying node could be mapped to the graph, so no pass was assigned."
+            _gaps = extraction_gaps(G)
+            if _gaps and verdict in ("VIOLATION", "SATISFIED", "NOT_APPLICABLE"):
+                rationale += f" WARNING: extraction incomplete for {len(_gaps)} document(s); result covers extracted data only."
+            rationale += f" [Legacy DSL result for this rule line: {_legacy['verdict']}; not authoritative here.]"
         logger.info(f"Policy rule {rule_id}: parsed={spec is not None} verdict={verdict} text={redact_pii(rd.get('condition', ''))[:120]!r}")
         G.nodes[rule_id]["engine_run"] = True
-        G.nodes[rule_id]["parsed"] = spec is not None  # RECOGNIZED only: text mapped to the supported rule format; says nothing about being executable
-        G.nodes[rule_id]["executable"] = spec is not None and verdict != "UNEVALUATED"  # deterministic rule AND required support/configuration available
+        G.nodes[rule_id]["legacy_parsed"] = spec is not None
+        G.nodes[rule_id]["compiled_authoritative"] = _comp is not None
+        G.nodes[rule_id]["parsed"] = (spec is not None or _comp is not None)  # RECOGNIZED only (legacy DSL or executed compiled rule): text mapped to the supported rule format; says nothing about being executable
+        G.nodes[rule_id]["executable"] = (spec is not None or _comp is not None) and verdict != "UNEVALUATED"  # deterministic rule AND required support/configuration available
         G.nodes[rule_id]["attempted"] = G.nodes[rule_id]["executable"]  # evaluation actually started (never true for UNEVALUATED)
         G.nodes[rule_id]["evaluated"] = verdict in ("VIOLATION", "SATISFIED")  # a determinate result exists
         G.nodes[rule_id]["unevaluated_reason"] = uneval_reason
@@ -2355,18 +2578,19 @@ def evaluate_policy_rules(G: nx.MultiDiGraph) -> List[str]:
                                      if not G.nodes[e].get("context_only") and not _is_policy_source_evidence(G.nodes[e])))
         for ev_id in used_ev:
             G.add_edge(ev_id, dec_id, relation="SUPPORTS")
-        _absence = spec is not None and spec["subject"] == "KEYWORD" and spec["mode"] == "REQUIRE" and verdict == "VIOLATION" and not viol
+        _absence = _comp is None and spec is not None and spec["subject"] == "KEYWORD" and spec["mode"] == "REQUIRE" and verdict == "VIOLATION" and not viol
         G.nodes[dec_id].update(violation_status=("CONFIRMED_BY_DETERMINISTIC_RULE" if (verdict == "VIOLATION" and not _absence) else
                                                  "ABSENCE_OF_REQUIRED_TEXT_WITHIN_EXTRACTED_SCOPE" if _absence else None),
                                heuristic_inputs_used=False,  # contradictions / shared terms are never inputs of a verdict
                                absence_scope_evidence_ids=([n for n, _ in _investigation_evidence(G)] if _absence else []),
-                               result_source="deterministic_policy_engine", evidence_used=used_ev, basis_node_ids=list(basis_nodes),
+                               result_source=("compiled_policy_engine" if _comp is not None else "deterministic_policy_engine"), evidence_used=used_ev, basis_node_ids=list(basis_nodes),
                                result_reason=rationale, parsed_spec=spec, rule_source_file=rd.get("source_file"), rule_source_location=rd.get("source_location"), unevaluated_reason=uneval_reason,
                                extraction_gap_documents=(extraction_gaps(G) if verdict == "INCONCLUSIVE" else []))
+        G.nodes[dec_id].update(_compiled_decision_fields(G, rd, _legacy, _comp, verdict, used_ev, viol, sat))
 
         if verdict == "VIOLATION":
             risk_data = RiskNodeSchema(node_id=_nid("risk"), severity=severity or "MEDIUM", rule_id=rule_id).model_dump()
-            G.add_node(risk_data["node_id"], **risk_data, severity_source=("rule_configured" if _RULE_SEVERITY.search(rd.get("condition", "")) else "default_when_unspecified"),
+            G.add_node(risk_data["node_id"], **risk_data, severity_source=("compiled_rule" if _comp is not None else "rule_configured" if _RULE_SEVERITY.search(rd.get("condition", "")) else "default_when_unspecified"),
                        decision_id=dec_id, basis_node_ids=list(basis_nodes), evidence_ids=list(used_ev),
                        basis="deterministic_policy_violation" if not _absence else "required_text_absent_within_extracted_scope")
             G.add_edge(dec_id, risk_data["node_id"], relation="HAS_RISK")
@@ -2755,6 +2979,1216 @@ def _detect_term_contradictions(G: nx.MultiDiGraph, remaining: int, seen: set, l
                 if c: linked.add(frozenset((t1, t2))); created += c
     return created
 
+# --- CROSS-DOCUMENT EVIDENCE LINKING (Prompt 5, Phase A) ---
+# Connects DOCUMENTS that refer to the same vendor / transaction / compliance chain, using only what the pipeline already extracted:
+# Evidence text + provenance, Transaction nodes (amount, currency), Entity nodes (GovID / Phone / Term), labelled vendor / person fields,
+# reference IDs, dates and the existing lexical similarity (bm25_scores). Edges are Document --CROSS_DOCUMENT_LINK--> Document, ONE per
+# unordered document pair, so the existing Evidence Graph is untouched and V1/V2 retrieval is unchanged (traversal never leaves a Document hub
+# except over LINKED_FROM). Every edge carries relationship_type, link_kinds, match_methods, match_score, matched_fields (with source/target
+# evidence ids + locations), conflicts, conflict_status and a plain-language link_reason.
+#   link_status EXPLICIT    = at least one STRONG anchor (typed reference ID, valid GovID, labelled vendor/person name exact match), no conflict
+#               WEAK        = weak anchor (cross-type token, phone, unverified GovID) or corroboration only (amount+date / semantic): NOT identity
+#               CONFLICTING = a positive match exists, but fields disagree (different IDs of the same type, vendor, currency, amounts)
+#               UNRESOLVED  = a signal exists (e.g. equal amount) but it is insufficient to associate the documents; never used for chains
+# Semantic (lexical) similarity is only ever a corroborator: it can never create EXPLICIT, and a semantic-only edge is flagged semantic_only.
+# match_score is rule-based (noisy-OR of signal weights), NOT a calibrated probability. No decision, verdict, VIOLATES/SATISFIES edge is created here.
+XDOC_RELATION = "CROSS_DOCUMENT_LINK"
+XDOC_EXPLICIT, XDOC_WEAK, XDOC_CONFLICT, XDOC_UNRESOLVED = "EXPLICIT", "WEAK", "CONFLICTING", "UNRESOLVED"
+
+def _env_float(name: str, default: float) -> float:
+    try: return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError): return default
+
+ENABLE_CROSS_DOCUMENT_LINKING = os.getenv("ENABLE_CROSS_DOCUMENT_LINKING", "true").lower() == "true"
+MAX_XDOC_EDGES = max(0, _env_int("MAX_XDOC_EDGES", 500))
+MAX_XDOC_DOCS = max(2, _env_int("MAX_XDOC_DOCS", 200))
+XDOC_MAX_BUCKET = max(2, _env_int("XDOC_MAX_BUCKET", 50))  # a shared value held by more documents than this (e.g. a common date) is a hub: not used to pair documents
+XDOC_MAX_SEMANTIC_DOCS = max(2, _env_int("XDOC_MAX_SEMANTIC_DOCS", 60))  # BM25 matrix is O(N^2): skipped (and reported) above this many documents
+XDOC_SEMANTIC_THRESHOLD = _env_float("XDOC_SEMANTIC_THRESHOLD", 0.5)  # uncalibrated normalized BM25 overlap in [0,1]
+XDOC_TXN_ROLES = ("PURCHASE_ORDER", "INVOICE", "PAYMENT", "APPROVAL")
+XDOC_ROLE_RANK = {"PURCHASE_ORDER": 0, "INVOICE": 1, "PAYMENT": 2, "APPROVAL": 3}
+XDOC_ROLE_CUES = {"INVOICE": re.compile(r'(?i)\b(invoice|inv|bill)\b'),
+                  "PURCHASE_ORDER": re.compile(r'(?i)\b(purchase\s*order|po)\b'),
+                  "PAYMENT": re.compile(r'(?i)\b(payment|paid|remittance|utr|receipt|voucher|bank\s+statement|neft|rtgs|upi)\b'),
+                  "APPROVAL": re.compile(r'(?i)\b(approval|approved|approver|authori[sz]ation|authori[sz]ed|sign[\s-]*off)\b')}
+_XDOC_TOK = r'(?P<marker>(?:\s*(?:(?:no|num(?:ber)?|id|utr|txn|ref(?:erence)?)\b\.?|#))*)\s*[:=#\-]?\s*(?P<tok>[A-Z0-9][A-Z0-9\-/_]{2,31})'  # lead-in words ("Payment UTR: X", "Invoice No. X") are skipped, not mistaken for the ID
+_XDOC_REF_LABELLED = {"invoice": re.compile(r'(?i)\b(?:invoice|inv)\b' + _XDOC_TOK),
+                      "purchase_order": re.compile(r'(?i)\b(?:purchase\s*order|po)\b' + _XDOC_TOK),
+                      "payment": re.compile(r'(?i)\b(?:utr|txn|transaction|payment|receipt|voucher|remittance|cheque)\b' + _XDOC_TOK),
+                      "approval": re.compile(r'(?i)\b(?:approval|approved|authori[sz]ation)\b' + _XDOC_TOK),
+                      "ref": re.compile(r'(?i)\b(?:ref(?:erence)?)\b' + _XDOC_TOK)}
+_XDOC_REF_PREFIXED = re.compile(r'(?<![A-Za-z0-9])(?P<pfx>INV|PO|UTR|TXN|PAY|APPR|REF)[-/_]?\d[A-Z0-9\-/_]{1,28}(?![A-Za-z0-9])')  # case-sensitive on purpose
+_XDOC_PREFIX_TYPE = {"INV": "invoice", "PO": "purchase_order", "UTR": "payment", "TXN": "payment", "PAY": "payment", "APPR": "approval", "REF": "ref"}
+_XDOC_COMPANY_SUFFIX = re.compile(r'\b(?:pvt|private|ltd|limited|inc|incorporated|llc|llp|corp|corporation|co|company)\b')
+_XDOC_WEIGHTS = {"strong_id": 0.9, "strong_govid": 0.9, "strong_party": 0.6, "weak_anchor": 0.35, "amount": 0.15, "date": 0.1, "term": 0.05}
+
+def _xdoc_norm_ref(tok: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', tok.upper())
+
+def _xdoc_norm_party(v: str) -> str:
+    s = re.sub(r'[^a-z0-9& ]', ' ', v.lower())
+    return re.sub(r'\s+', ' ', _XDOC_COMPANY_SUFFIX.sub(' ', s)).strip()
+
+def _xdoc_extract_refs(text: str) -> List[Tuple[str, str, str]]:
+    """(type, normalized id, matched text). Labelled patterns (invoice / PO / payment / approval / generic reference) plus upper-case prefixed IDs (INV-001, PO-77, UTR...).
+    A token must contain a digit, must not be a date, and a bare number without marker/letters/colon is skipped (it is probably an amount)."""
+    out: List[Tuple[str, str, str]] = []
+    for rtype, rx in _XDOC_REF_LABELLED.items():
+        for m in rx.finditer(text or ""):
+            tok = m.group("tok")
+            if not re.search(r'\d', tok) or any(p.fullmatch(tok) for p, _ in _DATE_PATTERNS): continue
+            if not m.group("marker") and not re.search(r'[A-Za-z]', tok) and ":" not in m.group(0): continue
+            norm = _xdoc_norm_ref(tok)
+            if len(norm) >= 3: out.append((rtype, norm, m.group(0)))
+    for m in _XDOC_REF_PREFIXED.finditer(text or ""):
+        norm = _xdoc_norm_ref(m.group(0))
+        if len(norm) >= 3: out.append((_XDOC_PREFIX_TYPE[m.group("pfx")], norm, m.group(0)))
+    return out
+
+def _xdoc_extract_parties(text: str) -> Dict[str, List[Tuple[str, str]]]:
+    """Labelled vendor / person fields (same label vocabulary as _extract_txn_attributes) -> (normalized name, raw value)."""
+    out: Dict[str, List[Tuple[str, str]]] = {"vendor": [], "person": []}
+    for key in ("vendor", "person"):
+        for m in re.finditer(rf'(?i)\b{_ATTR_LABELS[key]}\s*[:=]\s*([^|¦;\n]+?)(?=\s*(?:[|¦;\n]|$|\b(?:{_ALL_LABELS})\s*[:=]))', text or ""):
+            raw = re.sub(r'\s+', ' ', m.group(1)).strip()[:60]
+            if not raw or MONEY_PATTERN.fullmatch(raw): continue
+            norm = _xdoc_norm_party(raw)
+            if len(norm) >= 3 and not norm.isdigit(): out[key].append((norm, raw))
+    return out
+
+def _xdoc_infer_role(G: nx.MultiDiGraph, doc_id: str, fname: str, texts: List[str]) -> Tuple[str, str, Dict[str, int]]:
+    """Document role from filename / wording cues. A HINT used only to name the relationship; linking never depends on it. Ambiguous or cue-less => UNKNOWN."""
+    d = G.nodes[doc_id]
+    if d.get("role") == "RULEBOOK" or d.get("policy_context"): return "POLICY", "document flagged as policy/rulebook context", {}
+    name = re.sub(r'[_\-.]+', ' ', fname or "")
+    body = "\n".join(texts)[:20000]
+    scores = {r: 3 * len(rx.findall(name)) + min(5, len(rx.findall(body))) for r, rx in XDOC_ROLE_CUES.items()}
+    scores = {r: s for r, s in scores.items() if s}
+    name_roles = [r for r, rx in XDOC_ROLE_CUES.items() if rx.search(name)]
+    if len(name_roles) == 1: return name_roles[0], "filename cue", scores
+    if not scores: return "UNKNOWN", "no role cue found", scores
+    ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    if len(ranked) > 1 and ranked[1][1] * 2 > ranked[0][1]: return "UNKNOWN", "ambiguous role cues", scores
+    return ranked[0][0], "wording cues", scores
+
+def _xdoc_prov(G: nx.MultiDiGraph, ev_id: str, doc_id: str, matched: Any) -> Dict[str, Any]:
+    return {"document_id": doc_id, "filename": G.nodes[doc_id].get("filename"), "evidence_id": ev_id, "location": G.nodes[ev_id].get("source_location"), "matched_text": str(matched)[:80]}
+
+def _xdoc_build_profiles(G: nx.MultiDiGraph) -> Dict[str, Dict[str, Any]]:
+    """Per-document reference profile built from investigation Evidence (policy / context-only evidence excluded). Every value keeps its provenance list."""
+    ev_by_doc: Dict[str, List[str]] = defaultdict(list)
+    for ev_id, d in _investigation_evidence(G):
+        if d.get("context_only"): continue
+        for s in _evidence_source_docs(G, ev_id): ev_by_doc[s["document_id"]].append(ev_id)
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for doc_id, dd in sorted(_nodes_of_type(G, "Document"), key=lambda kv: (str(kv[1].get("filename")), kv[0])):
+        evs = sorted(ev_by_doc.get(doc_id, []))
+        texts = [G.nodes[e].get("text") or "" for e in evs]
+        role, basis, scores = _xdoc_infer_role(G, doc_id, dd.get("filename") or "", texts)
+        G.nodes[doc_id].update(xdoc_role=role, xdoc_role_basis=basis, xdoc_role_scores=scores)
+        if role == "POLICY" or not evs: continue
+        p: Dict[str, Any] = {"doc_id": doc_id, "filename": dd.get("filename"), "role": role, "evidence_ids": evs, "text": "\n".join(texts)[:20000],
+                             "ids": defaultdict(list), "dates": defaultdict(list), "amounts": defaultdict(list), "vendor": defaultdict(list), "person": defaultdict(list),
+                             "entities": defaultdict(list), "entity_meta": {}}
+        for ev, text in zip(evs, texts):
+            for rtype, norm, raw in _xdoc_extract_refs(text): p["ids"][(rtype, norm)].append(_xdoc_prov(G, ev, doc_id, raw))
+            for pat, fmt in _DATE_PATTERNS:
+                for m in pat.finditer(text):
+                    try: p["dates"][fmt(m)].append(_xdoc_prov(G, ev, doc_id, m.group(0)))
+                    except (KeyError, ValueError): pass
+            for key, vals in _xdoc_extract_parties(text).items():
+                for norm, raw in vals: p[key][norm].append(_xdoc_prov(G, ev, doc_id, raw))
+            for _, tgt, ed in G.out_edges(ev, data=True):
+                if ed.get("relation") != "SUPPORTS": continue
+                td = G.nodes[tgt]
+                if td.get("type") == "Transaction" and not _is_policy_role(td.get("amount_role")) and td.get("amount") is not None:
+                    p["amounts"][(td.get("currency"), td.get("amount"))].append(_xdoc_prov(G, ev, doc_id, f"{td.get('currency')} {td.get('amount')}"))
+                elif td.get("type") == "Entity" and td.get("entity_type") in ("GovID", "Phone", "Term"):
+                    p["entities"][tgt].append(_xdoc_prov(G, ev, doc_id, "[REDACTED]" if td.get("entity_type") != "Term" else td.get("value")))
+                    p["entity_meta"][tgt] = (td.get("entity_type"), td.get("is_valid"), td.get("value") if td.get("entity_type") == "Term" else f"{td.get('entity_type')}:{td.get('value_hash') or tgt}")
+        profiles[doc_id] = p
+    return profiles
+
+def _xdoc_semantic_matrix(profiles: Dict[str, Dict[str, Any]]) -> Optional[Dict[Tuple[str, str], float]]:
+    """Symmetric normalized BM25 overlap (existing bm25_scores): mean of score(A->B)/score(A->A) and score(B->A)/score(B->B), clamped to [0,1]. Lexical, NOT identity."""
+    ids = list(profiles)
+    if len(ids) < 2 or len(ids) > XDOC_MAX_SEMANTIC_DOCS: return None
+    texts = [profiles[i]["text"] for i in ids]
+    rows = [bm25_scores(profiles[i]["text"], texts) for i in ids]
+    sim: Dict[Tuple[str, str], float] = {}
+    for a in range(len(ids)):
+        for b in range(a + 1, len(ids)):
+            saa, sbb = rows[a][a], rows[b][b]
+            ab = min(1.0, rows[a][b] / saa) if saa > 0 else 0.0
+            ba = min(1.0, rows[b][a] / sbb) if sbb > 0 else 0.0
+            sim[(ids[a], ids[b])] = round((ab + ba) / 2, 4)
+    return sim
+
+def _xdoc_complementary(ra: str, rb: str) -> bool:
+    return ra in XDOC_TXN_ROLES and rb in XDOC_TXN_ROLES and ra != rb
+
+def _xdoc_evaluate_pair(G: nx.MultiDiGraph, pa: Dict[str, Any], pb: Dict[str, Any], sim: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Signals -> status. Returns None when there is nothing worth recording (no fabricated relationship)."""
+    sig: List[Dict[str, Any]] = []
+    def add(field, kind, strength, method, value, provs_a, provs_b, weight, link_kind=None):
+        sig.append({"field": field, "kind": kind, "strength": strength, "method": method, "value": value, "weight": weight, "link_kind": link_kind,
+                    "source": provs_a[:5], "target": provs_b[:5]})
+    strong_tokens = set()
+    for key in sorted(set(pa["ids"]) & set(pb["ids"])):
+        rtype, norm = key
+        strong = rtype != "ref" or len(norm) >= 5
+        add(f"{rtype}_id", "anchor", "strong" if strong else "weak", "identifier_exact_match", norm, pa["ids"][key], pb["ids"][key], _XDOC_WEIGHTS["strong_id" if strong else "weak_anchor"], "SAME_TRANSACTION_REFERENCE")
+        if strong: strong_tokens.add(norm)
+    for (t1, n1) in sorted(pa["ids"]):
+        for (t2, n2) in sorted(pb["ids"]):
+            if n1 == n2 and t1 != t2 and "ref" in (t1, t2) and len(n1) >= 5 and n1 not in strong_tokens:
+                add("reference_token", "anchor", "weak", "identifier_token_cross_type", n1, pa["ids"][(t1, n1)], pb["ids"][(t2, n2)], _XDOC_WEIGHTS["weak_anchor"], "SAME_TRANSACTION_REFERENCE")
+    terms: List[str] = []
+    for ent in sorted(set(pa["entities"]) & set(pb["entities"])):
+        etype, valid, label = pa["entity_meta"][ent]
+        if etype == "GovID":
+            strong = valid is True
+            add("govid", "anchor", "strong" if strong else "weak", "shared_govid_entity" if strong else "shared_govid_entity_unverified", "[REDACTED_GOVID]", pa["entities"][ent], pb["entities"][ent],
+                _XDOC_WEIGHTS["strong_govid" if strong else "weak_anchor"], "SAME_ENTITY_IDENTIFIER")
+        elif etype == "Phone":
+            add("phone", "anchor", "weak", "shared_phone_entity", "[REDACTED_PHONE]", pa["entities"][ent], pb["entities"][ent], _XDOC_WEIGHTS["weak_anchor"], "SAME_ENTITY_IDENTIFIER")
+        else:
+            terms.append(ent)
+    for ent in terms[:5]:
+        add("shared_term", "corroborator", "weak", "title_case_term_co_mention", pa["entity_meta"][ent][2], pa["entities"][ent], pb["entities"][ent], _XDOC_WEIGHTS["term"])
+    for fld, kind in (("vendor", "SAME_VENDOR"), ("person", "SAME_PERSON")):
+        for norm in sorted(set(pa[fld]) & set(pb[fld])):
+            add(fld, "anchor", "strong", "structured_field_exact_match", norm, pa[fld][norm], pb[fld][norm], _XDOC_WEIGHTS["strong_party"], kind)
+    for amt in sorted(set(pa["amounts"]) & set(pb["amounts"]), key=str):
+        add("amount", "corroborator", "weak", "amount_currency_exact_match", f"{amt[0]} {amt[1]}", pa["amounts"][amt], pb["amounts"][amt], _XDOC_WEIGHTS["amount"])
+    for dt in sorted(set(pa["dates"]) & set(pb["dates"])):
+        add("date", "corroborator", "weak", "date_exact_match", dt, pa["dates"][dt], pb["dates"][dt], _XDOC_WEIGHTS["date"])
+    if sim is not None and sim >= XDOC_SEMANTIC_THRESHOLD:
+        sig.append({"field": "semantic_similarity", "kind": "corroborator", "strength": "weak", "method": "bm25_normalized_lexical_overlap", "value": sim, "weight": round(0.2 * sim, 4),
+                    "link_kind": None, "source": [], "target": []})
+    if not sig: return None
+    strong_a = [s for s in sig if s["kind"] == "anchor" and s["strength"] == "strong"]
+    weak_a = [s for s in sig if s["kind"] == "anchor" and s["strength"] == "weak"]
+    corr = {s["field"] for s in sig if s["kind"] == "corroborator"}
+    comp = _xdoc_complementary(pa["role"], pb["role"])
+    semantic_only = False
+    if strong_a: positive = XDOC_EXPLICIT
+    elif weak_a: positive = XDOC_WEAK
+    elif {"amount", "date"} <= corr or ("semantic_similarity" in corr and len(corr) > 1): positive = XDOC_WEAK
+    elif corr == {"semantic_similarity"} and comp: positive, semantic_only = XDOC_WEAK, True
+    elif "amount" in corr and comp: positive = XDOC_UNRESOLVED
+    else: return None
+    conflicts: List[Dict[str, Any]] = []
+    if positive != XDOC_UNRESOLVED:
+        for rtype in sorted({t for t, _ in pa["ids"]} & {t for t, _ in pb["ids"]}):
+            if rtype == "ref": continue
+            ia, ib = {n for t, n in pa["ids"] if t == rtype}, {n for t, n in pb["ids"] if t == rtype}
+            if ia and ib and not (ia & ib): conflicts.append({"field": f"{rtype}_id", "kind": "different_identifiers", "source_values": sorted(ia)[:5], "target_values": sorted(ib)[:5]})
+        for fld in ("vendor", "person"):
+            if pa[fld] and pb[fld] and not (set(pa[fld]) & set(pb[fld])): conflicts.append({"field": fld, "kind": "different_names", "source_values": sorted(pa[fld])[:5], "target_values": sorted(pb[fld])[:5]})
+        ca, cb = {c for c, _ in pa["amounts"]}, {c for c, _ in pb["amounts"]}
+        if ca and cb and not (ca & cb): conflicts.append({"field": "currency", "kind": "different_currencies", "source_values": sorted(map(str, ca)), "target_values": sorted(map(str, cb))})
+        for cur in sorted(ca & cb, key=str):
+            va, vb = {a for c, a in pa["amounts"] if c == cur}, {a for c, a in pb["amounts"] if c == cur}
+            if va and vb and not (va & vb): conflicts.append({"field": "amount", "kind": "different_amounts_same_currency", "currency": cur, "source_values": sorted(va)[:5], "target_values": sorted(vb)[:5],
+                                                               "note": "may be a legitimate partial payment / line-item difference; requires reconciliation"})
+    status = XDOC_CONFLICT if conflicts else positive
+    score = 1.0
+    for s in sig: score *= (1.0 - min(0.99, s["weight"]))
+    return {"signals": sig, "positive_status": positive, "status": status, "conflicts": conflicts, "semantic_only": semantic_only, "score": round(1.0 - score, 4), "complementary_roles": comp}
+
+def _xdoc_pair_order(pa: Dict[str, Any], pb: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ka = (XDOC_ROLE_RANK.get(pa["role"], 9), str(pa["filename"]), pa["doc_id"])
+    kb = (XDOC_ROLE_RANK.get(pb["role"], 9), str(pb["filename"]), pb["doc_id"])
+    return (pa, pb) if ka <= kb else (pb, pa)
+
+def _xdoc_relationship(sr: Dict[str, Any], tr: Dict[str, Any], kinds: List[str], status: str) -> str:
+    if status == XDOC_UNRESOLVED: return "UNRESOLVED_ASSOCIATION"
+    if "SAME_TRANSACTION_REFERENCE" in kinds:
+        if sr in XDOC_TXN_ROLES and tr in XDOC_TXN_ROLES: return f"{sr}_TO_{tr}" if sr != tr else f"SAME_ROLE_{sr}"
+        return "RELATED_TRANSACTION_DOCUMENTS"
+    for k in ("SAME_VENDOR", "SAME_PERSON", "SAME_ENTITY_IDENTIFIER"):
+        if k in kinds: return k
+    return "POSSIBLY_RELATED_DOCUMENTS"
+
+def _xdoc_reason(signals: List[Dict[str, Any]], conflicts: List[Dict[str, Any]], status: str, semantic_only: bool) -> str:
+    parts = [f"{s['field']} '{s['value']}' via {s['method']} ({s['strength']} {s['kind']})" for s in signals if s["field"] != "semantic_similarity"]
+    sem = [s for s in signals if s["field"] == "semantic_similarity"]
+    if sem: parts.append(f"lexical similarity {sem[0]['value']} (corroboration only; not identity)")
+    txt = "; ".join(parts[:8]) + (f"; +{len(parts) - 8} more" if len(parts) > 8 else "")
+    if conflicts: txt += " | CONFLICTS: " + "; ".join(f"{c['field']} ({c['kind']})" for c in conflicts)
+    if semantic_only: txt += " | semantic similarity alone does not show the documents refer to the same entity or transaction"
+    if status == XDOC_UNRESOLVED: txt += " | insufficient to associate the documents; no identifier or party anchor matched"
+    return txt
+
+def _xdoc_unresolved_references(profiles: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Typed references (e.g. a PO number inside an invoice) whose target document is not among the supplied documents. Own-role IDs and generic 'ref' are skipped."""
+    tokens_by_doc = {d: {n for _, n in p["ids"]} for d, p in profiles.items()}
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for did, p in profiles.items():
+        if p["role"] not in XDOC_TXN_ROLES: continue
+        own = p["role"].lower()
+        for (rtype, norm), provs in sorted(p["ids"].items()):
+            if rtype in ("ref", own) or any(norm in toks for d, toks in tokens_by_doc.items() if d != did): continue
+            out.setdefault(did, []).append({"reference_type": rtype, "reference": norm, "reason": "referenced document/identifier is not present in any other supplied document", "provenance": provs[:3]})
+    return out
+
+def link_cross_documents(G: nx.MultiDiGraph) -> Dict[str, Any]:
+    """Builds Document --CROSS_DOCUMENT_LINK--> Document edges (idempotent: previous cross-document edges/annotations are replaced). Phase A only: no decision,
+    no verdict, no VIOLATES/SATISFIES, no policy link. Returns a summary (also kept in G.graph['cross_document_summary'])."""
+    summary: Dict[str, Any] = {"status": "OK", "phase": "A", "edges_created": 0, "by_status": {}, "chains": 0, "documents_profiled": 0, "unresolved_references": 0, "truncated": False, "notes": []}
+    G.remove_edges_from([(u, v, k) for u, v, k, d in list(G.edges(keys=True, data=True)) if d.get("relation") == XDOC_RELATION])
+    for n, _ in _nodes_of_type(G, "Document"):
+        for key in ("xdoc_chain_id", "xdoc_unresolved_references", "xdoc_identifiers", "xdoc_vendors", "xdoc_persons"): G.nodes[n].pop(key, None)
+    if not ENABLE_CROSS_DOCUMENT_LINKING:
+        summary["status"] = "DISABLED"; G.graph["cross_document_summary"] = summary; return summary
+    profiles = _xdoc_build_profiles(G)
+    summary["documents_profiled"] = len(profiles)
+    if len(profiles) > MAX_XDOC_DOCS:
+        summary["status"] = "SKIPPED"; summary["notes"].append(f"{len(profiles)} documents exceed MAX_XDOC_DOCS={MAX_XDOC_DOCS}; no cross-document links created")
+        G.graph["cross_document_summary"] = summary; return summary
+    for did, p in profiles.items():
+        G.nodes[did]["xdoc_identifiers"] = [{"type": t, "value": n} for t, n in sorted(p["ids"])][:100]
+        G.nodes[did]["xdoc_vendors"] = sorted(p["vendor"])[:20]; G.nodes[did]["xdoc_persons"] = sorted(p["person"])[:20]
+    unresolved = _xdoc_unresolved_references(profiles)
+    for did, items in unresolved.items(): G.nodes[did]["xdoc_unresolved_references"] = items[:50]
+    summary["unresolved_references"] = sum(len(v) for v in unresolved.values())
+    index: Dict[Tuple[str, Any], set] = defaultdict(set)
+    for did, p in profiles.items():
+        for _, n in p["ids"]: index[("token", n)].add(did)
+        for e in p["entities"]: index[("entity", e)].add(did)
+        for f in ("vendor", "person", "dates", "amounts"):
+            for v in p[f]: index[(f, v)].add(did)
+    pairs: set = set()
+    hubs = 0
+    for (_k, _v), docs in index.items():
+        if len(docs) < 2: continue
+        if len(docs) > XDOC_MAX_BUCKET: hubs += 1; continue
+        ds = sorted(docs)
+        for i in range(len(ds)):
+            for j in range(i + 1, len(ds)): pairs.add((ds[i], ds[j]))
+    if hubs: summary["notes"].append(f"{hubs} shared value(s) held by more than {XDOC_MAX_BUCKET} documents were not used to pair documents (hub values)")
+    sims = _xdoc_semantic_matrix(profiles)
+    if sims is None:
+        summary["semantic"] = {"status": "SKIPPED", "reason": f"needs 2..{XDOC_MAX_SEMANTIC_DOCS} documents, got {len(profiles)}"}
+    else:
+        summary["semantic"] = {"status": "COMPUTED", "method": "bm25_normalized_lexical_overlap", "threshold": XDOC_SEMANTIC_THRESHOLD, "basis": "uncalibrated lexical overlap; never proof of identity"}
+        for (a, b), s in sims.items():
+            if s >= XDOC_SEMANTIC_THRESHOLD and _xdoc_complementary(profiles[a]["role"], profiles[b]["role"]): pairs.add((a, b))
+    results = []
+    for a, b in sorted(pairs):
+        sim = None
+        if sims is not None: sim = sims.get((a, b), sims.get((b, a)))
+        ev = _xdoc_evaluate_pair(G, profiles[a], profiles[b], sim)
+        if ev: results.append((a, b, ev))
+    prio = {XDOC_EXPLICIT: 0, XDOC_CONFLICT: 1, XDOC_WEAK: 2, XDOC_UNRESOLVED: 3}
+    results.sort(key=lambda r: (prio[r[2]["status"]], -r[2]["score"], r[0], r[1]))
+    if len(results) > MAX_XDOC_EDGES:
+        summary["truncated"] = True; summary["notes"].append(f"{len(results)} candidate links exceed MAX_XDOC_EDGES={MAX_XDOC_EDGES}; weakest dropped")
+        results = results[:MAX_XDOC_EDGES]
+    by_status: Counter = Counter()
+    for a, b, ev in results:
+        s, t = _xdoc_pair_order(profiles[a], profiles[b])
+        kinds = sorted({x["link_kind"] for x in ev["signals"] if x["link_kind"]})
+        strong_kinds = sorted({x["link_kind"] for x in ev["signals"] if x["link_kind"] and x["kind"] == "anchor" and x["strength"] == "strong"})  # a weak cross-type token must not make a link transaction-level
+        status = ev["status"]
+        sigs = ev["signals"]
+        ev_ids = sorted(set(s["evidence_ids"]) | set(t["evidence_ids"]))
+        used = sorted({p_["evidence_id"] for x in sigs for p_ in x["source"] + x["target"]})
+        sem = next((x["value"] for x in sigs if x["field"] == "semantic_similarity"), None)
+        G.add_edge(s["doc_id"], t["doc_id"], relation=XDOC_RELATION, method="cross_document_linking", phase="A",
+                   link_status=status, positive_status=ev["positive_status"], conflict_status=("CONFLICTING" if ev["conflicts"] else "NONE"), conflicts=ev["conflicts"],
+                   match_strength=("strong" if any(x["kind"] == "anchor" and x["strength"] == "strong" for x in sigs) else ("none" if status == XDOC_UNRESOLVED else "weak")),
+                   match_score=ev["score"], score_basis="rule_based_noisy_or_of_signal_weights; not a calibrated probability",
+                   relationship_type=_xdoc_relationship(s["role"], t["role"], strong_kinds or kinds, status), link_kinds=kinds, strong_link_kinds=strong_kinds,
+                   match_methods=sorted({x["method"] for x in sigs}), matched_fields=sigs,
+                   semantic_only=ev["semantic_only"], semantic_similarity=sem, semantic_proof_of_identity=False,
+                   source_document_id=s["doc_id"], target_document_id=t["doc_id"], source_filename=s["filename"], target_filename=t["filename"],
+                   source_role=s["role"], target_role=t["role"], evidence_ids=used or ev_ids,
+                   source_refs=[{"evidence_id": e, "documents": _evidence_source_docs(G, e)} for e in used[:20]],
+                   link_reason=_xdoc_reason(sigs, ev["conflicts"], status, ev["semantic_only"]),
+                   uncertainty_reason=("" if status == XDOC_EXPLICIT else {XDOC_WEAK: "no strong identifier / party anchor; relationship is a possibility, not established",
+                                                                         XDOC_CONFLICT: "a match exists but fields disagree; requires reconciliation against source records",
+                                                                         XDOC_UNRESOLVED: "signal insufficient to associate the documents"}[status]),
+                   heuristic=status != XDOC_EXPLICIT, confirmed=False, can_create_violation=False, decision_made=False)
+        by_status[status] += 1
+    summary["edges_created"] = len(results); summary["by_status"] = dict(by_status)
+    summary["chains"] = len(_assign_xdoc_chains(G))
+    G.graph["cross_document_summary"] = summary
+    return summary
+
+def _xdoc_edges(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    return [dict(d, source_id=u, target_id=v) for u, v, d in G.edges(data=True) if d.get("relation") == XDOC_RELATION]
+
+def _assign_xdoc_chains(G: nx.MultiDiGraph) -> Dict[str, List[str]]:
+    """Compliance chains = connected components of EXPLICIT, transaction-level links (SAME_TRANSACTION_REFERENCE). Vendor/person/identifier-only links, weak,
+    conflicting and unresolved links never merge documents into a chain (one vendor has many transactions). Sets Document.xdoc_chain_id (components of >= 2 documents)."""
+    parent: Dict[str, str] = {}
+    def find(x):
+        while parent.setdefault(x, x) != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for e in _xdoc_edges(G):
+        if e.get("link_status") == XDOC_EXPLICIT and "SAME_TRANSACTION_REFERENCE" in _xdoc_strong_kinds(e): parent[find(e["source_id"])] = find(e["target_id"])
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for n in list(parent): groups[find(n)].append(n)
+    chains: Dict[str, List[str]] = {}
+    for members in groups.values():
+        if len(members) < 2: continue
+        key = "|".join(sorted(f"{G.nodes[m].get('file_hash')}:{G.nodes[m].get('filename')}" for m in members))
+        cid = "xchain_" + hashlib.sha256(key.encode("utf-8", "ignore")).hexdigest()[:12]
+        chains[cid] = sorted(members)
+        for m in members: G.nodes[m]["xdoc_chain_id"] = cid
+    return chains
+
+# --- CROSS-DOCUMENT QUERIES (read-only; answer 'which documents belong together' without deciding compliance) ---
+def query_cross_document_links(G: nx.MultiDiGraph, doc_id: Optional[str] = None, statuses: Optional[List[str]] = None, link_kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Cross-document links, optionally for one document / status set / link kind (SAME_VENDOR, SAME_TRANSACTION_REFERENCE, SAME_PERSON, SAME_ENTITY_IDENTIFIER)."""
+    out = []
+    for e in _xdoc_edges(G):
+        if doc_id and doc_id not in (e["source_id"], e["target_id"]): continue
+        if statuses and e.get("link_status") not in statuses: continue
+        if link_kind and link_kind not in (e.get("link_kinds") or []): continue
+        out.append(e)
+    return out
+
+def query_documents_for_vendor(G: nx.MultiDiGraph, vendor: str, explicit_only: bool = True) -> List[Dict[str, Any]]:
+    """Documents carrying the labelled vendor name (normalized: case, punctuation and company suffixes ignored). Exact normalized match only."""
+    norm = _xdoc_norm_party(vendor or "")
+    if not norm: return []
+    return [{"document_id": n, "filename": d.get("filename"), "role": d.get("xdoc_role")} for n, d in _nodes_of_type(G, "Document") if norm in (d.get("xdoc_vendors") or [])]
+
+def query_related_documents(G: nx.MultiDiGraph, doc_id: str, include_weak: bool = False) -> List[Dict[str, Any]]:
+    """Documents linked to doc_id. EXPLICIT only by default; include_weak adds WEAK / CONFLICTING / UNRESOLVED (each keeps its status and reason)."""
+    sts = None if include_weak else [XDOC_EXPLICIT]
+    return [{"document_id": e["target_id"] if e["source_id"] == doc_id else e["source_id"], "link_status": e["link_status"], "relationship_type": e["relationship_type"],
+             "link_kinds": e["link_kinds"], "match_score": e["match_score"], "conflict_status": e["conflict_status"], "link_reason": e["link_reason"]}
+            for e in query_cross_document_links(G, doc_id, sts)]
+
+def query_compliance_chains(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    """Documents grouped into transaction chains (see _assign_xdoc_chains), each with its explicit links, plus weak / conflicting / unresolved links touching it and
+    unresolved references. roles_present describes what was FOUND; it does not say what SHOULD exist (no compliance judgement)."""
+    by_chain: Dict[str, List[str]] = defaultdict(list)
+    for n, d in _nodes_of_type(G, "Document"):
+        if d.get("xdoc_chain_id"): by_chain[d["xdoc_chain_id"]].append(n)
+    edges = _xdoc_edges(G)
+    out = []
+    for cid, members in sorted(by_chain.items()):
+        ms = set(members)
+        touching = [e for e in edges if e["source_id"] in ms or e["target_id"] in ms]
+        brief = lambda e: {"source": e["source_id"], "target": e["target_id"], "relationship_type": e["relationship_type"], "link_status": e["link_status"], "match_score": e["match_score"], "link_reason": e["link_reason"]}
+        out.append({"chain_id": cid, "documents": [{"document_id": m, "filename": G.nodes[m].get("filename"), "role": G.nodes[m].get("xdoc_role")} for m in sorted(members)],
+                    "roles_present": sorted({G.nodes[m].get("xdoc_role") for m in members}),
+                    "explicit_links": [brief(e) for e in touching if e["link_status"] == XDOC_EXPLICIT and e["source_id"] in ms and e["target_id"] in ms],
+                    "conflicting_links": [brief(e) for e in touching if e["link_status"] == XDOC_CONFLICT],
+                    "weak_links": [brief(e) for e in touching if e["link_status"] == XDOC_WEAK],
+                    "unresolved_links": [brief(e) for e in touching if e["link_status"] == XDOC_UNRESOLVED],
+                    "unresolved_references": {m: G.nodes[m].get("xdoc_unresolved_references") for m in sorted(members) if G.nodes[m].get("xdoc_unresolved_references")}})
+    return out
+
+def query_chain_for_document(G: nx.MultiDiGraph, doc_id: str) -> Optional[Dict[str, Any]]:
+    cid = G.nodes[doc_id].get("xdoc_chain_id") if G.has_node(doc_id) else None
+    return next((c for c in query_compliance_chains(G) if c["chain_id"] == cid), None) if cid else None
+
+# --- CROSS-DOCUMENT REASONING (Prompt 5, Phase B): retrieval through CROSS_DOCUMENT_LINK edges (V2 path only) ---
+# NOT a second reasoning system and NOT a decision engine. When V2 has retrieved evidence from a document, this READS the Phase A CROSS_DOCUMENT_LINK edges around
+# that document and adds the relevant evidence of related documents to the existing V2 context, each item labelled with how and why it was reached:
+#   [XDOC-EXPLICIT]   EXPLICIT link (strong identifier / party anchor, no conflict, not semantic-only). Followed up to V2_XDOC_MAX_HOPS hops. Entity-level links
+#                     (same vendor / person / ID value) are followed one hop from a directly retrieved document only, and only for related documents that are
+#                     lexically relevant to the objective, because one vendor has many unrelated transactions.
+#   [XDOC-POSSIBLE]   WEAK link: surfaced as a possible relationship, never traversed, never identity (semantic-only links land here, flagged semantic_only).
+#   [XDOC-CONFLICT]   CONFLICTING link: surfaced with its conflicts as a reconciliation requirement, never traversed, never resolved.
+#   [XDOC-UNRESOLVED] UNRESOLVED link: listed, no relationship established, no evidence text added.
+#   [MISSING-REFERENCE] xdoc_unresolved_references of documents in the chain: a referenced document that was not supplied. Nothing is invented for it.
+# Policy / rulebook documents are never traversed. The graph is never modified: no VIOLATES / SATISFIES / Decision / CONTRADICTS edge is created and no verdict changes;
+# the deterministic compiled-policy / rule-engine path stays authoritative. Budgets (hops, related documents, evidence items, links inspected) are reported, never hidden.
+ENABLE_CROSS_DOCUMENT_REASONING = os.getenv("ENABLE_CROSS_DOCUMENT_REASONING", "true").lower() == "true"
+V2_XDOC_MAX_HOPS = max(1, _env_int("V2_XDOC_MAX_HOPS", 3))  # invoice -> PO -> payment -> approval is 3 hops from the invoice
+V2_XDOC_DOC_LIMIT = max(0, _env_int("V2_XDOC_DOC_LIMIT", 4))  # related documents accepted for traversal per investigation
+V2_XDOC_EVIDENCE_LIMIT = max(0, _env_int("V2_XDOC_EVIDENCE_LIMIT", 6))  # evidence items added through EXPLICIT links per investigation
+V2_XDOC_EVIDENCE_PER_DOC = max(1, _env_int("V2_XDOC_EVIDENCE_PER_DOC", 2))
+V2_XDOC_SIGNAL_LIMIT = max(0, _env_int("V2_XDOC_SIGNAL_LIMIT", 6))  # WEAK / CONFLICTING / UNRESOLVED links surfaced per investigation
+V2_XDOC_LINK_BUDGET = max(10, _env_int("V2_XDOC_LINK_BUDGET", 500))  # links inspected per investigation
+V2_XDOC_MISSING_LIMIT = 20
+_XDOC_STATUS_PRIO = {XDOC_EXPLICIT: 0, XDOC_CONFLICT: 1, XDOC_WEAK: 2, XDOC_UNRESOLVED: 3}
+XDOC_PHASE_B_LIMITS = ("Cross-document retrieval associates DOCUMENTS through deterministic links. It covers only the links, hops and budgets reported; it does not show that every related "
+                       "document was found, and an EXPLICIT link does not by itself establish compliance, a violation, approval validity or that amounts reconcile.")
+
+def _xdoc_strong_kinds(e: Dict[str, Any]) -> set:
+    """Link kinds backed by a STRONG anchor only (a weak cross-type token never makes a link transaction-level)."""
+    return {s.get("link_kind") for s in (e.get("matched_fields") or []) if s.get("kind") == "anchor" and s.get("strength") == "strong" and s.get("link_kind")}
+
+def _xdoc_edge_scope(e: Dict[str, Any]) -> Optional[str]:
+    sk = _xdoc_strong_kinds(e)
+    return "TRANSACTION" if "SAME_TRANSACTION_REFERENCE" in sk else ("ENTITY" if sk else None)
+
+def _xdoc_doc_ok(G: nx.MultiDiGraph, doc_id: str) -> bool:
+    """A transaction document: exists, is not a policy / rulebook document."""
+    if not G.has_node(doc_id): return False
+    d = G.nodes[doc_id]
+    return d.get("type") == "Document" and d.get("role") != "RULEBOOK" and not d.get("policy_context") and d.get("xdoc_role") != "POLICY"
+
+def _xdoc_eligibility(G: nx.MultiDiGraph, e: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
+    """May this link be TRAVERSED as an established relationship? -> (ok, reason when not, scope TRANSACTION|ENTITY)."""
+    if e.get("link_status") != XDOC_EXPLICIT: return False, f"link status {e.get('link_status')} is not an established relationship", None
+    if e.get("conflict_status") != "NONE" or e.get("conflicts"): return False, "link carries conflicts", None
+    if e.get("semantic_only"): return False, "semantic similarity alone is not proof of identity", None
+    scope = _xdoc_edge_scope(e)
+    if scope is None: return False, "no strong anchor recorded on the link", None
+    if not (_xdoc_doc_ok(G, e["source_id"]) and _xdoc_doc_ok(G, e["target_id"])): return False, "policy / rulebook documents are not traversed as transaction documents", None
+    return True, "", scope
+
+def _xdoc_edge_doc_evidence(e: Dict[str, Any], doc_id: str) -> List[str]:
+    """Evidence ids on `doc_id`'s side of the link that carry the matched values (the evidence the relationship was built from)."""
+    out: List[str] = []
+    for s in e.get("matched_fields") or []:
+        for p in (s.get("source") or []) + (s.get("target") or []):
+            if p.get("document_id") == doc_id and p.get("evidence_id") and p["evidence_id"] not in out: out.append(p["evidence_id"])
+    return out
+
+def _xdoc_link_brief(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {"source_document_id": e["source_id"], "target_document_id": e["target_id"], "source_filename": e.get("source_filename"), "target_filename": e.get("target_filename"),
+            "relationship_type": e.get("relationship_type"), "link_status": e.get("link_status"), "link_kinds": e.get("link_kinds"), "match_methods": e.get("match_methods"),
+            "match_score": e.get("match_score"), "link_reason": e.get("link_reason")}
+
+def traverse_cross_document_context(G: nx.MultiDiGraph, direct_evidence_ids: List[str], objective: str = "", max_hops: Optional[int] = None, doc_limit: Optional[int] = None,
+                                    evidence_limit: Optional[int] = None, evidence_per_doc: Optional[int] = None, signal_limit: Optional[int] = None, link_budget: Optional[int] = None) -> Dict[str, Any]:
+    """READ-ONLY. direct_evidence_ids = evidence V2 already retrieved (lexical hits + graph-expanded). Returns the cross-document evidence to add to the context plus
+    instrumentation (see 'metrics'). Never modifies G, never creates a decision / VIOLATES / SATISFIES, never invents a document or evidence item."""
+    max_hops = V2_XDOC_MAX_HOPS if max_hops is None else max(1, int(max_hops))
+    doc_limit = V2_XDOC_DOC_LIMIT if doc_limit is None else max(0, int(doc_limit))
+    evidence_limit = V2_XDOC_EVIDENCE_LIMIT if evidence_limit is None else max(0, int(evidence_limit))
+    evidence_per_doc = V2_XDOC_EVIDENCE_PER_DOC if evidence_per_doc is None else max(1, int(evidence_per_doc))
+    signal_limit = V2_XDOC_SIGNAL_LIMIT if signal_limit is None else max(0, int(signal_limit))
+    link_budget = V2_XDOC_LINK_BUDGET if link_budget is None else max(1, int(link_budget))
+    m: Dict[str, Any] = {"documents_direct": 0, "documents_via_cross_document_links": 0, "links_inspected": 0, "links_accepted_for_traversal": 0, "links_rejected": 0,
+                         "links_between_retrieved_documents": 0, "weak_links_surfaced": 0, "conflicting_links_surfaced": 0, "unresolved_links_surfaced": 0,
+                         "unresolved_references_surfaced": 0, "evidence_added_via_explicit_links": 0, "evidence_added_via_signal_links": 0, "evidence_already_retrieved": 0,
+                         "doc_limit_reached": False, "evidence_limit_reached": False, "signal_limit_reached": False, "link_budget_exhausted": False,
+                         "frontier_not_expanded": 0, "max_hops": max_hops}
+    res: Dict[str, Any] = {"status": "OK", "enabled": True, "direct_documents": [], "related_documents": [], "explicit_items": [], "weak_signals": [], "conflict_signals": [],
+                           "unresolved_signals": [], "missing_references": [], "rejected_links": [], "links_between_retrieved_documents": [], "metrics": m, "limitations": XDOC_PHASE_B_LIMITS}
+    direct_ev = [e for e in dict.fromkeys(direct_evidence_ids or []) if G.has_node(e) and G.nodes[e].get("type") == "Evidence"
+                 and not G.nodes[e].get("context_only") and not _is_policy_source_evidence(G.nodes[e])]
+    direct_set = set(direct_ev)
+    roots: Dict[str, List[str]] = {}
+    for ev in direct_ev:
+        for s in _evidence_source_docs(G, ev):
+            if _xdoc_doc_ok(G, s["document_id"]): roots.setdefault(s["document_id"], []).append(ev)
+    res["direct_documents"] = [{"document_id": d, "filename": G.nodes[d].get("filename"), "evidence_ids": evs} for d, evs in roots.items()]
+    m["documents_direct"] = len(roots)
+    if not roots:
+        res["status"] = "NO_DIRECT_DOCUMENTS"; return res
+    edges = _xdoc_edges(G)
+    adj: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for e in edges: adj[e["source_id"]].append(e); adj[e["target_id"]].append(e)
+    inv = [(n, d) for n, d in _investigation_evidence(G) if not d.get("context_only")]
+    doc_ev: Dict[str, List[str]] = defaultdict(list)
+    for n, _ in inv:
+        for s in _evidence_source_docs(G, n): doc_ev[s["document_id"]].append(n)
+    lexv = dict(zip([n for n, _ in inv], bm25_scores(objective, [d.get("text", "") for _, d in inv]))) if (edges and objective) else {}
+    members: Dict[str, Dict[str, Any]] = {d: {"hop": 0, "via": None, "path": []} for d in roots}
+    seen_pairs: set = set()
+    frontier = list(roots)
+    accepted = 0
+    root_of = lambda d: (members[d]["path"][0]["from_document_id"] if members[d]["path"] else d)
+
+    def _prov(ev: str) -> Dict[str, Any]:
+        src = _evidence_source_docs(G, ev)
+        return {"evidence_id": ev, "document_id": src[0]["document_id"] if src else None, "filename": src[0]["filename"] if src else None, "location": G.nodes[ev].get("source_location")}
+
+    def _signal(e: Dict[str, Any], doc: str, other: str, cls: str) -> Dict[str, Any]:
+        evs = [x for x in _xdoc_edge_doc_evidence(e, other) if x in G and not G.nodes[x].get("context_only")]
+        ev = evs[0] if (evs and cls != "XDOC_UNRESOLVED") else None
+        base = {"class": cls, "document_id": other, "filename": G.nodes[other].get("filename"), "related_document_id": doc, "related_filename": G.nodes[doc].get("filename"),
+                "relationship_type": e.get("relationship_type"), "link_status": e.get("link_status"), "link_reason": e.get("link_reason"), "match_methods": e.get("match_methods"),
+                "match_score": e.get("match_score"), "semantic_only": bool(e.get("semantic_only")), "conflicts": e.get("conflicts") or [], "uncertainty_reason": e.get("uncertainty_reason"),
+                "matched_evidence": [_prov(x) for x in evs[:4]], "treated_as_identity": False, "requires_reconciliation": cls == "XDOC_CONFLICT",
+                "evidence_id": ev, "location": G.nodes[ev].get("source_location") if ev else None, "already_retrieved": bool(ev and ev in direct_set), "hops": members[doc]["hop"] + 1}
+        return base
+
+    for hop in range(max_hops):
+        nxt: List[str] = []
+        for doc in frontier:
+            cands = sorted(adj.get(doc, []), key=lambda e: (_XDOC_STATUS_PRIO.get(e.get("link_status"), 9), 0 if _xdoc_edge_scope(e) == "TRANSACTION" else 1, -float(e.get("match_score") or 0),
+                                                           str(e.get("target_filename") if e["source_id"] == doc else e.get("source_filename")), e["source_id"], e["target_id"]))
+            for e in cands:
+                pair = (e["source_id"], e["target_id"])
+                if pair in seen_pairs: continue
+                if m["links_inspected"] >= link_budget: m["link_budget_exhausted"] = True; break
+                seen_pairs.add(pair); m["links_inspected"] += 1
+                other = e["target_id"] if e["source_id"] == doc else e["source_id"]
+                status = e.get("link_status")
+                if status == XDOC_EXPLICIT:
+                    ok, why, scope = _xdoc_eligibility(G, e)
+                    if ok and other in members:
+                        m["links_between_retrieved_documents"] += 1; res["links_between_retrieved_documents"].append(_xdoc_link_brief(e)); continue
+                    if ok and scope == "ENTITY" and members[doc]["hop"] > 0: ok, why = False, "entity-level link (same vendor / person / ID value) is not chained beyond a directly retrieved document"
+                    if ok and accepted >= doc_limit: ok, why = False, f"related-document limit ({doc_limit}) reached"; m["doc_limit_reached"] = True
+                    if ok and scope == "ENTITY" and not any(lexv.get(x, 0.0) > 0.0 for x in doc_ev.get(other, [])): ok, why = False, "entity-level link and the related document has no lexical relevance to the objective"
+                    if not ok:
+                        m["links_rejected"] += 1; res["rejected_links"].append({**_xdoc_link_brief(e), "reason": why}); continue
+                    step = {"from_document_id": doc, "to_document_id": other, "relationship_type": e.get("relationship_type"), "link_status": status, "link_scope": scope}
+                    members[other] = {"hop": hop + 1, "via": doc, "path": members[doc]["path"] + [step]}
+                    accepted += 1; m["links_accepted_for_traversal"] += 1; nxt.append(other)
+                    matched = [x for x in _xdoc_edge_doc_evidence(e, other) if x in set(doc_ev.get(other, []))]
+                    lex_ev = sorted([x for x in doc_ev.get(other, []) if lexv.get(x, 0.0) > 0.0 and x not in matched], key=lambda x: (-lexv.get(x, 0.0), x))
+                    order = [(x, "matched_field") for x in matched] + [(x, "lexical") for x in lex_ev] if scope == "TRANSACTION" else [(x, "lexical") for x in lex_ev] + [(x, "matched_field") for x in matched]
+                    res["related_documents"].append({"document_id": other, "filename": G.nodes[other].get("filename"), "hops": hop + 1, "via_document_id": doc, "root_document_id": root_of(other),
+                                                     "relationship_type": e.get("relationship_type"), "link_status": status, "link_scope": scope, "path": members[other]["path"]})
+                    taken = 0
+                    for ev, basis in order:
+                        if taken >= evidence_per_doc: break
+                        if ev in direct_set: m["evidence_already_retrieved"] += 1; continue
+                        if m["evidence_added_via_explicit_links"] >= evidence_limit: m["evidence_limit_reached"] = True; break
+                        taken += 1; m["evidence_added_via_explicit_links"] += 1
+                        res["explicit_items"].append({"class": "XDOC_EXPLICIT", "evidence_id": ev, "document_id": other, "filename": G.nodes[other].get("filename"), "location": G.nodes[ev].get("source_location"),
+                                                      "related_document_id": doc, "related_filename": G.nodes[doc].get("filename"), "root_document_id": root_of(other), "anchoring_direct_evidence_ids": roots.get(root_of(other), [])[:5],
+                                                      "relationship_type": e.get("relationship_type"), "link_status": status, "link_scope": scope, "link_reason": e.get("link_reason"),
+                                                      "match_methods": e.get("match_methods"), "match_score": e.get("match_score"), "match_basis": basis, "hops": hop + 1, "path": members[other]["path"],
+                                                      "treated_as_identity": False})
+                else:
+                    cls = {XDOC_WEAK: "XDOC_WEAK", XDOC_CONFLICT: "XDOC_CONFLICT"}.get(status, "XDOC_UNRESOLVED")
+                    if len(res["weak_signals"]) + len(res["conflict_signals"]) + len(res["unresolved_signals"]) >= signal_limit: m["signal_limit_reached"] = True; continue
+                    sig = _signal(e, doc, other, cls)
+                    key = {"XDOC_WEAK": "weak_signals", "XDOC_CONFLICT": "conflict_signals", "XDOC_UNRESOLVED": "unresolved_signals"}[cls]
+                    res[key].append(sig)
+                    m[{"XDOC_WEAK": "weak_links_surfaced", "XDOC_CONFLICT": "conflicting_links_surfaced", "XDOC_UNRESOLVED": "unresolved_links_surfaced"}[cls]] += 1
+                    if sig["evidence_id"] and not sig["already_retrieved"]: m["evidence_added_via_signal_links"] += 1
+                    elif sig["already_retrieved"]: m["evidence_already_retrieved"] += 1
+            if m["link_budget_exhausted"]: break
+        frontier = nxt
+        if not frontier or m["link_budget_exhausted"]: break
+    m["frontier_not_expanded"] = len(frontier) if hop == max_hops - 1 else 0
+    m["documents_via_cross_document_links"] = len(res["related_documents"])
+    for d in members:  # missing referenced documents of the documents in the chain (existing Phase A data; nothing invented)
+        for r in G.nodes[d].get("xdoc_unresolved_references") or []:
+            if len(res["missing_references"]) >= V2_XDOC_MISSING_LIMIT: break
+            res["missing_references"].append({"document_id": d, "filename": G.nodes[d].get("filename"), "reference_type": r.get("reference_type"), "reference": r.get("reference"),
+                                              "reason": r.get("reason"), "provenance": r.get("provenance") or [], "document_reached_via_link": members[d]["hop"] > 0})
+    m["unresolved_references_surfaced"] = len(res["missing_references"])
+    if not edges and not res["missing_references"]: res["status"] = "NO_CROSS_DOCUMENT_LINKS"
+    return res
+
+def cross_document_has_content(xd: Optional[Dict[str, Any]]) -> bool:
+    return bool(xd) and any(xd.get(k) for k in ("explicit_items", "weak_signals", "conflict_signals", "unresolved_signals", "missing_references", "related_documents"))
+
+def format_cross_document_for_context(G: nx.MultiDiGraph, xd: Dict[str, Any]) -> str:
+    """V2 context block. '' when there is nothing cross-document to say (so single-document / unlinked cases are unchanged)."""
+    if not cross_document_has_content(xd): return ""
+    m = xd["metrics"]
+    out = ("--- CROSS-DOCUMENT EVIDENCE (Phase B: evidence from OTHER documents reached over deterministic CROSS_DOCUMENT_LINK edges from a directly retrieved document) ---\n"
+           "Classes (kept separate from [LEXICAL] / [GRAPH-EXPANDED]): [XDOC-EXPLICIT] established link (strong identifier / party match); [XDOC-POSSIBLE] weak link, a possibility only; "
+           "[XDOC-CONFLICT] linked documents disagree, reconciliation required; [XDOC-UNRESOLVED] signal too weak to associate documents; [MISSING-REFERENCE] a referenced document was not supplied.\n")
+    for it in xd["explicit_items"]:
+        hdr = (f"[XDOC-EXPLICIT] Evidence Node {it['evidence_id']} from Document {it['document_id']} ({it['filename']}) | reached from Document {it['related_document_id']} ({it['related_filename']}) "
+               f"over a {it['relationship_type']} link (status EXPLICIT, scope {it['link_scope']}, {it['hops']} hop(s), basis {it['match_basis']}; methods {it['match_methods']}; score {it['match_score']}, rule-based, not a probability) | reason: {it['link_reason']}")
+        out += _describe_evidence(G, it["evidence_id"], G.nodes[it["evidence_id"]], hdr, "CROSS-DOCUMENT (explicit link; NOT a lexical match unless basis is lexical)")
+    for cls, tag, items, note in (("XDOC_WEAK", "[XDOC-POSSIBLE]", xd["weak_signals"], "WEAK link: a POSSIBLE relationship only. It does NOT establish that these documents refer to the same entity or transaction"),
+                                  ("XDOC_CONFLICT", "[XDOC-CONFLICT]", xd["conflict_signals"], "CONFLICTING link: a match exists but fields disagree. RECONCILIATION REQUIRED; do not pick a side")):
+        for it in items:
+            hdr = (f"{tag} Document {it['document_id']} ({it['filename']}) vs Document {it['related_document_id']} ({it['related_filename']}) | {it['relationship_type']} | status {it['link_status']}"
+                   f"{' | SEMANTIC-ONLY (lexical similarity is not identity)' if it['semantic_only'] else ''} | {note} | reason: {it['link_reason']}"
+                   + (f" | conflicts: {[(c.get('field'), c.get('kind')) for c in it['conflicts']]}" if it["conflicts"] else ""))
+            if it["evidence_id"] and not it["already_retrieved"]: out += _describe_evidence(G, it["evidence_id"], G.nodes[it["evidence_id"]], hdr, f"CROSS-DOCUMENT ({it['link_status']} link; context only)")
+            else: out += hdr + (f" | matched evidence {it['evidence_id']} is already part of the retrieved evidence" if it["already_retrieved"] else " | no matched evidence text available") + "\n\n"
+    for it in xd["unresolved_signals"]:
+        out += (f"[XDOC-UNRESOLVED] Document {it['document_id']} ({it['filename']}) vs Document {it['related_document_id']} ({it['related_filename']}) | status UNRESOLVED | {it['link_reason']} | "
+                "NO relationship is established; evidence text not included.\n\n")
+    for r in xd["missing_references"]:
+        pv = "; ".join(f"{p.get('filename')} @ {p.get('location')} (evidence {p.get('evidence_id')})" for p in r["provenance"][:2])
+        out += (f"[MISSING-REFERENCE] Document {r['document_id']} ({r['filename']}) refers to {r['reference_type']} '{r['reference']}' [{pv}]; {r['reason']}. MISSING EVIDENCE: "
+                "do not assume the contents of that document, and treat conclusions that depend on it as incomplete.\n\n")
+    out += (f"Cross-document retrieval summary: directly retrieved documents {m['documents_direct']}; related documents reached {m['documents_via_cross_document_links']}; links inspected {m['links_inspected']}; "
+            f"accepted for traversal {m['links_accepted_for_traversal']}; rejected {m['links_rejected']}; weak {m['weak_links_surfaced']}, conflicting {m['conflicting_links_surfaced']}, unresolved {m['unresolved_links_surfaced']} surfaced; "
+            f"missing references {m['unresolved_references_surfaced']}; evidence items added through explicit links {m['evidence_added_via_explicit_links']}.\n")
+    lim = [x for x, f in (("related-document limit", m["doc_limit_reached"]), ("evidence limit", m["evidence_limit_reached"]), ("signal limit", m["signal_limit_reached"]), ("link-inspection budget", m["link_budget_exhausted"])) if f]
+    if lim: out += f"LIMITS REACHED: {', '.join(lim)}; further related evidence may exist. "
+    if m["frontier_not_expanded"]: out += f"{m['frontier_not_expanded']} related document(s) sit at the hop limit and their links were not examined. "
+    out += ("RULES: only [XDOC-EXPLICIT] items are established document relationships and they still do not prove compliance, a violation, approval validity or reconciled amounts. A cross-document link never creates "
+            "VIOLATION or SATISFIED; only DETERMINISTIC policy results can. " + XDOC_PHASE_B_LIMITS + "\n\n")
+    return out
+
+def v2_cross_document_section(stats: Dict[str, Any]) -> str:
+    """Deterministic V2 appendix block: which documents were reached through which link and why, kept apart by class. '' when there is no cross-document activity."""
+    xd = (stats or {}).get("cross_document")
+    if not cross_document_has_content(xd): return ""
+    m = xd["metrics"]
+    out = "\n### Cross-document evidence (V2 Phase B, deterministic)\n\n"
+    out += (f"Directly retrieved documents: **{m['documents_direct']}**; related documents reached through explicit links: **{m['documents_via_cross_document_links']}**; links inspected: **{m['links_inspected']}**; "
+            f"accepted for traversal: **{m['links_accepted_for_traversal']}**; rejected: **{m['links_rejected']}**; evidence items added through explicit links: **{m['evidence_added_via_explicit_links']}**.\n\n")
+    def rows(title, items, cols):
+        o = f"{title}\n\n"
+        for i, it in enumerate(items, 1): o += f"{i}. " + "; ".join(f"{k}: `{it.get(v)}`" for k, v in cols) + "\n"
+        return o + "\n"
+    if xd["explicit_items"]:
+        out += rows("**Retrieved through an EXPLICIT cross-document link** (established document relationship; not a direct retrieval and not a compliance finding):", xd["explicit_items"],
+                    [("evidence", "evidence_id"), ("document", "filename"), ("location", "location"), ("reached from", "related_filename"), ("relationship", "relationship_type"), ("status", "link_status"), ("hops", "hops"), ("basis", "match_basis"), ("reason", "link_reason")])
+    if xd["weak_signals"]:
+        out += rows("**Possible (WEAK) cross-document links** (not identity; not traversed):", xd["weak_signals"], [("document", "filename"), ("related to", "related_filename"), ("relationship", "relationship_type"), ("semantic-only", "semantic_only"), ("reason", "link_reason")])
+    if xd["conflict_signals"]:
+        out += rows("**CONFLICTING cross-document links** (reconciliation required; not resolved):", xd["conflict_signals"], [("document", "filename"), ("related to", "related_filename"), ("relationship", "relationship_type"), ("conflicts", "conflicts"), ("reason", "link_reason")])
+    if xd["unresolved_signals"]:
+        out += rows("**UNRESOLVED cross-document links** (no relationship established):", xd["unresolved_signals"], [("document", "filename"), ("related to", "related_filename"), ("reason", "link_reason")])
+    if xd["missing_references"]:
+        out += rows("**Missing referenced documents** (not supplied; nothing was inferred about them):", xd["missing_references"], [("referenced by", "filename"), ("type", "reference_type"), ("reference", "reference"), ("reason", "reason")])
+    lim = [x for x, f in (("related-document limit", m["doc_limit_reached"]), ("evidence limit", m["evidence_limit_reached"]), ("signal limit", m["signal_limit_reached"]), ("link-inspection budget", m["link_budget_exhausted"])) if f]
+    if lim: out += f"Limits reached: {', '.join(lim)}; further related evidence may exist.\n\n"
+    return out + XDOC_PHASE_B_LIMITS + "\n\n"
+
+# --- CONTRADICTION CLASSIFIER (deterministic; builds on the Phase A conflict signals + provenance; no new graph nodes/edges) ---
+# Classifies what the linked documents say about the SAME transaction: CONSISTENT / MINOR_CONTRADICTION / MAJOR_CONTRADICTION / MISSING_EVIDENCE / POLICY_VIOLATION / UNRESOLVED.
+# * Only documents joined by a STRONG TRANSACTION-level link (identifier anchor, not semantic-only) are compared. Entity-level links (same vendor / person) do not show the
+#   documents are the same transaction, so their Phase A conflicts are suppressed (counted, not classified); weak / semantic-only links yield UNRESOLVED, never a contradiction.
+# * Both claims are kept side by side with document / evidence ids and locations (existing _xdoc_prov provenance). Nothing is resolved or picked.
+# * Legitimate differences that can be recognised deterministically (payment that states it is partial, line items summing to a total) are CONSISTENT with the reason recorded.
+# * POLICY_VIOLATION is only ever a COPY of an existing deterministic Decision with verdict VIOLATION. A contradiction is never converted into a violation here.
+# * Results: Document-link edge properties contradiction_class / contradiction_findings + G.graph["contradiction_findings"]; recomputed from scratch each call (idempotent).
+XCON_CATEGORIES = ("CONSISTENT", "MINOR_CONTRADICTION", "MAJOR_CONTRADICTION", "MISSING_EVIDENCE", "POLICY_VIOLATION", "UNRESOLVED")
+XCON_CONTRADICTION = ("MINOR_CONTRADICTION", "MAJOR_CONTRADICTION")
+_XCON_PRIO = {"MAJOR_CONTRADICTION": 0, "POLICY_VIOLATION": 1, "MINOR_CONTRADICTION": 2, "UNRESOLVED": 3, "MISSING_EVIDENCE": 4, "CONSISTENT": 5}
+XCON_MINOR_REL = 0.05  # amounts / quantities within 5% of each other: minor
+XCON_MINOR_DATE_DAYS = 7
+_XCON_PARTIAL = re.compile(r'(?i)\b(partial|part[\s-]*payment|instal+ment|advance|on\s+account|balance)\b')
+_XCON_DATE_LABEL = re.compile(r'(?i)\b(invoice|order|payment|paid|approval|delivery|due)\s+date\b\s*[:=]?\s*(.{0,30})')
+_XCON_APPROVAL_LABELLED = re.compile(r'(?i)\bapproval\s+status\s*[:=]\s*([A-Za-z]{3,12})')
+_XCON_STATUS_BARE = re.compile(r'(?i)\bstatus\s*[:=]\s*([A-Za-z]{3,12})')
+_XCON_QTY = re.compile(r'(?i)\b(?:quantity|qty)\b\s*[:=]?\s*(\d+(?:\.\d+)?)')
+_XCON_DELIVERY = re.compile(r'(?i)\bdelivery\s+status\s*[:=]\s*([A-Za-z ]{3,25})')
+_XCON_PAYSTATUS = re.compile(r'(?i)\bpayment\s+status\s*[:=]\s*([A-Za-z ]{3,25})')
+
+def _xcon_norm_approval(v: str) -> Optional[str]:
+    v = v.lower()
+    return "APPROVED" if v in ("approved", "granted", "accepted") else ("REJECTED" if v in ("rejected", "declined", "denied", "refused") else ("PENDING" if v == "pending" else None))
+
+def _xcon_norm_delivery(v: str) -> Optional[str]:
+    v = v.lower()
+    return "NOT_DELIVERED" if re.search(r'\bnot\b|\bun|pending|awaiting|\bno\b', v) else ("PARTIAL" if "partial" in v else ("DELIVERED" if "deliver" in v else None))
+
+def _xcon_norm_paystatus(v: str) -> Optional[str]:
+    v = v.lower()
+    return "UNPAID" if re.search(r'unpaid|not paid|pending|\bdue\b|overdue', v) else ("PARTIAL" if "partial" in v else ("PAID" if re.search(r'\bpaid\b|settled|complete', v) else None))
+
+def _xcon_doc_claims(G: nx.MultiDiGraph, prof: Dict[str, Any]) -> Dict[str, Any]:
+    """Labelled dates, approval status and factual claims of one document, each value with its provenance."""
+    did = prof["doc_id"]
+    out: Dict[str, Any] = {"dates": defaultdict(lambda: defaultdict(list)), "approval": defaultdict(list), "quantity": defaultdict(list), "delivery_status": defaultdict(list), "payment_status": defaultdict(list)}
+    for ev in prof["evidence_ids"]:
+        text = G.nodes[ev].get("text") or ""
+        for m in _XCON_DATE_LABEL.finditer(text):
+            best = None
+            for pat, fmt in _DATE_PATTERNS:
+                mm = pat.search(m.group(2))
+                if mm and mm.start() <= 2 and (best is None or mm.start() < best[0]):
+                    try: best = (mm.start(), fmt(mm), mm.group(0))
+                    except (KeyError, ValueError): pass
+            if best: out["dates"]["payment" if m.group(1).lower() == "paid" else m.group(1).lower()][best[1]].append(_xdoc_prov(G, ev, did, f"{m.group(1)} date {best[2]}"))
+        for m in _XCON_APPROVAL_LABELLED.finditer(text):
+            s = _xcon_norm_approval(m.group(1))
+            if s: out["approval"][s].append(_xdoc_prov(G, ev, did, m.group(0)))
+        if prof["role"] == "APPROVAL":
+            for m in _XCON_STATUS_BARE.finditer(text):
+                s = _xcon_norm_approval(m.group(1))
+                if s: out["approval"][s].append(_xdoc_prov(G, ev, did, m.group(0)))
+        for m in _XCON_QTY.finditer(text): out["quantity"][float(m.group(1))].append(_xdoc_prov(G, ev, did, m.group(0)))
+        for rx, key, norm in ((_XCON_DELIVERY, "delivery_status", _xcon_norm_delivery), (_XCON_PAYSTATUS, "payment_status", _xcon_norm_paystatus)):
+            for m in rx.finditer(text):
+                s = norm(m.group(1))
+                if s: out[key][s].append(_xdoc_prov(G, ev, did, m.group(0)))
+    return out
+
+def _xcon_side(G: nx.MultiDiGraph, doc_id: str, value: Any, provs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"document_id": doc_id, "filename": G.nodes[doc_id].get("filename"), "value": value, "provenance": provs[:5]}
+
+def _xcon_mk(cat: str, field: str, a: Dict[str, Any], b: Optional[Dict[str, Any]], reason: str, link: Optional[Dict[str, Any]] = None, severity: Optional[str] = None, **extra) -> Dict[str, Any]:
+    key = json.dumps([cat, field, sorted(x["filename"] or "" for x in (a, b) if x), [({k: v for k, v in x["value"].items() if not k.endswith("_id")} if isinstance(x["value"], dict) else x["value"]) for x in (a, b) if x], extra.get("subfield")], sort_keys=True, default=str)
+    return {"finding_id": "xcon_" + hashlib.sha256(key.encode()).hexdigest()[:12], "category": cat, "field": field, "severity": severity or {"MAJOR_CONTRADICTION": "major", "MINOR_CONTRADICTION": "minor"}.get(cat),
+            "claim_a": a, "claim_b": b, "reason": reason, "link": link, "resolution": "NOT_RESOLVED", "is_policy_violation": False, "heuristic": cat != "POLICY_VIOLATION", **extra}
+
+def _xcon_rel(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(a), abs(b), 1e-9)
+
+def _xcon_edit1(a: str, b: str) -> bool:
+    if a == b: return True
+    if abs(len(a) - len(b)) > 1: return False
+    if len(a) == len(b): return sum(x != y for x, y in zip(a, b)) == 1
+    s, l = (a, b) if len(a) < len(b) else (b, a)
+    return any(l[:i] + l[i + 1:] == s for i in range(len(l)))
+
+def _xcon_compare_pair(G: nx.MultiDiGraph, e: Dict[str, Any], pa: Dict[str, Any], pb: Dict[str, Any], ca: Dict[str, Any], cb: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    A, B = pa["doc_id"], pb["doc_id"]
+    link = {"relationship_type": e.get("relationship_type"), "link_status": e.get("link_status"), "link_reason": e.get("link_reason"), "match_methods": e.get("match_methods")}
+    conf = {c["field"] for c in e.get("conflicts") or []}
+    F: List[Dict[str, Any]] = []
+    compared: List[str] = []
+    flat = lambda d, pred=lambda k: True: [p for k, ps in d.items() if pred(k) for p in ps]
+    # amounts (trigger: Phase A amount / currency conflict; details recomputed from the same profile values)
+    if pa["amounts"] and pb["amounts"]:
+        common = sorted({c for c, _ in pa["amounts"]} & {c for c, _ in pb["amounts"]}, key=str)
+        if not common:
+            compared.append("amount")
+            if "currency" in conf:
+                F.append(_xcon_mk("UNRESOLVED", "amount", _xcon_side(G, A, sorted({str(c) for c, _ in pa["amounts"]}), flat(pa["amounts"])), _xcon_side(G, B, sorted({str(c) for c, _ in pb["amounts"]}), flat(pb["amounts"])),
+                                  "amounts are in different currencies and no exchange rate is applied, so they cannot be compared", link))
+        for cur in common:
+            compared.append("amount")
+            va, vb = sorted({x for c, x in pa["amounts"] if c == cur}), sorted({x for c, x in pb["amounts"] if c == cur})
+            if set(va) & set(vb): continue
+            sa = _xcon_side(G, A, {"currency": cur, "amounts": va}, flat(pa["amounts"], lambda k: k[0] == cur))
+            sb = _xcon_side(G, B, {"currency": cur, "amounts": vb}, flat(pb["amounts"], lambda k: k[0] == cur))
+            if any(abs(sum(va) - x) <= 0.01 for x in vb) or any(abs(sum(vb) - x) <= 0.01 for x in va):
+                F.append(_xcon_mk("CONSISTENT", "amount", sa, sb, "line items of one document sum to the amount in the other", link, legitimate_difference="line_item_total")); continue
+            if {pa["role"], pb["role"]} >= {"PAYMENT"} and pa["role"] != pb["role"]:
+                pay, oth = (pa, pb) if pa["role"] == "PAYMENT" else (pb, pa)
+                vp, vo = (va, vb) if pay is pa else (vb, va)
+                if max(vp) > max(vo): F.append(_xcon_mk("MAJOR_CONTRADICTION", "amount", sa, sb, "payment exceeds the amount of the document it settles", link)); continue
+                if _XCON_PARTIAL.search(pay["text"]):
+                    F.append(_xcon_mk("CONSISTENT", "amount", sa, sb, "payment states it is partial / on account and is smaller than the billed amount", link, legitimate_difference="partial_payment")); continue
+                F.append(_xcon_mk("UNRESOLVED", "amount", sa, sb, "payment is smaller than the billed amount and nothing states whether it is partial", link)); continue
+            d = min(_xcon_rel(x, y) for x in va for y in vb)
+            F.append(_xcon_mk("MINOR_CONTRADICTION" if d <= XCON_MINOR_REL else "MAJOR_CONTRADICTION", "amount", sa, sb, f"amounts differ by {d:.1%} (minor threshold {XCON_MINOR_REL:.0%})", link))
+    # transaction ids of the same type
+    for t in sorted(({x for x, _ in pa["ids"]} & {x for x, _ in pb["ids"]}) - {"ref"}):
+        compared.append("transaction_id")
+        ia, ib = {n for x, n in pa["ids"] if x == t}, {n for x, n in pb["ids"] if x == t}
+        if ia & ib: continue
+        sa, sb = _xcon_side(G, A, {"type": t, "ids": sorted(ia)}, flat(pa["ids"], lambda k: k[0] == t)), _xcon_side(G, B, {"type": t, "ids": sorted(ib)}, flat(pb["ids"], lambda k: k[0] == t))
+        if pa["role"] == pb["role"] == t.upper():
+            if set(pa["amounts"]) & set(pb["amounts"]): F.append(_xcon_mk("MAJOR_CONTRADICTION", "transaction_id", sa, sb, "two documents of the same kind with different numbers carry the same amount against one anchor (duplicate-document signature)", link))
+            else: F.append(_xcon_mk("UNRESOLVED", "transaction_id", sa, sb, "two documents of the same kind with different numbers against one anchor: separate (e.g. partial) documents or a duplicate cannot be told apart", link))
+        elif len(ia) > 1 or len(ib) > 1: F.append(_xcon_mk("UNRESOLVED", "transaction_id", sa, sb, "one document lists several identifiers of this type; a mismatch cannot be established", link))
+        elif any(_xcon_edit1(x, y) for x in ia for y in ib): F.append(_xcon_mk("MINOR_CONTRADICTION", "transaction_id", sa, sb, "identifiers differ by one character (possible typo; not resolved)", link))
+        else: F.append(_xcon_mk("MAJOR_CONTRADICTION", "transaction_id", sa, sb, "linked documents cite different identifiers of the same type", link))
+    # vendor / person names, valid GovIDs
+    for fld, field in (("vendor", "vendor"), ("person", "identity")):
+        if not (pa[fld] and pb[fld]): continue
+        compared.append(field)
+        if set(pa[fld]) & set(pb[fld]): continue
+        sa, sb = _xcon_side(G, A, sorted(pa[fld]), flat(pa[fld])), _xcon_side(G, B, sorted(pb[fld]), flat(pb[fld]))
+        close = any((lambda x, y: x <= y or y <= x or len(x & y) / len(x | y) >= 0.5)(set(p.split()), set(q.split())) for p in pa[fld] for q in pb[fld])
+        F.append(_xcon_mk("MINOR_CONTRADICTION" if close else "MAJOR_CONTRADICTION", field, sa, sb, "names differ but share most words (variant spelling / suffix; not resolved)" if close else "linked documents name different parties", link))
+    ga, gb = {k for k in pa["entities"] if pa["entity_meta"][k][0] == "GovID"}, {k for k in pb["entities"] if pb["entity_meta"][k][0] == "GovID"}
+    if ga and gb:
+        compared.append("identity")
+        if not (ga & gb):
+            ok = all(pa["entity_meta"][k][1] is True for k in ga) and all(pb["entity_meta"][k][1] is True for k in gb)
+            F.append(_xcon_mk("MAJOR_CONTRADICTION" if ok else "UNRESOLVED", "identity", _xcon_side(G, A, "[REDACTED_GOVID]", flat({k: pa["entities"][k] for k in ga})), _xcon_side(G, B, "[REDACTED_GOVID]", flat({k: pb["entities"][k] for k in gb})),
+                              "linked documents carry different Government IDs" if ok else "different Government IDs but at least one is unverified", link))
+    # labelled dates
+    for kind in sorted(set(ca["dates"]) & set(cb["dates"])):
+        compared.append("date")
+        da, db = ca["dates"][kind], cb["dates"][kind]
+        if set(da) & set(db): continue
+        sa, sb = _xcon_side(G, A, {"kind": kind, "dates": sorted(da)}, flat(da)), _xcon_side(G, B, {"kind": kind, "dates": sorted(db)}, flat(db))
+        try:
+            gap = min(abs((datetime.strptime(x, "%Y-%m-%d") - datetime.strptime(y, "%Y-%m-%d")).days) for x in da for y in db)
+            F.append(_xcon_mk("MINOR_CONTRADICTION" if gap <= XCON_MINOR_DATE_DAYS else "MAJOR_CONTRADICTION", "date", sa, sb, f"the {kind} date differs by {gap} day(s)", link, subfield=kind))
+        except ValueError: F.append(_xcon_mk("UNRESOLVED", "date", sa, sb, f"the {kind} dates differ but are not in an unambiguous format", link, subfield=kind))
+    for (cx, dx), (cy, dy) in (((ca, A), (cb, B)), ((cb, B), (ca, A))):  # an invoice dated before the order it cites
+        if cx["dates"].get("order") and cy["dates"].get("invoice"):
+            od, iv = min(cx["dates"]["order"]), min(cy["dates"]["invoice"])
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', od) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', iv) and iv < od:
+                F.append(_xcon_mk("MAJOR_CONTRADICTION", "date", _xcon_side(G, dx, {"kind": "order", "dates": [od]}, cx["dates"]["order"][od]), _xcon_side(G, dy, {"kind": "invoice", "dates": [iv]}, cy["dates"]["invoice"][iv]),
+                                  "the invoice is dated before the order it cites", link, subfield="sequence"))
+                compared.append("date")
+    # approval status
+    if ca["approval"] and cb["approval"]:
+        compared.append("approval_status")
+        sa_, sb_ = set(ca["approval"]), set(cb["approval"])
+        if not (sa_ & sb_):
+            side = lambda d, c: _xcon_side(G, d, sorted(c), flat(c))
+            hard = ("APPROVED" in sa_ and "REJECTED" in sb_) or ("REJECTED" in sa_ and "APPROVED" in sb_)
+            F.append(_xcon_mk("MAJOR_CONTRADICTION" if hard else "UNRESOLVED", "approval_status", side(A, ca["approval"]), side(B, cb["approval"]),
+                              "one document records the approval as approved and the other as rejected" if hard else "approval statuses differ but one is pending, so a later decision may simply have been recorded", link))
+    # factual claims
+    q_a, q_b = ca["quantity"], cb["quantity"]
+    if q_a and q_b:
+        compared.append("factual_claim")
+        if not (set(q_a) & set(q_b)):
+            d = min(_xcon_rel(x, y) for x in q_a for y in q_b)
+            F.append(_xcon_mk("MINOR_CONTRADICTION" if d <= XCON_MINOR_REL else "MAJOR_CONTRADICTION", "factual_claim", _xcon_side(G, A, {"claim": "quantity", "values": sorted(q_a)}, flat(q_a)),
+                              _xcon_side(G, B, {"claim": "quantity", "values": sorted(q_b)}, flat(q_b)), f"quantities differ by {d:.1%}", link, subfield="quantity"))
+    for key, hard_pairs in (("delivery_status", {frozenset(("DELIVERED", "NOT_DELIVERED"))}), ("payment_status", {frozenset(("PAID", "UNPAID"))})):
+        if ca[key] and cb[key]:
+            compared.append("factual_claim")
+            if not (set(ca[key]) & set(cb[key])):
+                hard = any(frozenset((x, y)) in hard_pairs for x in ca[key] for y in cb[key])
+                F.append(_xcon_mk("MAJOR_CONTRADICTION" if hard else "MINOR_CONTRADICTION", "factual_claim", _xcon_side(G, A, {"claim": key, "values": sorted(ca[key])}, flat(ca[key])),
+                                  _xcon_side(G, B, {"claim": key, "values": sorted(cb[key])}, flat(cb[key])), "the documents state opposite " + key.replace("_", " ") if hard else key.replace("_", " ") + " differs (partial vs complete)", link, subfield=key))
+    return F, sorted(set(compared))
+
+def classify_contradictions(G: nx.MultiDiGraph) -> Dict[str, Any]:
+    """Recomputed from scratch on every call (idempotent): adds no node or edge. See the header comment for the rules."""
+    summary: Dict[str, Any] = {"status": "OK", "pairs_compared": 0, "suppressed_entity_level_conflicts": 0, "by_category": {}, "note": "heuristic classification; no finding is a compliance violation (POLICY_VIOLATION findings copy existing deterministic Decisions)"}
+    live = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("relation") == XDOC_RELATION]
+    for _, _, d in live: d["contradiction_findings"], d["contradiction_class"] = [], "NOT_ASSESSED"
+    profiles = _xdoc_build_profiles(G)
+    claims = {k: _xcon_doc_claims(G, p) for k, p in profiles.items()}
+    allf: List[Dict[str, Any]] = []
+    for u, v, d in live:
+        e = dict(d, source_id=u, target_id=v)
+        if u not in profiles or v not in profiles: continue
+        a, b = profiles[u], profiles[v]
+        scope = _xdoc_edge_scope(e)
+        if e.get("link_status") in (XDOC_EXPLICIT, XDOC_CONFLICT) and scope == "TRANSACTION" and not e.get("semantic_only"):
+            F, compared = _xcon_compare_pair(G, e, a, b, claims[u], claims[v])
+            summary["pairs_compared"] += 1
+            if not F and compared:
+                F = [_xcon_mk("CONSISTENT", "*", _xcon_side(G, u, None, []), _xcon_side(G, v, None, []), "all compared fields agree: " + ", ".join(compared), {"relationship_type": e.get("relationship_type"), "link_status": e.get("link_status"), "link_reason": e.get("link_reason")}, compared_fields=compared)]
+        elif e.get("link_status") == XDOC_CONFLICT and scope == "ENTITY": F = []; summary["suppressed_entity_level_conflicts"] += 1  # same vendor / person only: different transactions legitimately differ
+        elif e.get("link_status") == XDOC_CONFLICT and scope is None:
+            F = [_xcon_mk("UNRESOLVED", "link", _xcon_side(G, u, sorted({c["field"] for c in e["conflicts"]}), []), _xcon_side(G, v, None, []), "fields differ but the documents are linked only weakly" + (" (semantic similarity)" if e.get("semantic_only") else "") + ", so it is not established they describe the same transaction",
+                              {"relationship_type": e.get("relationship_type"), "link_status": e.get("link_status"), "link_reason": e.get("link_reason")}, conflicting_fields=sorted({c["field"] for c in e["conflicts"]}))]
+        else: F = []
+        F.sort(key=lambda f: (_XCON_PRIO[f["category"]], f["field"], f["finding_id"]))
+        d["contradiction_findings"] = F
+        d["contradiction_class"] = F[0]["category"] if F else "NOT_ASSESSED"
+        allf += F
+    for did, p in profiles.items():  # information needed to resolve is absent: a referenced document was not supplied (Phase A xdoc_unresolved_references)
+        for r in G.nodes[did].get("xdoc_unresolved_references") or []:
+            allf.append(_xcon_mk("MISSING_EVIDENCE", "reference", _xcon_side(G, did, {"reference_type": r.get("reference_type"), "reference": r.get("reference")}, r.get("provenance") or []), None,
+                                 "the document refers to a document that was not supplied; nothing is assumed about it"))
+    viol_by_ev: Dict[str, List[str]] = defaultdict(list)
+    for dec, dd in _nodes_of_type(G, "Decision"):  # POLICY_VIOLATION = existing deterministic verdicts only
+        if dd.get("verdict") != "VIOLATION": continue
+        evs = _supporting_evidence_ids(G, dec)
+        for ev in evs: viol_by_ev[ev].append(dec)
+        provs = [{"evidence_id": ev, "document_id": (_evidence_source_docs(G, ev) or [{}])[0].get("document_id"), "filename": (_evidence_source_docs(G, ev) or [{}])[0].get("filename"), "location": G.nodes[ev].get("source_location")} for ev in evs]
+        if provs:
+            f = _xcon_mk("POLICY_VIOLATION", "policy", {"document_id": provs[0]["document_id"], "filename": provs[0]["filename"], "value": {"decision_id": dec, "rule_id": dd.get("rule_id"), "rule": G.nodes[dd["rule_id"]].get("condition") if dd.get("rule_id") in G else None}, "provenance": provs[:5]}, None,
+                         "existing deterministic Decision with verdict VIOLATION (copied, not derived from any contradiction)", None, severity="deterministic", source="existing_deterministic_decision", derived_from_contradiction=False,
+                         files=sorted({p["filename"] for p in provs if p["filename"]}))
+            allf.append(f)
+    for f in allf:  # information only: a contradictory claim's evidence that also underlies an existing violation decision (category unchanged)
+        if f["category"] in XCON_CONTRADICTION:
+            f["policy_decisions_on_same_evidence"] = sorted({dec for s in (f["claim_a"], f["claim_b"]) if s for p in s["provenance"] for dec in viol_by_ev.get(p.get("evidence_id"), [])})
+    allf.sort(key=lambda f: (_XCON_PRIO[f["category"]], f["field"], f["finding_id"]))
+    G.graph["contradiction_findings"] = allf
+    summary["by_category"] = dict(Counter(f["category"] for f in allf))
+    summary["findings"] = len(allf)
+    G.graph["contradiction_summary"] = summary
+    return summary
+
+def v2_contradiction_section(G: nx.MultiDiGraph) -> str:
+    """Deterministic report block; '' when there is nothing to report."""
+    fs = [f for f in G.graph.get("contradiction_findings") or [] if f["category"] != "CONSISTENT"]
+    if not fs: return ""
+    out = ("\n### Contradiction classification (deterministic, heuristic)\n\nFindings compare what linked documents say about the same transaction. A contradiction is NOT a compliance violation, nothing here is resolved, "
+           "and POLICY_VIOLATION entries are copies of existing deterministic policy decisions.\n\n")
+    for i, f in enumerate(fs, 1):
+        cl = lambda s: "-" if not s else f"{s['filename']}: `{s['value']}` [" + "; ".join(f"{p.get('filename')} @ {p.get('location')} (evidence {p.get('evidence_id')})" for p in s["provenance"][:2]) + "]"
+        out += f"{i}. **{f['category']}** ({f['field']}): {f['reason']}. Claim A: {cl(f['claim_a'])}. Claim B: {cl(f['claim_b'])}.\n"
+    return out + "\n"
+
+# --- SELF-VERIFICATION RESULT CONTRACT (Phase 7A: structure only) ---
+# One structured, read-only view of an EXISTING Decision for later self-verification phases. It only REUSES query_decision_lineage, the stored Decision attributes, the
+# contradiction findings (G.graph["contradiction_findings"]) and the Evidence provenance. It creates no node / edge, changes no verdict and invents no evidence: every evidence
+# reference is an Evidence node that exists in the graph, with its stored document id / location / provenance. No verification is performed here, so verification_status is
+# NOT_VERIFIED and escalation_reason is None; confidence.value is None (NOT_MEASURED) because no calibrated decision-level confidence exists (measured components are listed, never aggregated).
+SELF_VERIFICATION_FIELDS = ("decision", "confidence", "supporting_evidence", "contradicting_evidence", "policy_rules", "missing_evidence", "verification_status", "escalation_reason")
+SELF_VERIFICATION_STATUSES = ("NOT_VERIFIED", "VERIFIED", "FAILED", "ESCALATE")  # 7A produced NOT_VERIFIED only; 7B (verify_self_verification_result) may set the rest
+
+def _sv_json(x: Any) -> Any:
+    return json.loads(json.dumps(x, default=str))
+
+def _sv_evidence_refs(G: nx.MultiDiGraph, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    eid = item["evidence_id"]
+    base = {"evidence_id": eid, "origins": list(item.get("origins") or []), "via_nodes": list(item.get("via_nodes") or []), "context_only": bool(item.get("context_only")), "provenance": _sv_json(item.get("provenance"))}
+    docs = item.get("documents") or []
+    if not docs: return [{**base, "document_id": None, "filename": None, "location": G.nodes[eid].get("source_location"), "file_hash": None}]
+    return [{**base, "document_id": d["document_id"], "filename": d.get("filename"), "location": d.get("location"), "file_hash": d.get("file_hash")} for d in docs]
+
+def build_self_verification_result(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Read-only; recomputed on every call (idempotent). All eight contract fields are always present."""
+    res: Dict[str, Any] = {"contract_version": "7A", "decision_id": decision_id, "found": False, "decision": None,
+                           "confidence": {"value": None, "status": "NOT_MEASURED", "basis": "no calibrated decision-level confidence exists; measured components are reported as stored and never aggregated", "components": {"compiled_rules": [], "evidence_extraction": []}},
+                           "supporting_evidence": [], "contradicting_evidence": [], "policy_rules": [], "missing_evidence": [],
+                           "verification_status": "NOT_VERIFIED", "escalation_reason": None, "gaps": []}
+    if not G.has_node(decision_id) or G.nodes[decision_id].get("type") != "Decision":
+        res["gaps"].append("start node missing or not a Decision"); return res
+    dd = G.nodes[decision_id]
+    lin = query_decision_lineage(G, decision_id)
+    res["found"] = True
+    res["gaps"] = list(lin.get("gaps") or [])
+    res["decision"] = {"decision_id": decision_id, "verdict": dd.get("verdict"), "rule_id": dd.get("rule_id"), "rationale": dd.get("rationale"), "result_source": dd.get("result_source"),
+                       "evaluation_engine": dd.get("evaluation_engine"), "violation_status": dd.get("violation_status")}
+    sup_ids: set = set()
+    sup_docs: set = set()
+    for item in lin.get("evidence") or []:
+        refs = _sv_evidence_refs(G, item)
+        res["supporting_evidence"] += refs
+        sup_ids.add(item["evidence_id"]); sup_docs |= {r["document_id"] for r in refs if r["document_id"]}
+        m = (item.get("provenance") or {})
+        if m.get("confidence_value") is not None: res["confidence"]["components"]["evidence_extraction"].append({"evidence_id": item["evidence_id"], "value": m.get("confidence_value"), "basis": m.get("confidence_basis")})
+        if not item.get("documents"): res["missing_evidence"].append({"kind": "evidence_without_source_document", "evidence_id": item["evidence_id"], "location": G.nodes[item["evidence_id"]].get("source_location")})
+    for c in lin.get("contradicting_evidence") or []:  # heuristic Evidence --CONTRADICTS--> Transaction edges on the basis nodes (possible, not proven)
+        if G.has_node(c["evidence_id"]):
+            res["contradicting_evidence"].append({"source": "CONTRADICTS_edge", "evidence_id": c["evidence_id"], "transaction_id": c.get("transaction_id"), "heuristic": c.get("heuristic"), "match_strength": c.get("match_strength"),
+                                                  "method": c.get("method"), "documents": _sv_json(c.get("documents")), "location": G.nodes[c["evidence_id"]].get("source_location"), "provenance": _sv_json(G.nodes[c["evidence_id"]].get("provenance"))})
+    for eid in dd.get("contradicting_evidence_ids") or []:  # evidence behind the OPPOSITE verdict of the same rule (stored by the rule engine)
+        if G.has_node(eid) and G.nodes[eid].get("type") == "Evidence":
+            res["contradicting_evidence"].append({"source": "opposite_verdict_basis", "evidence_id": eid, "documents": _sv_json(_evidence_source_docs(G, eid)), "location": G.nodes[eid].get("source_location"), "provenance": _sv_json(G.nodes[eid].get("provenance"))})
+    for f in G.graph.get("contradiction_findings") or []:  # classifier findings whose claims rest on this decision's supporting evidence; both claims kept as stored
+        sides = [s for s in (f.get("claim_a"), f.get("claim_b")) if s]
+        touches = any(p.get("evidence_id") in sup_ids for s in sides for p in s.get("provenance") or [])
+        if f.get("category") in XCON_CONTRADICTION and touches:
+            res["contradicting_evidence"].append({"source": "contradiction_finding", "finding_id": f["finding_id"], "category": f["category"], "field": f["field"], "reason": f.get("reason"), "claim_a": _sv_json(f.get("claim_a")),
+                                                  "claim_b": _sv_json(f.get("claim_b")), "resolution": f.get("resolution"), "is_policy_violation": f.get("is_policy_violation")})
+        elif f.get("category") == "MISSING_EVIDENCE" and f.get("claim_a") and f["claim_a"].get("document_id") in sup_docs:
+            res["missing_evidence"].append({"kind": "referenced_document_not_supplied", "finding_id": f["finding_id"], "claim": _sv_json(f["claim_a"]), "reason": f.get("reason")})
+    if lin.get("rule"):
+        res["policy_rules"].append({"rule_id": lin["rule"]["node_id"], "condition": lin["rule"].get("condition"), "source_file": lin["rule"].get("source_file"), "source_location": lin["rule"].get("source_location"),
+                                    "policies": list(lin.get("policies") or []), "rulebook_provenance": _sv_json(dd.get("rulebook_provenance")), "compiled_rules": _sv_json(dd.get("compiled_rules") or []),
+                                    "rule_source_evidence": [{"evidence_id": x["evidence_id"], "documents": _sv_json(x.get("documents"))} for x in lin.get("rule_source") or []]})
+    for cr in dd.get("compiled_rules") or []:
+        if cr.get("confidence") is not None: res["confidence"]["components"]["compiled_rules"].append({"rule_id": cr.get("rule_id"), "value": cr.get("confidence"), "basis": "policy_compiler_reported"})
+    for mf in dd.get("compiled_missing_facts") or []: res["missing_evidence"].append({"kind": "compiled_rule_missing_fact", "fact": mf})
+    for g_ in dd.get("extraction_gap_documents") or []: res["missing_evidence"].append({"kind": "extraction_gap", "document": g_})
+    if dd.get("verdict") in ("VIOLATION", "SATISFIED") and not sup_ids: res["missing_evidence"].append({"kind": "no_supporting_evidence", "reason": "no evidence linked to this decision"})
+    if dd.get("verdict") in ("UNEVALUATED", "INCONCLUSIVE") and dd.get("unevaluated_reason"): res["missing_evidence"].append({"kind": "rule_not_evaluated", "reason": dd.get("unevaluated_reason")})
+    return res
+
+def build_self_verification_results(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    return [build_self_verification_result(G, n) for n, _ in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0])]
+
+def validate_self_verification_result(G: nx.MultiDiGraph, r: Dict[str, Any]) -> List[str]:
+    """Contract check: all fields present, status allowed, and every evidence / document reference exists in the graph (nothing invented)."""
+    probs = [f"missing field {k}" for k in SELF_VERIFICATION_FIELDS if k not in r]
+    if r.get("verification_status") not in SELF_VERIFICATION_STATUSES: probs.append(f"unknown verification_status {r.get('verification_status')}")
+    if r.get("escalation_reason") is not None and not isinstance(r["escalation_reason"], str): probs.append("escalation_reason must be None or str")
+    for ref in r.get("supporting_evidence") or []:
+        eid = ref.get("evidence_id")
+        if not (G.has_node(eid) and G.nodes[eid].get("type") == "Evidence"): probs.append(f"supporting evidence {eid} not in graph"); continue
+        if ref.get("document_id") and ref["document_id"] not in {x["document_id"] for x in _evidence_source_docs(G, eid)}: probs.append(f"evidence {eid} is not derived from document {ref['document_id']}")
+    if (r.get("confidence") or {}).get("value") is not None: probs.append("confidence.value must stay None (NOT_MEASURED)")
+    if (r.get("verification_status") == "ESCALATE") != bool(r.get("escalation_reason")): probs.append("escalation_reason must be set exactly when verification_status is ESCALATE")
+    for mc in r.get("material_claims") or []:  # 7B: every cited evidence / document must exist and be derived from that document (nothing invented)
+        for ref in mc.get("evidence") or []:
+            eid = ref.get("evidence_id")
+            if not (G.has_node(eid) and G.nodes[eid].get("type") == "Evidence"): probs.append(f"material claim {mc.get('claim_id')} cites evidence {eid} not in graph"); continue
+            if ref.get("document_id") and ref["document_id"] not in {x["document_id"] for x in _evidence_source_docs(G, eid)}: probs.append(f"material claim evidence {eid} is not derived from document {ref['document_id']}")
+    for c in r.get("contradicting_evidence") or []:
+        if c.get("evidence_id") and not G.has_node(c["evidence_id"]): probs.append(f"contradicting evidence {c['evidence_id']} not in graph")
+        for s in (c.get("claim_a"), c.get("claim_b")):
+            for p in (s or {}).get("provenance") or []:
+                if p.get("evidence_id") and not G.has_node(p["evidence_id"]): probs.append(f"claim evidence {p['evidence_id']} not in graph")
+    return probs
+
+# --- SELF-VERIFICATION OF MATERIAL CLAIMS (Phase 7B) ---
+# Verifies the MATERIAL CLAIMS behind an existing VIOLATION / SATISFIED Decision: the basis nodes (Transaction / Claim / Entity / Evidence) recorded by the rule engine, plus the
+# "required text absent within extracted scope" claim. Each claim is re-checked against its ACTUAL source evidence (non-heuristic, non-context Evidence --SUPPORTS--> node, with a
+# DERIVED_FROM Document, and, for amounts, the stored evidence text must still contain that currency + amount). Reuses build_self_verification_result / query_decision_lineage /
+# contradiction findings; creates no node / edge, changes no verdict, invents no evidence, and leaves confidence.value None (NOT_MEASURED).
+#   claim grounding: GROUNDED | WEAK (grounded text-wise but no source location, or text redacted so the value cannot be re-confirmed, or extraction incomplete) | UNSUPPORTED
+#   FAILED = any UNSUPPORTED material claim (incl. conclusion with no recorded basis) | ESCALATE = no UNSUPPORTED, but a WEAK claim or a MAJOR contradiction / opposite-verdict evidence is unresolved | VERIFIED otherwise.
+#   Decisions asserting no conclusion (UNEVALUATED / INCONCLUSIVE / NOT_APPLICABLE) have nothing to ground: they stay NOT_VERIFIED with a note.
+SV_ASSERTING_VERDICTS = ("VIOLATION", "SATISFIED")
+
+def _sv_amount_in_text(text: Optional[str], currency: str, amount: float) -> bool:
+    for m in MONEY_PATTERN.finditer(text or ""):
+        try: v = float(m.group(2).replace(",", ""))
+        except ValueError: continue
+        if _normalize_currency(m.group(1)) == currency and abs(v - amount) < 1e-9: return True
+    return False
+
+def _sv_claim_spec(G: nx.MultiDiGraph, node_id: str) -> Dict[str, Any]:
+    d = G.nodes[node_id]; t = d.get("type")
+    spec: Dict[str, Any] = {"node_id": node_id, "node_type": t, "kind": "existence", "currency": None, "amount": None, "description": f"{t} {node_id}"}
+    cur, amt = None, None
+    if t == "Transaction": cur, amt = d.get("currency"), d.get("amount")
+    elif t == "Claim" and d.get("claim_type") == "MonetaryAmount":
+        try: cur, amt = str(d.get("value")).split()[0], float(str(d.get("value")).split()[1])
+        except (IndexError, ValueError): pass
+    if cur and isinstance(amt, (int, float)) and math.isfinite(amt):
+        spec.update(kind="amount", currency=cur, amount=float(amt), description=f"{t} {cur} {amt:g}")
+    return spec
+
+def _sv_check_claim(G: nx.MultiDiGraph, spec: Dict[str, Any]) -> Dict[str, Any]:
+    nid = spec["node_id"]
+    out = {"claim_id": f"claim::{nid}", "node_id": nid, "node_type": spec["node_type"], "kind": spec["kind"], "description": spec["description"], "grounding": "UNSUPPORTED", "reason": None, "evidence": []}
+    if not G.has_node(nid): out["reason"] = "basis node not found in graph"; return out
+    ev_ids = []
+    for e in _supporting_evidence_ids(G, nid):
+        ed = G.nodes[e]
+        if ed.get("type") != "Evidence" or ed.get("context_only") or _is_policy_source_evidence(ed): continue
+        if e != nid and not any(not x.get("heuristic") for x in (G.get_edge_data(e, nid) or {}).values() if x.get("relation") == "SUPPORTS"): continue  # heuristic links never ground a claim
+        ev_ids.append(e)
+    if not ev_ids: out["reason"] = "no qualifying (non-heuristic, non-context) supporting Evidence"; return out
+    matched, unconfirmed, mismatched, nodoc = [], [], [], []
+    for e in ev_ids:
+        docs = _evidence_source_docs(G, e)
+        ref = {"evidence_id": e, "document_id": docs[0]["document_id"] if docs else None, "filename": docs[0]["filename"] if docs else None, "location": G.nodes[e].get("source_location") or (docs[0].get("location") if docs else None),
+               "document_ids": [x["document_id"] for x in docs], "provenance": _sv_json(G.nodes[e].get("provenance"))}
+        out["evidence"].append(ref)
+        if not docs: nodoc.append(e); continue
+        if spec["kind"] != "amount": matched.append(e)
+        elif _sv_amount_in_text(G.nodes[e].get("text"), spec["currency"], spec["amount"]): matched.append(e)
+        elif "[REDACTED" in str(G.nodes[e].get("text") or ""): unconfirmed.append(e)
+        else: mismatched.append(e)
+    located = lambda e: bool(next(r for r in out["evidence"] if r["evidence_id"] == e)["location"])
+    if matched and any(located(e) for e in matched): out["grounding"], out["reason"] = "GROUNDED", f"found in {len(matched)} source evidence item(s)"
+    elif matched: out["grounding"], out["reason"] = "WEAK", "supported by evidence that has no recorded source location"
+    elif unconfirmed: out["grounding"], out["reason"] = "WEAK", "evidence text is redacted, so the claimed value cannot be re-confirmed from source text"
+    else: out["reason"] = ("supporting evidence has no source document" if nodoc and not mismatched else f"claimed {spec['currency']} {spec['amount']:g} not found in the supporting evidence text") if spec["kind"] == "amount" else "supporting evidence has no source document"
+    return out
+
+def verify_self_verification_result(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Read-only (no graph mutation); idempotent. Returns the 7A result with verification_status / escalation_reason / gaps populated and a `material_claims` list added."""
+    res = build_self_verification_result(G, decision_id)
+    res["material_claims"] = []
+    if not res["found"]: return res
+    dd = G.nodes[decision_id]; verdict = dd.get("verdict")
+    if verdict not in SV_ASSERTING_VERDICTS:
+        res["gaps"].append(f"verification not applicable: verdict {verdict} asserts no conclusion, so there are no material claims to ground"); return res
+    res["contract_version"] = "7B"
+    claims: List[Dict[str, Any]] = []
+    if dd.get("violation_status") == "ABSENCE_OF_REQUIRED_TEXT_WITHIN_EXTRACTED_SCOPE":
+        scope = list(dd.get("absence_scope_evidence_ids") or [])
+        ok = [e for e in scope if G.has_node(e) and G.nodes[e].get("type") == "Evidence"]
+        c = {"claim_id": f"claim::{decision_id}::absence", "node_id": None, "node_type": "Decision", "kind": "absence_within_scope", "description": "required text absent within the extracted evidence scope",
+             "grounding": "UNSUPPORTED", "reason": "no scope evidence recorded", "evidence": [{"evidence_id": e, "document_id": (_evidence_source_docs(G, e) or [{}])[0].get("document_id"), "filename": (_evidence_source_docs(G, e) or [{}])[0].get("filename"),
+                                                                                           "location": G.nodes[e].get("source_location"), "document_ids": [x["document_id"] for x in _evidence_source_docs(G, e)], "provenance": _sv_json(G.nodes[e].get("provenance"))} for e in ok]}
+        if ok and len(ok) == len(scope):
+            gaps = extraction_gaps(G)
+            c["grounding"], c["reason"] = ("WEAK", f"absence holds only within extracted scope; extraction incomplete for {len(gaps)} document(s)") if gaps else ("GROUNDED", "absence verified against every recorded scope evidence item")
+        elif scope: c["reason"] = "some recorded scope evidence is not in the graph"
+        claims.append(c)
+    else:
+        lin = query_decision_lineage(G, decision_id)
+        ids = list(dict.fromkeys(list(dd.get("basis_node_ids") or []) + [b["node_id"] for b in lin.get("basis_nodes") or []]))
+        for b in ids:
+            claims.append(_sv_check_claim(G, _sv_claim_spec(G, b)) if G.has_node(b) else _sv_check_claim(G, {"node_id": b, "node_type": None, "kind": "existence", "description": f"basis node {b}"}))
+        if not ids: claims.append({"claim_id": f"claim::{decision_id}::basis", "node_id": None, "node_type": None, "kind": "decision_basis", "description": f"{verdict} conclusion has no recorded basis",
+                                   "grounding": "UNSUPPORTED", "reason": "no basis node recorded for the conclusion", "evidence": []})
+    res["material_claims"] = claims
+    bad, weak = [c for c in claims if c["grounding"] == "UNSUPPORTED"], [c for c in claims if c["grounding"] == "WEAK"]
+    majors = [c for c in res["contradicting_evidence"] if c.get("category") == "MAJOR_CONTRADICTION" or c.get("source") == "opposite_verdict_basis"]
+    for c in bad: res["gaps"].append(f"unsupported material claim {c['claim_id']}: {c['reason']}")
+    for c in weak: res["gaps"].append(f"weakly grounded material claim {c['claim_id']}: {c['reason']}")
+    if bad: res["verification_status"] = "FAILED"
+    elif weak or majors:
+        res["verification_status"] = "ESCALATE"
+        why = ([f"{len(weak)} weakly grounded material claim(s)"] if weak else []) + ([f"{len(majors)} unresolved major contradiction / opposite-verdict evidence item(s)"] if majors else [])
+        res["escalation_reason"] = "; ".join(why) + "; review required"
+    else: res["verification_status"] = "VERIFIED"
+    return res
+
+def verify_self_verification_results(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    return [verify_self_verification_result(G, n) for n, _ in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0])]
+
+# --- POLICY-RULE APPLICABILITY VERIFICATION (Phase 7C) ---
+# Independent, read-only check that the rule the Decision cites actually applies to the verified material facts. It REUSES verify_self_verification_result (7B), the stored Decision
+# attributes (rule_id, parsed_spec, compiled_rules, rulebook_provenance, basis_node_ids) and the PolicyRule / Policy nodes; it does NOT rerun or replace the policy engine, creates no node / edge,
+# never changes the verdict, invents nothing and keeps confidence None (NOT_MEASURED). Result is ADDITIVE: the eight contract fields stay; details go in `policy_applicability`.
+#   checks: rule identity (EVALUATES edge == Decision.rule_id) | policy scope (Decision policies subset of the rule's owning policies) | rule text still equals the spec the Decision used |
+#           required facts present (amount / currency unit / validity / phrase) | basis values meet the rule's condition for the stored verdict | compiled rule mapped, VALID, no missing facts.
+#   status: FAILED (7B) stays FAILED | non-asserting verdict stays NOT_VERIFIED | applicability established -> keeps 7B status (VERIFIED) | mismatch or cannot be established -> ESCALATE.
+def _pa_basis_problems(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any], basis: List[str]) -> Tuple[List[str], List[str]]:
+    bad: List[str] = []; miss: List[str] = []
+    verdict, subj = dd.get("verdict"), spec.get("subject")
+    want = (spec.get("mode") == "FORBID") == (verdict == "VIOLATION")  # True: basis must MEET the condition (FORBID+VIOLATION, REQUIRE+SATISFIED)
+    if dd.get("violation_status") == "ABSENCE_OF_REQUIRED_TEXT_WITHIN_EXTRACTED_SCOPE":
+        phrase = str(spec.get("value") or "")
+        if not (subj == "KEYWORD" and spec.get("mode") == "REQUIRE" and verdict == "VIOLATION" and phrase): bad.append("absence conclusion does not match a REQUIRE KEYWORD rule")
+        elif any(phrase in str(G.nodes[e].get("text") or "").lower() for e in dd.get("absence_scope_evidence_ids") or [] if G.has_node(e)): bad.append(f"required phrase '{phrase}' is present in the recorded scope evidence")
+        return bad, miss
+    for n in basis:
+        d = G.nodes[n] if G.has_node(n) else {}
+        t = d.get("type")
+        if subj in ("TRANSACTION", "AMOUNT_MATCH"):
+            if t != "Transaction": bad.append(f"basis node {n} is {t}, not a Transaction"); continue
+            if _is_policy_role(d.get("amount_role")) or d.get("amount_role") == ROLE_UNCLEAR: bad.append(f"basis node {n} amount role {d.get('amount_role')} is not an actual transaction"); continue
+            amt = d.get("amount")
+            if not isinstance(amt, (int, float)) or not math.isfinite(amt): miss.append(f"{n}: amount"); continue
+            if subj == "TRANSACTION":
+                cur = spec.get("currency")
+                if cur and d.get("currency") not in _KNOWN_CURRENCIES: miss.append(f"{n}: currency unit"); continue
+                if cur and d.get("currency") != cur: bad.append(f"basis node {n} currency {d.get('currency')} differs from rule currency {cur}"); continue
+                if _CMP_OPS[spec["op"]](amt, spec["value"]) != want: bad.append(f"basis node {n} amount {amt:g} does not {'meet' if want else 'fail'} the rule condition {spec['op']} {spec['value']:g} required for verdict {verdict}")
+        elif subj in ("GOVID", "PHONE"):
+            if t != "Entity" or d.get("entity_type") != ("GovID" if subj == "GOVID" else "Phone"): bad.append(f"basis node {n} is not a {subj} entity")
+            elif d.get("is_valid") is None: miss.append(f"{n}: validity result")
+            elif bool(d["is_valid"]) != want: bad.append(f"basis node {n} validity {d['is_valid']} contradicts the rule for verdict {verdict}")
+        elif subj == "KEYWORD":
+            if t != "Evidence": bad.append(f"basis node {n} is not an Evidence node")
+            elif (str(spec.get("value")) in str(d.get("text") or "").lower()) != want: bad.append(f"basis evidence {n} {'lacks' if want else 'contains'} phrase '{spec.get('value')}' contrary to verdict {verdict}")
+        else: miss.append(f"rule subject {subj} cannot be re-checked")
+    if subj == "AMOUNT_MATCH" and not bad and not miss:  # relationship, not mere presence: reliably linked basis pairs must differ (VIOLATION) / all agree (SATISFIED)
+        pairs = [(a, b) for i, a in enumerate(basis) for b in basis[i + 1:] if G.nodes[a].get("currency") == G.nodes[b].get("currency") and _match_transactions(G.nodes[a], G.nodes[b])[0] == "strong"]
+        diff = any(G.nodes[a]["amount"] != G.nodes[b]["amount"] for a, b in pairs); same = any(G.nodes[a]["amount"] == G.nodes[b]["amount"] for a, b in pairs)
+        if not pairs: bad.append("no reliably linked basis pair (same reference / date + party + expense type, same currency) to compare amounts")
+        elif verdict == "VIOLATION" and not diff: bad.append("linked basis amounts do not differ, contrary to verdict VIOLATION")
+        elif verdict == "SATISFIED" and (diff or not same): bad.append("linked basis amounts do not all match, contrary to verdict SATISFIED")
+    return bad, miss
+
+def _pa_compiled_problems(G: nx.MultiDiGraph, dd: Dict[str, Any], rd: Dict[str, Any], basis: List[str]) -> Tuple[List[str], List[str]]:
+    bad: List[str] = []; miss: List[str] = []
+    ents = [e for e in dd.get("compiled_rules") or [] if e.get("executed") and e.get("verdict") not in (None, "INDETERMINATE")]
+    if not ents: return bad, ["no executed compiled rule recorded on the Decision"]
+    full = {e.get("rule_id"): e for e in rd.get("compiled_rules") or []}
+    line = _ws_norm(redact_pii(rd.get("original_text") or rd.get("condition") or ""))
+    for e in ents:
+        rid, src = e.get("rule_id"), _ws_norm(e.get("source_text"))
+        if e.get("status") != "VALID": bad.append(f"compiled rule {rid} status {e.get('status')} is not VALID")
+        if not e.get("mapping_basis") or not src or not (src in line or line in src): bad.append(f"compiled rule {rid} is not mapped to the cited rule text")
+        for m in e.get("missing_facts") or []: miss.append(f"{rid}: {m}")
+        ent = str(((full.get(rid) or {}).get("compiled_rule") or {}).get("entity") or "").lower()
+        types = {"Transaction"} if ent in _COMPILED_TXN_ENTITIES else {"Entity"} if any(ent in a for a in _COMPILED_ENTITY_MAP.values()) else None
+        if types is None: miss.append(f"{rid}: entity {ent or 'unknown'} cannot be matched to basis nodes")
+        else: bad += [f"basis node {n} is {G.nodes[n].get('type') if G.has_node(n) else None}, not {sorted(types)[0]} required by compiled rule {rid}" for n in basis if not G.has_node(n) or G.nodes[n].get("type") not in types]
+    miss += [f"decision: {m}" for m in dd.get("compiled_missing_facts") or []]
+    return bad, list(dict.fromkeys(miss))
+
+def verify_policy_applicability(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Read-only; idempotent. 7B result + additive `policy_applicability` detail. Never changes the Decision verdict, the graph, or confidence."""
+    res = verify_self_verification_result(G, decision_id)
+    pa: Dict[str, Any] = {"status": "NOT_CHECKED", "rule": None, "checks": [], "mismatches": [], "missing_facts": [], "note": None}
+    res["policy_applicability"] = pa
+    if not res["found"]: pa["note"] = "decision not found"; return res
+    dd = G.nodes[decision_id]
+    if dd.get("verdict") not in SV_ASSERTING_VERDICTS: pa["note"] = f"verdict {dd.get('verdict')} asserts no conclusion: applicability not checked"; return res
+    if res["verification_status"] == "FAILED": pa["note"] = "7B FAILED: applicability not assessed; status stays FAILED"; return res
+    res["contract_version"] = "7C"
+    rid = dd.get("rule_id"); rd = G.nodes[rid] if rid and G.has_node(rid) and G.nodes[rid].get("type") == "PolicyRule" else None
+    pa["rule"] = {"rule_id": rid, "condition": (rd or {}).get("condition"), "source_file": (rd or {}).get("source_file"), "source_location": (rd or {}).get("source_location"),
+                  "rulebook_provenance": _sv_json(dd.get("rulebook_provenance")), "parsed_spec": _sv_json(dd.get("parsed_spec")), "basis_node_ids": list(dd.get("basis_node_ids") or []), "result_source": dd.get("result_source")}
+    bad, miss = pa["mismatches"], pa["missing_facts"]
+    def chk(name: str, b0: int, m0: int) -> None: pa["checks"].append({"check": name, "result": "MISMATCH" if len(bad) > b0 else "MISSING" if len(miss) > m0 else "OK"})
+    b0, m0 = len(bad), len(miss)
+    if rd is None: bad.append(f"cited rule {rid} is not a PolicyRule in the graph")
+    else:
+        evaluated = [v for _, v, e in G.out_edges(decision_id, data=True) if e.get("relation") == "EVALUATES"]
+        if evaluated != [rid]: bad.append(f"Decision evaluates {evaluated} but cites rule {rid}")
+        if dd.get("rule_source_file") != rd.get("source_file") or dd.get("rule_source_location") != rd.get("source_location"): bad.append("Decision rule source file/location differs from the rule node")
+    chk("rule_identity", b0, m0); b0, m0 = len(bad), len(miss)
+    if rd is not None:
+        rule_pols = {v for _, v, e in G.out_edges(rid, data=True) if e.get("relation") == "BELONGS_TO" and G.nodes[v].get("type") == "Policy"}
+        dec_pols = {v for _, v, e in G.out_edges(decision_id, data=True) if e.get("relation") == "BELONGS_TO" and G.nodes[v].get("type") == "Policy"}
+        if not rule_pols: miss.append("rule has no owning Policy: scope cannot be established")
+        elif not dec_pols: miss.append("Decision records no Policy scope")
+        elif not dec_pols <= rule_pols: bad.append(f"Decision policy scope {sorted(dec_pols - rule_pols)} is not a Policy that owns rule {rid}")
+    chk("policy_scope", b0, m0); b0, m0 = len(bad), len(miss)
+    basis = list(dd.get("basis_node_ids") or [])
+    if rd is not None:
+        if dd.get("result_source") == "compiled_policy_engine": nb, nm = _pa_compiled_problems(G, dd, rd, basis)
+        else:
+            spec = dd.get("parsed_spec")
+            if not spec: nb, nm = [], ["no parsed rule spec recorded on the Decision"]
+            elif parse_policy_rule(rd.get("condition", "")) != spec: nb, nm = ["rule text no longer parses to the spec the Decision used"], []
+            else: nb, nm = _pa_basis_problems(G, dd, spec, basis)
+        bad += nb; miss += nm
+    chk("rule_conditions_facts_units", b0, m0)
+    pa["status"] = "MISMATCH" if bad else "UNESTABLISHED" if miss else "VERIFIED"
+    for x in bad: res["gaps"].append(f"policy rule mismatch: {x}")
+    for x in miss: res["gaps"].append(f"policy rule fact missing: {x}")
+    if pa["status"] != "VERIFIED":
+        why = f"policy rule applicability {'mismatch' if bad else 'not established'}: " + "; ".join((bad + miss)[:3])
+        res["verification_status"] = "ESCALATE"
+        res["escalation_reason"] = f"{res['escalation_reason']}; {why}" if res.get("escalation_reason") else why
+    return res
+
+def verify_policy_applicability_results(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    return [verify_policy_applicability(G, n) for n, _ in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0])]
+
 # --- FULL-CHAIN TRACE: Document <- Evidence -> Claim/Entity/Transaction -> Rule <- Decision -> Risk ---
 def trace_decision_chain(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
     chain: Dict[str, Any] = {"decision_id": decision_id}
@@ -2784,6 +4218,15 @@ def trace_decision_chain(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]
     chain["supporting_evidence"] = [s["node_id"] for s in query_evidence_supporting_decision(G, decision_id)]
     return chain
 
+def _compiled_coverage(G: nx.MultiDiGraph, rules: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    """Compiled-policy counts derived from the PolicyRule / Decision nodes (empty when no rulebook was compiled)."""
+    ce = [e for _, rd in rules for e in (rd.get("compiled_rules") or [])]
+    if not ce: return {}
+    dec = {d.get("rule_id"): d for _, d in _nodes_of_type(G, "Decision")}
+    return {"compiled_rules": len(ce), "compiled_authoritative": sum(1 for rid, _ in rules if (dec.get(rid) or {}).get("evaluation_engine") == "compiled_rule_engine"),
+            "compiled_indeterminate": sum(1 for e in ce if (e.get("result") or {}).get("verdict") == "INDETERMINATE"),
+            "compiled_needs_review_not_executed": sum(1 for e in ce if e.get("status") != "VALID")}
+
 def policy_coverage(G: nx.MultiDiGraph) -> Dict[str, Any]:
     """Counts derived from each rule's own Decision, so they always agree with the per-rule results.
     discovered = PolicyRule nodes | recognized (key 'parsed') = text recognized/stored in the supported rule format; NOT necessarily executable
@@ -2804,15 +4247,23 @@ def policy_coverage(G: nx.MultiDiGraph) -> Dict[str, Any]:
         if is_rec and v and v != "UNEVALUATED":
             attempted += 1
             if v in ("VIOLATION", "SATISFIED"): evaluated += 1
-    return {"total": discovered, "discovered": discovered, "parsed": recognized, "recognized": recognized, "executable": attempted, "attempted": attempted,
+    return {**_compiled_coverage(G, rules), "total": discovered, "discovered": discovered, "parsed": recognized, "recognized": recognized, "executable": attempted, "attempted": attempted,
             "evaluated": evaluated, "evaluated_with_result": evaluated, "attempted_without_result": attempted - evaluated, "not_determined": attempted - evaluated,
             "unevaluated": discovered - attempted, "recognized_not_executable": recognized - attempted, "parsed_but_not_evaluable": recognized - attempted, "verdicts": dict(verdicts)}
 
-def _coverage_sentence(c: Dict[str, Any]) -> str:
+def _coverage_sentence_base(c: Dict[str, Any]) -> str:
     return (f"{c['discovered']} rule(s) discovered; {c['recognized']} recognized in the supported rule format (recognized/stored only; not necessarily executable); "
             f"{c['executable']} executable (deterministic rule with required support/configuration available); {c['attempted']} attempted (evaluation started); "
             f"{c['evaluated_with_result']} evaluated with a result (SATISFIED/VIOLATION); {c['attempted_without_result']} attempted without a result (INCONCLUSIVE/NOT_APPLICABLE); "
             f"{c['unevaluated']} UNEVALUATED (not attempted: support, configuration or unambiguous interpretation unavailable; NOT checked; not counted as attempted)")
+
+def _coverage_sentence(c: Dict[str, Any]) -> str:
+    s = _coverage_sentence_base(c)
+    if c.get("compiled_rules"):
+        s += (f"; compiled-policy layer: {c['compiled_rules']} compiled rule(s) mapped to rulebook lines, {c['compiled_authoritative']} rule(s) decided by the deterministic compiled-rule engine "
+              f"(authoritative), {c['compiled_indeterminate']} compiled rule(s) INDETERMINATE (required facts/evidence not available in the graph, or NEEDS_REVIEW), "
+              f"{c['compiled_needs_review_not_executed']} NEEDS_REVIEW compiled rule(s) never executed; the legacy DSL result applies wherever the compiled result is not determinate")
+    return s
 
 def policy_coverage_note(G: nx.MultiDiGraph) -> str:
     c = policy_coverage(G)
@@ -2931,11 +4382,11 @@ def report_appendix_details(G: nx.MultiDiGraph, latency: float, link_log: Option
            "INCONCLUSIVE and UNEVALUATED are neither passed nor failed: no pass or violation is implied, and no result is inferred for them.\n\n")
     rows = policy_rule_report(G)
     if rows:
-        out += "| Rule | Source | Recognized | Executable | Attempted | Verdict | Reason |\n|---|---|---|---|---|---|---|\n"
+        out += "| Rule | Source | Recognized | Executable | Attempted | Verdict | Engine | Compiled verdict | Legacy verdict | Reason |\n|---|---|---|---|---|---|---|---|---|---|\n"
         for r in rows[:30]:
             src = f"{r.get('source_file') or ''} @ {r.get('source_location') or r.get('source_line') or 'n/a'}"
             out += (f"| {_md_cell(r['condition'], 140)} | {_md_cell(src, 100)} | {'yes' if r['recognized'] else 'no'} | {'yes' if r['executable'] else 'no'} | "
-                    f"{'yes' if r['attempted'] else 'no'} | {r['verdict']} | {_md_cell(r.get('unevaluated_reason') or r.get('rationale'), 240)} |\n")
+                    f"{'yes' if r['attempted'] else 'no'} | {r['verdict']} | {r.get('evaluation_engine') or ''} | {r.get('compiled_verdict') or 'none'} | {r.get('legacy_verdict') or ''} | {_md_cell(r.get('unevaluated_reason') or r.get('rationale'), 240)} |\n")
         out += "\n"
     roles = Counter(d.get("amount_role", "not_classified") for _, d in _nodes_of_type(G, "Transaction"))
     roles.update(d.get("amount_role", ROLE_POLICY_CONTEXT) for _, d in _nodes_of_type(G, "Claim") if d.get("claim_type") == "PolicyListedAmount")
@@ -3036,8 +4487,43 @@ def policy_rule_report(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
                      "verdict": dd.get("verdict"), "rationale": dd.get("rationale"),
                      "source_file": rd.get("source_file"), "source_location": rd.get("source_location"), "source_line": rd.get("source_line"),
                      "evidence_used": dd.get("evidence_used", []), "unevaluated_reason": dd.get("unevaluated_reason"),
-                     "evaluated": dd.get("verdict") in ("VIOLATION", "SATISFIED") and bool(rd.get("parsed"))})
+                     "evaluated": dd.get("verdict") in ("VIOLATION", "SATISFIED") and bool(rd.get("parsed")),
+                     **{k: dd.get(k) for k in _COMPILED_REPORT_KEYS}})
     return rows
+
+def _compiled_policy_context(G: nx.MultiDiGraph) -> str:
+    cp = next((d.get("compiled_policy") for _, d in _nodes_of_type(G, "Policy") if d.get("compiled_policy")), None)
+    if not cp: return ""
+    rb, inp = cp.get("rulebook") or {}, cp.get("inputs") or {}
+    out = ("--- COMPILED POLICY [rulebook text interpreted by an LLM into structured rules; ONLY the deterministic rule engine executes them; NEEDS_REVIEW rules are never executed] ---\n"
+           f"Status: {cp.get('status')}; stats: {cp.get('stats')}; rulebook: {rb.get('filename')} (sha256 {rb.get('sha256')}).\n")
+    if cp.get("error"): out += f"Compilation did not complete: {cp['error']}. Legacy DSL results apply.\n"
+    if inp: out += (f"Facts derived from the graph: entities {inp.get('fact_entities')}, records {inp.get('records')}; evidence: {inp.get('evidence_note')}; evaluation date: {inp.get('evaluation_date')} ({inp.get('evaluation_date_source')}); "
+                    f"fx rates: {inp.get('fx_rates')}; strict units: {inp.get('strict_units')}.\n")
+    if cp.get("evaluation_error"): out += f"Compiled evaluation error: {cp['evaluation_error']}.\n"
+    if cp.get("needs_review_not_executed"): out += f"NEEDS_REVIEW compiled rules NOT executed (INDETERMINATE): {cp['needs_review_not_executed']}.\n"
+    if cp.get("unmapped_rules"): out += "Compiled rules not matched to any PolicyRule node (informational only, not authoritative): " + "; ".join(f"{u['rule_id']} {u.get('verdict')}" for u in cp["unmapped_rules"][:10]) + ".\n"
+    if cp.get("ambiguity_reasons"): out += "Ambiguities: " + " | ".join(str(a_) for a_ in cp["ambiguity_reasons"][:5]) + "\n"
+    out += (f"Rejected rules: {len(cp.get('rejected') or [])}; unparsed statements: {len(cp.get('unparsed_statements') or [])}.\n"
+            "Compiled verdicts: COMPLIANT / VIOLATION / EXEMPT / ACTION_REQUIRED / NOT_APPLICABLE are deterministic results; INDETERMINATE = required facts/evidence/units unavailable or rule needs review (neither pass nor fail). "
+            "A Decision names its engine: compiled_rule_engine (authoritative) or legacy_dsl; the other engine's result is shown separately and never merged.\n\n")
+    return out
+
+def _compiled_context_lines(dd: Dict[str, Any]) -> str:
+    if not dd.get("evaluation_engine"): return ""
+    out = (f"  Evaluation engine (authoritative): {dd.get('evaluation_engine')}; compiled-rule verdict: {dd.get('compiled_verdict') or 'none (no compiled rule mapped to this rule line)'}; "
+           f"legacy DSL verdict: {dd.get('legacy_verdict')}\n")
+    for cr in dd.get("compiled_rules") or []:
+        out += (f"  Compiled rule {cr.get('rule_id')} [{cr.get('status')}, {cr.get('rule_type')}, confidence {cr.get('confidence')}]: {cr.get('expression')} => {cr.get('verdict')}"
+                + ("" if cr.get("executed") else " (NOT executed)") + (f"; missing facts: {cr['missing_facts']}" if cr.get("missing_facts") else "")
+                + (f"; {'; '.join(cr['reasons'][:2])}" if cr.get("reasons") else "") + f"\n    Rule text: {cr.get('source_text')!r} (span {cr.get('source_span')} of the compiler input)\n")
+    if dd.get("legacy_disagrees"): out += "  NOTE: the legacy DSL verdict differs from the compiled result; the compiled result is authoritative.\n"
+    if dd.get("compiled_verdict_downgraded"): out += "  NOTE: the compiled verdict was downgraded to INCONCLUSIVE because no qualifying evidence-backed basis node exists.\n"
+    if dd.get("compiled_rules"):
+        out += f"  Supporting evidence: {dd.get('supporting_evidence_ids') or 'none'}; contradicting evidence: {dd.get('contradicting_evidence_ids') or 'none'}\n"
+    prov = dd.get("rulebook_provenance") or {}
+    out += f"  Rulebook provenance: {prov.get('file')} @ {prov.get('location') or prov.get('line')} (sha256 {prov.get('rulebook_sha256')})\n"
+    return out
 
 def format_policy_results_for_context(G: nx.MultiDiGraph, max_decisions: int = 30, max_nodes: int = 5) -> str:
     decisions = [(n, d) for n, d in G.nodes(data=True) if d.get("type") == "Decision"]
@@ -3045,6 +4531,7 @@ def format_policy_results_for_context(G: nx.MultiDiGraph, max_decisions: int = 3
     cov = policy_coverage(G)
     out = (f"--- POLICY EVALUATION RESULTS [DETERMINISTIC; not LLM interpretation] (UNEVALUATED = no evaluation performed: unsupported/ambiguous rule or required configuration missing, NOT checked; INCONCLUSIVE = attempted, evidence insufficient) ---\n"
            f"Coverage: {_coverage_sentence(cov)}.\n")
+    out += _compiled_policy_context(G)
     order = {"VIOLATION": 0, "SATISFIED": 1, "NOT_APPLICABLE": 2, "INCONCLUSIVE": 3, "UNEVALUATED": 4}
     decisions.sort(key=lambda x: order.get(x[1].get("verdict"), 9))
     for dec_id, dd in decisions[:max_decisions]:
@@ -3055,6 +4542,7 @@ def format_policy_results_for_context(G: nx.MultiDiGraph, max_decisions: int = 3
         if sev: out += f"  Risk severity: {sev}\n"
         _rn = G.nodes.get(rule.get("node_id"), {})
         out += f"  Rule status: recognized={'yes' if _rn.get('parsed') else 'no'}; executable={'yes' if _rn.get('executable') else 'no'}; attempted={'yes' if _rn.get('attempted') else 'no'}; result={'yes' if dd.get('verdict') in ('VIOLATION', 'SATISFIED') else 'no'}\n"
+        out += _compiled_context_lines(dd)
         if dd.get("unevaluated_reason"): out += f"  NOT EVALUATED, no compliance conclusion. Reason: {dd.get('unevaluated_reason')}\n"
         if dd.get("rule_source_location"): out += f"  Rule source: {dd.get('rule_source_file')} @ {dd.get('rule_source_location')}\n"
         if ch.get("rule_source"):
@@ -3088,7 +4576,7 @@ def format_contradictions_for_context(G: nx.MultiDiGraph, max_items: int = 20) -
                 + (f"  UNCERTAIN (requires reconciliation): {d.get('uncertainty_reason')}\n" if d.get("uncertainty_reason") else ""))
     return out + "\n"
 
-def build_v2_context(G: nx.MultiDiGraph, objective: str, link_log: Optional[List[Dict[str, Any]]] = None) -> Tuple[str, Dict[str, Any]]:
+def build_v2_context(G: nx.MultiDiGraph, objective: str, link_log: Optional[List[Dict[str, Any]]] = None, cross_document: Optional[bool] = None) -> Tuple[str, Dict[str, Any]]:
     """V2 payload: [LEXICAL] BM25 hits, [GRAPH-EXPANDED] evidence reached by edges, the traversal trace,
     policy decisions/risks, heuristic contradictions, rule context."""
     evidence_items = _investigation_evidence(G)
@@ -3199,6 +4687,16 @@ def build_v2_context(G: nx.MultiDiGraph, objective: str, link_log: Optional[List
                 "past the budget, or between nodes that were never reached were NOT examined, so it is not a complete evidence lineage and does not show that all relevant evidence was found.\n")
         ctx += "\n"
 
+    xd: Dict[str, Any] = {"status": "NOT_RUN", "enabled": False}  # Phase B: cross-document reasoning (read-only; V2 path only; cross_document=False reproduces the pre-Phase-B context exactly)
+    if ENABLE_CROSS_DOCUMENT_REASONING if cross_document is None else bool(cross_document):
+        if retrieved_evidence == 0: xd = {"status": "NO_SEEDS", "enabled": True}
+        else:
+            try:
+                xd = traverse_cross_document_context(G, list(seeds) + [i_["evidence_id"] for i_ in expanded], objective)
+                ctx += format_cross_document_for_context(G, xd)
+            except Exception as e_:
+                logger.exception(f"Cross-document context failed (continuing without it): {e_}")
+                xd = {"status": "ERROR", "enabled": True, "reason": str(e_)[:200]}
     ctx += format_policy_results_for_context(G)
     ctx += format_contradictions_for_context(G)
     _gsrc = _govid_source_lines(G)
@@ -3228,7 +4726,7 @@ def build_v2_context(G: nx.MultiDiGraph, objective: str, link_log: Optional[List
     return ctx, {"trace": trace_info, "inspected_edges": trace_info["inspected"], "retrieved": retrieved_evidence, "expanded": len(expanded), "nodes_reached": len(reached_nodes), "traversal_edges": trace_edges,
                  "context_only_expanded": sum(1 for i_ in expanded if not i_.get("supports_objective_lexically") or i_.get("policy_context")), "expansion_trace": expansion_trace,
                  "relevant_unretrieved_links": [{"key": r_["link"].get("key"), "status": r_["link"].get("status"), "evidence_ids": r_["evidence_ids"], "basis": r_["basis"]} for r_ in rel_links],
-                 "relevant_unretrieved_note": v2_unretrieved_link_note(rel_links), "relevant_unretrieved_row": v2_unretrieved_link_row(rel_links)}
+                 "relevant_unretrieved_note": v2_unretrieved_link_note(rel_links), "relevant_unretrieved_row": v2_unretrieved_link_row(rel_links), "cross_document": xd}
 
 # --- EVALUATION: evidence retrieval + graph queries (structure only; NO scores are shipped) ---
 # Ground truth is keyed by STABLE source keys (file, optional location), never by node ids (those are random per run).
@@ -3275,6 +4773,15 @@ def evaluate_evidence_retrieval(G: nx.MultiDiGraph, objective: str, ground_truth
                            "scope_note": ("Retrieval metrics are computed only against the supplied ground truth. They are NOT a V1 vs V2 comparison and do not "
                                           "establish overall accuracy; NOT_MEASURED means no usable ground truth was supplied."),
                            "ambiguous_entries": len(ground_truth or []) - len(valid), "retrieved_top_k": top, "graph_expanded": expanded}
+    xd_explicit: List[str] = []
+    xd_signal: List[str] = []
+    if ENABLE_CROSS_DOCUMENT_REASONING and seeds:  # Phase B: same inputs build_v2_context gives the cross-document traversal (lexical top-K + graph-expanded)
+        xd = traverse_cross_document_context(G, list(dict.fromkeys(top + expanded)), objective)
+        xd_explicit = [i["evidence_id"] for i in xd["explicit_items"]]
+        xd_signal = [i["evidence_id"] for k in ("weak_signals", "conflict_signals") for i in xd[k] if i.get("evidence_id")]
+        out["cross_document"] = {"status": xd["status"], "metrics": xd["metrics"], "explicit_evidence": xd_explicit, "signal_evidence": xd_signal, "related_documents": [r["filename"] for r in xd["related_documents"]],
+                                  "note": "counts describe what the traversal did; they are not accuracy. Precision/recall appear only with ground truth (below)."}
+    else: out["cross_document"] = {"status": "NOT_RUN", "reason": "cross-document reasoning disabled or no lexical seed"}
     if not valid:
         out.update(status="NOT_MEASURED", reason="no usable ground truth supplied (needs entries with a 'file'); no metrics computed")
         return out
@@ -3290,7 +4797,10 @@ def evaluate_evidence_retrieval(G: nx.MultiDiGraph, objective: str, ground_truth
         m["f1"] = None if m["precision"] is None else (0.0 if (m["precision"] + m["recall"]) == 0 else 2 * m["precision"] * m["recall"] / (m["precision"] + m["recall"]))
         return m
     out.update(status="MEASURED", unmatched_ground_truth=unmatched, relevant_evidence_in_graph=len(pool),
-               lexical_top_k=score(top), lexical_plus_graph_expansion=score(list(dict.fromkeys(top + expanded))))
+               lexical_top_k=score(top), lexical_plus_graph_expansion=score(list(dict.fromkeys(top + expanded))),
+               lexical_plus_graph_plus_cross_document=score(list(dict.fromkeys(top + expanded + xd_explicit))), cross_document_added_only=score(xd_explicit) if xd_explicit else {"status": "NOT_MEASURED", "reason": "no evidence was added through cross-document links"},
+               variant_notes={"v2_existing_graph": "lexical_plus_graph_expansion", "v2_phase_a": "Phase A adds CROSS_DOCUMENT_LINK edges that retrieval does not follow, so its retrieval equals lexical_plus_graph_expansion by construction; see cross_document.metrics for link counts",
+                              "v2_phase_b": "lexical_plus_graph_plus_cross_document", "v1": "no retrieval stage (NOT_MEASURED)"})
     return out
 
 def evaluate_graph_queries(G: nx.MultiDiGraph, expectations: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -3552,7 +5062,7 @@ def _scalar_metrics(rec: Dict[str, Any]) -> Dict[str, float]:
     out: Dict[str, Any] = {}
     r = m.get("retrieval")
     if isinstance(r, dict) and r.get("status") == "MEASURED":
-        for name, key in (("retrieval_lexical_top_k", "lexical_top_k"), ("retrieval_with_graph_expansion", "lexical_plus_graph_expansion")):
+        for name, key in (("retrieval_lexical_top_k", "lexical_top_k"), ("retrieval_with_graph_expansion", "lexical_plus_graph_expansion"), ("retrieval_with_cross_document", "lexical_plus_graph_plus_cross_document")):
             for met in ("precision", "recall", "f1"): out[f"{name}_{met}"] = (r.get(key) or {}).get(met)
     for name, key, sub in (("verdict_agreement", "verdict_agreement", "agreement"), ("false_violations", "false_violations", "count"), ("missed_violations", "missed_violations", "count"),
                            ("correct_inconclusive_unevaluated", "correct_inconclusive_unevaluated", "rate"), ("unsupported_claims", "unsupported_claims", "count"), ("citation_validity", "citation_validity", "value")):
@@ -3625,6 +5135,794 @@ def _build_v1_payload(file_paths: List[str], rulebook_text: str, G: nx.MultiDiGr
             if len(combined) < 100000:
                 combined += f"\n\n========================================\nFILE NAME: {fn}\n========================================\n\n{generate_system_validation_report(raw)}{generate_amount_role_report(raw, fn)}{raw}"
     return build_v1_amount_brief(entries, policy_coverage(G), statuses, [], sources) + combined
+
+# --- CROSS-DOCUMENT BENCHMARK + EVALUATION (evaluation layer only; no linking / retrieval / decision logic is changed) ---
+# Deterministic labelled cases + an evaluator that runs the EXISTING pipeline per variant on the SAME cases and scores it against the labels:
+#   V1              = documents present in the V1 payload (_build_v1_payload); no retrieval stage, no graph, no links, no contradiction signals, free-text LLM verdicts
+#   EVIDENCE_GRAPH = existing V2 retrieval: lexical top-K + graph expansion (ranked_evidence_ids + traverse_graph_context); Phase A edges exist but are not followed
+#   CROSS_DOCUMENT = EVIDENCE_GRAPH + Phase B (traverse_cross_document_context): evidence reached through EXPLICIT links and evidence of CONFLICTING-link documents
+# No randomness (seed: none). No LLM. Aggregates are derived from the raw per-case records only. Metrics that cannot legitimately be computed are NOT_MEASURED.
+# The benchmark decision is an EVALUATION PROTOCOL applied identically to every variant's retrieved evidence (not a change to the compliance decision logic):
+#   RECONCILIATION_REQUIRED if the variant produced a cross-document contradiction signal involving a required document (a heuristic signal, NEVER a VIOLATION);
+#   else SUPPORTED if every required document is covered by retrieved evidence; else INSUFFICIENT_EVIDENCE.
+# V1 decisions / contradictions / links are NOT_MEASURED: V1 verdicts are free LLM text and V1 has no graph.
+XBENCH_ID, XBENCH_VERSION = "omnicheck-xdoc-bench", "1.0"
+XBENCH_VARIANTS = ("V1", "EVIDENCE_GRAPH", "CROSS_DOCUMENT")
+XBENCH_DECISIONS = ("SUPPORTED", "RECONCILIATION_REQUIRED", "INSUFFICIENT_EVIDENCE")
+XBENCH_PROTOCOL = {
+    "seed": None, "randomness": "none", "llm_used": False,
+    "decision": "RECONCILIATION_REQUIRED if a contradiction signal involves a required document; else SUPPORTED if all required documents are covered by retrieved evidence; else INSUFFICIENT_EVIDENCE. A contradiction signal is never a violation.",
+    "retrieval": "evidence-level precision = retrieved evidence from relevant (required+supporting+contradicting) documents / retrieved evidence; recall = relevant ground-truth documents covered by retrieved evidence / relevant documents (entry-level, as in evaluate_evidence_retrieval); completeness = required documents covered / required documents. CROSS_DOCUMENT retrieved = EVIDENCE_GRAPH + evidence reached through EXPLICIT links + evidence of CONFLICTING-link documents; WEAK-link documents are surfaced as possibilities and are NOT counted as retrieved.",
+    "entity_links": "unordered document pairs. EVIDENCE_GRAPH: documents sharing a GovID/Phone Entity node (strong only for a valid GovID; Term co-mentions are heuristic phrase overlap and are not counted). CROSS_DOCUMENT adds CROSS_DOCUMENT_LINK edges with status EXPLICIT/WEAK/CONFLICTING (strength = the edge's match_strength); UNRESOLVED edges are not links. Semantic similarity alone is never strong.",
+    "contradictions": "unordered cross-document pairs. EVIDENCE_GRAPH: CONTRADICTS edges between evidence of different documents. CROSS_DOCUMENT adds conflict signals surfaced by the cross-document traversal. false_contradiction_rate = FP / predicted; missed_contradiction_rate = FN / expected; case_false_positive_rate = share of cases with no expected contradiction where one was predicted.",
+    "metrics_not_measured_when": "denominator is empty (nothing expected / nothing predicted), the variant has no such mechanism (V1), or ground truth does not exist.",
+}
+
+def _xb_case(cid, category, difficulty, objective, docs, decision, required, policy=None, supporting=(), contradicting=(), missing=(), links=(), contradictions=(), distractors=(), provenance=()):
+    f = lambda xs: [{"file": x} for x in xs]
+    return {"case_id": cid, "category": category, "difficulty": difficulty, "objective": objective, "policy_context": policy, "documents": dict(docs), "expected_decision": decision,
+            "required_evidence": f(required), "supporting_evidence": f(supporting), "contradicting_evidence": f(contradicting),
+            "missing_evidence": [{"reference_type": t, "reference": r, "file": fl} for t, r, fl in missing],
+            "expected_entity_links": [{"a": a, "b": b, "strength": s, "basis": bs} for a, b, s, bs in links],
+            "expected_contradictions": [{"a": a, "b": b, "field": fl} for a, b, fl in contradictions],
+            "distractors": list(distractors),
+            "expected_provenance": [{"file": fl, "reached_from": rf, "relationship_type": rt, "link_status": st} for fl, rf, rt, st in provenance]}
+
+CROSS_DOCUMENT_BENCHMARK: List[Dict[str, Any]] = [
+    _xb_case("XB-01-one-document", "one_document_sufficient", "easy", "review billed amount",
+             {"invoice_001.txt": "Invoice No: INV-1001\nVendor: Zenith Tools\nBilled amount INR 4,000\nPayment due in 30 days\n"},
+             "SUPPORTED", ["invoice_001.txt"], policy="An invoice must state its vendor and billed amount."),
+    _xb_case("XB-02-two-documents-identifier", "two_document_identifier_link", "easy", "review billed amount",
+             {"invoice_002.txt": "Invoice No: INV-2002\nPO Number: PO-2002\nVendor: Bluefin Traders\nBilled amount INR 9,000\n",
+              "po_002.txt": "Purchase Order No: PO-2002\nVendor: Bluefin Traders\nOrder value INR 9,000\nItems: cables\n"},
+             "SUPPORTED", ["invoice_002.txt", "po_002.txt"], policy="An invoice must be backed by the purchase order it references.",
+             links=[("invoice_002.txt", "po_002.txt", "strong", "identifier PO-2002 and vendor name")],
+             provenance=[("po_002.txt", "invoice_002.txt", "PURCHASE_ORDER_TO_INVOICE", "EXPLICIT")]),
+    _xb_case("XB-03-three-document-chain", "three_document_chain", "medium", "review billed amount",
+             {"invoice_003.txt": "Invoice No: INV-3003\nPO Number: PO-3003\nBilled amount INR 33,000\n",
+              "po_003.txt": "Purchase Order No: PO-3003\nApproval ID: APPR-3003\nItems: chairs\n",
+              "approval_003.txt": "Approval ID: APPR-3003\nGranted by the finance head\n"},
+             "SUPPORTED", ["invoice_003.txt", "po_003.txt", "approval_003.txt"], policy="An invoice requires a purchase order and a recorded approval of that order.",
+             links=[("invoice_003.txt", "po_003.txt", "strong", "identifier PO-3003"), ("po_003.txt", "approval_003.txt", "strong", "identifier APPR-3003")],
+             provenance=[("po_003.txt", "invoice_003.txt", "PURCHASE_ORDER_TO_INVOICE", "EXPLICIT"), ("approval_003.txt", "po_003.txt", "PURCHASE_ORDER_TO_APPROVAL", "EXPLICIT")]),
+    _xb_case("XB-04-contradictory-amount", "contradictory_documents", "medium", "review billed amount",
+             {"invoice_005.txt": "Invoice No: INV-5005\nPO Number: PO-5005\nVendor: Corvid Metals\nBilled amount INR 20,000\n",
+              "po_005.txt": "Purchase Order No: PO-5005\nVendor: Corvid Metals\nOrder value INR 12,000\n"},
+             "RECONCILIATION_REQUIRED", ["invoice_005.txt", "po_005.txt"], policy="Billed amount must not exceed the purchase order value.", contradicting=["po_005.txt"],
+             links=[("invoice_005.txt", "po_005.txt", "strong", "identifier PO-5005 and vendor name")], contradictions=[("invoice_005.txt", "po_005.txt", "amount")],
+             provenance=[("po_005.txt", "invoice_005.txt", "PURCHASE_ORDER_TO_INVOICE", "CONFLICTING")]),
+    _xb_case("XB-05-contradictory-vendor", "contradictory_documents", "hard", "review billed amount",
+             {"invoice_006.txt": "Invoice No: INV-6006\nPO Number: PO-6006\nVendor: Alder Foods\nBilled amount INR 5,000\n",
+              "po_006.txt": "Purchase Order No: PO-6006\nVendor: Birch Foods\nOrder value INR 5,000\n"},
+             "RECONCILIATION_REQUIRED", ["invoice_006.txt", "po_006.txt"], policy="The invoicing vendor must be the vendor named on the purchase order.", contradicting=["po_006.txt"],
+             links=[("invoice_006.txt", "po_006.txt", "strong", "identifier PO-6006")], contradictions=[("invoice_006.txt", "po_006.txt", "vendor")],
+             provenance=[("po_006.txt", "invoice_006.txt", "PURCHASE_ORDER_TO_INVOICE", "CONFLICTING")]),
+    _xb_case("XB-06-missing-required-evidence", "missing_required_evidence", "medium", "review billed amount",
+             {"invoice_007.txt": "Invoice No: INV-7007\nPO Number: PO-7777\nVendor: Dune Freight\nBilled amount INR 6,500\n"},
+             "INSUFFICIENT_EVIDENCE", ["invoice_007.txt", "po_007.txt"], policy="An invoice requires the purchase order it references.",
+             missing=[("purchase_order", "PO7777", "po_007.txt")]),
+    _xb_case("XB-07-distractors", "distractor_documents", "medium", "review billed amount",
+             {"invoice_008.txt": "Invoice No: INV-8008\nPO Number: PO-8008\nBilled amount INR 11,000\n",
+              "po_008.txt": "Purchase Order No: PO-8008\nOrder value INR 11,000\nItems: laptops\n",
+              "stray_008a.txt": "Payment UTR: UTR111222\nVendor: Globex Corp\nCatering for the picnic INR 300\n",
+              "stray_008b.txt": "Meeting minutes\nAgenda: office plants\n",
+              "stray_008c.txt": "Purchase Order No: PO-8999\nVendor: Hollis Paper\nOrder value INR 450\n"},
+             "SUPPORTED", ["invoice_008.txt", "po_008.txt"], policy="An invoice must be backed by the purchase order it references.",
+             links=[("invoice_008.txt", "po_008.txt", "strong", "identifier PO-8008")], distractors=["stray_008a.txt", "stray_008b.txt", "stray_008c.txt"],
+             provenance=[("po_008.txt", "invoice_008.txt", "PURCHASE_ORDER_TO_INVOICE", "EXPLICIT")]),
+    _xb_case("XB-08-identifier-invoice-payment", "identifier_entity_link", "easy", "review billed amount",
+             {"invoice_009.txt": "Invoice No: INV-9009\nBilled amount INR 2,500\n",
+              "payment_009.txt": "Payment UTR: UTR9009 settled against INV-9009\nSettled INR 2,500\n"},
+             "SUPPORTED", ["invoice_009.txt", "payment_009.txt"], policy="An invoice must have a recorded payment that cites its invoice number.",
+             links=[("invoice_009.txt", "payment_009.txt", "strong", "identifier INV-9009")],
+             provenance=[("payment_009.txt", "invoice_009.txt", "INVOICE_TO_PAYMENT", "EXPLICIT")]),
+    _xb_case("XB-09-date-and-amount-weak", "date_relationship", "medium", "review billed amount",
+             {"invoice_010.txt": "Invoice No: INV-1010\nInvoice date 2024-06-15\nBilled amount INR 3,300\n",
+              "payment_010.txt": "Payment advice\nDated 2024-06-15\nSettled INR 3,300\n"},
+             "SUPPORTED", ["invoice_010.txt"], policy="An invoice states its billed amount.", links=[("invoice_010.txt", "payment_010.txt", "weak", "same date and amount, no identifier")],
+             distractors=["payment_010.txt"]),
+    _xb_case("XB-10-amount-only-unresolved", "amount_relationship", "medium", "review billed amount",
+             {"invoice_011.txt": "Invoice No: INV-1111\nBilled amount INR 7,500\n", "payment_011.txt": "Payment advice\nSettled INR 7,500\n"},
+             "SUPPORTED", ["invoice_011.txt"], policy="An invoice states its billed amount.", distractors=["payment_011.txt"]),
+    _xb_case("XB-11-structured-field-person", "structured_field_relationship", "medium", "review billed amount",
+             {"expense_012.txt": "Expense claim\nEmployee: Priya Nair\nBilled amount INR 2,100\n", "approval_012.txt": "Approval note\nEmployee: Priya Nair\nStatus: granted\n"},
+             "SUPPORTED", ["expense_012.txt", "approval_012.txt"], policy="An expense claim requires an approval naming the same employee.",
+             links=[("expense_012.txt", "approval_012.txt", "strong", "structured field Employee: Priya Nair")]),
+    _xb_case("XB-12-semantic-similarity-only", "semantic_similarity", "hard", "review billed amount",
+             {"invoice_013.txt": "Invoice for consulting services rendered to the client during the quarter\nBilled amount INR 90,000\n",
+              "payment_013.txt": "Payment for consulting services rendered to the client during the quarter\nSettled in full\n"},
+             "SUPPORTED", ["invoice_013.txt"], policy="An invoice states its billed amount.", links=[("invoice_013.txt", "payment_013.txt", "weak", "semantic similarity only")],
+             distractors=["payment_013.txt"]),
+    _xb_case("XB-13-weak-cross-type-token", "weak_unresolved_link", "hard", "review billed amount",
+             {"invoice_014.txt": "Invoice No: INV-1414\nReference: ABC12345\nBilled amount INR 1,900\n", "payment_014.txt": "Payment UTR: ABC12345\nSettled by bank transfer\n"},
+             "SUPPORTED", ["invoice_014.txt"], policy="An invoice states its billed amount.", links=[("invoice_014.txt", "payment_014.txt", "weak", "same token under different reference types")],
+             distractors=["payment_014.txt"]),
+    _xb_case("XB-14-unrelated-documents", "unrelated_documents", "easy", "review billed amount",
+             {"invoice_015.txt": "Invoice No: INV-1500\nVendor: Quill Stationers\nBilled amount INR 800\n", "memo_015.txt": "Office memo\nThe plants in the east wing need watering twice weekly\n"},
+             "SUPPORTED", ["invoice_015.txt"], policy="An invoice states its vendor and billed amount.", distractors=["memo_015.txt"]),
+    _xb_case("XB-15-duplicate-billing-conflict", "contradictory_documents", "hard", "review billed amount",
+             {"invoice_016a.txt": "Invoice No: INV-1601\nPO Number: PO-1601\nBilled amount INR 8,000\n",
+              "invoice_016b.txt": "Invoice No: INV-1602\nPO Number: PO-1601\nBilled amount INR 8,000\n",
+              "po_016.txt": "Purchase Order No: PO-1601\nOrder value INR 8,000\n"},
+             "RECONCILIATION_REQUIRED", ["invoice_016a.txt", "invoice_016b.txt", "po_016.txt"], policy="A purchase order is billed by one invoice only.", contradicting=["invoice_016b.txt"],
+             links=[("invoice_016a.txt", "po_016.txt", "strong", "identifier PO-1601"), ("invoice_016b.txt", "po_016.txt", "strong", "identifier PO-1601"), ("invoice_016a.txt", "invoice_016b.txt", "strong", "identifier PO-1601")],
+             contradictions=[("invoice_016a.txt", "invoice_016b.txt", "invoice_id")],
+             provenance=[("po_016.txt", "invoice_016a.txt", "PURCHASE_ORDER_TO_INVOICE", "EXPLICIT")]),
+    _xb_case("XB-16-four-document-chain-with-distractors", "four_plus_document_chain", "hard", "review billed amount",
+             {"po_017.txt": "Purchase Order No: PO-1701\nItems: monitors\n",
+              "invoice_017.txt": "Invoice No: INV-1701\nPO Number: PO-1701\nBilled amount INR 14,000\n",
+              "payment_017.txt": "Payment UTR: UTR1701 settled against INV-1701\nSettled INR 14,000\n",
+              "approval_017.txt": "Approval ID: APPR-1701\nApproved payment UTR1701\n",
+              "stray_017a.txt": "Meeting minutes\nAgenda: parking policy\n", "stray_017b.txt": "Payment UTR: UTR5555\nVendor: Nile Print\nSettled INR 220\n"},
+             "SUPPORTED", ["po_017.txt", "invoice_017.txt", "payment_017.txt", "approval_017.txt"], policy="An invoice requires a purchase order, a payment that cites it, and an approval of that payment.",
+             links=[("po_017.txt", "invoice_017.txt", "strong", "identifier PO-1701"), ("invoice_017.txt", "payment_017.txt", "strong", "identifier INV-1701"), ("payment_017.txt", "approval_017.txt", "strong", "identifier UTR1701")],
+             distractors=["stray_017a.txt", "stray_017b.txt"],
+             provenance=[("po_017.txt", "invoice_017.txt", "PURCHASE_ORDER_TO_INVOICE", "EXPLICIT"), ("payment_017.txt", "invoice_017.txt", "INVOICE_TO_PAYMENT", "EXPLICIT"),
+                         ("approval_017.txt", "payment_017.txt", "PAYMENT_TO_APPROVAL", "EXPLICIT")]),
+]
+
+def validate_cross_document_benchmark(cases: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """Structural consistency of the labels (unique ids, known decisions, every referenced file is a supplied document or a declared missing one). [] = consistent."""
+    cases = CROSS_DOCUMENT_BENCHMARK if cases is None else cases
+    probs: List[str] = []
+    ids = [c.get("case_id") for c in cases]
+    probs += [f"duplicate case_id {i}" for i, n in Counter(ids).items() if n > 1]
+    for c in cases:
+        cid, docs = c.get("case_id"), c.get("documents") or {}
+        missing_files = {m["file"] for m in c.get("missing_evidence") or []}
+        if c.get("expected_decision") not in XBENCH_DECISIONS: probs.append(f"{cid}: unknown expected_decision")
+        for k in ("category", "difficulty", "objective", "required_evidence"):
+            if not c.get(k): probs.append(f"{cid}: missing {k}")
+        for k in ("required_evidence", "supporting_evidence", "contradicting_evidence"):
+            for e in c.get(k) or []:
+                if e["file"] not in docs and e["file"] not in missing_files: probs.append(f"{cid}: {k} file {e['file']} is neither a document nor declared missing")
+        for k, keys in (("expected_entity_links", ("a", "b")), ("expected_contradictions", ("a", "b")), ("expected_provenance", ("file", "reached_from"))):
+            for e in c.get(k) or []:
+                for f in keys:
+                    if e[f] not in docs: probs.append(f"{cid}: {k} references unknown document {e[f]}")
+        probs += [f"{cid}: distractor {d} is not a document" for d in c.get("distractors") or [] if d not in docs]
+        probs += [f"{cid}: missing file {f} is also supplied" for f in missing_files if f in docs]
+    return probs
+
+# ---- metric helpers ----
+def _xb_r(x: Any) -> Any:
+    return round(x, 4) if isinstance(x, float) else x
+
+def _xb_prf(tp: int, fp: int, fn: int) -> Dict[str, Any]:
+    return {"precision": _xb_r(tp / (tp + fp)) if tp + fp else NOT_MEASURED, "recall": _xb_r(tp / (tp + fn)) if tp + fn else NOT_MEASURED,
+            "f1": _xb_r(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) else NOT_MEASURED}
+
+def _xb_set_metrics(pred: set, exp: set) -> Dict[str, Any]:
+    tp, fp, fn = len(pred & exp), len(pred - exp), len(exp - pred)
+    return {"tp": tp, "fp": fp, "fn": fn, **_xb_prf(tp, fp, fn)}
+
+def _xb_num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+def _xb_mean(vals: List[Any]) -> Any:
+    v = [x for x in vals if _xb_num(x)]
+    return _xb_r(sum(v) / len(v)) if v else NOT_MEASURED
+
+def _xb_pair(a: str, b: str) -> Tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+def _xb_files_of(G: nx.MultiDiGraph, ev: str) -> List[str]:
+    return [s["filename"] for s in _evidence_source_docs(G, ev) if s.get("filename")]
+
+def _xb_eg_links(G: nx.MultiDiGraph) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for ent, d in _nodes_of_type(G, "Entity"):
+        if d.get("entity_type") not in ("GovID", "Phone"): continue
+        files = sorted({f for ev in _supporting_evidence_ids(G, ent) for f in _xb_files_of(G, ev)})
+        strength = "strong" if (d.get("entity_type") == "GovID" and d.get("is_valid") is True) else "weak"
+        for i in range(len(files)):
+            for j in range(i + 1, len(files)):
+                k = _xb_pair(files[i], files[j])
+                if out.get(k, {}).get("strength") != "strong": out[k] = {"strength": strength, "basis": f"shared {d.get('entity_type')} entity", "status": "SHARED_ENTITY"}
+    return out
+
+def _xb_cd_links(G: nx.MultiDiGraph) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], List[Dict[str, Any]]]:
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    unresolved: List[Dict[str, Any]] = []
+    for e in _xdoc_edges(G):
+        k = _xb_pair(str(e.get("source_filename")), str(e.get("target_filename")))
+        if e.get("link_status") == XDOC_UNRESOLVED:
+            unresolved.append({"a": k[0], "b": k[1], "link_reason": e.get("link_reason")}); continue
+        strength = "strong" if e.get("match_strength") == "strong" else "weak"
+        if out.get(k, {}).get("strength") != "strong":
+            out[k] = {"strength": strength, "basis": e.get("link_reason"), "status": e.get("link_status"), "relationship_type": e.get("relationship_type"), "match_methods": e.get("match_methods"), "semantic_only": bool(e.get("semantic_only"))}
+    return out, unresolved
+
+def _xb_eg_contradictions(G: nx.MultiDiGraph) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for u, v, d in G.edges(data=True):
+        if d.get("relation") != "CONTRADICTS": continue
+        other = d.get("counterpart_evidence_id") or (_supporting_evidence_ids(G, v) or [None])[0]
+        if not other or not G.has_node(other): continue
+        for fa in _xb_files_of(G, u):
+            for fb in _xb_files_of(G, other):
+                if fa == fb: continue
+                out.setdefault(_xb_pair(fa, fb), {"source": "CONTRADICTS edge", "match_strength": d.get("match_strength"), "heuristic": bool(d.get("heuristic")), "label": d.get("label"), "is_violation": False,
+                                                  "evidence": sorted(({"file": f, "location": G.nodes[e_].get("source_location"), "evidence": "stable key: file @ location"} for e_, f in ((u, fa), (other, fb))), key=lambda x: (str(x["file"]), str(x["location"])))})
+    return out
+
+def _xb_decide(required: List[str], retrieved_files: set, contra: Dict[Tuple[str, str], Any]) -> str:
+    req = set(required)
+    if any(a in req or b in req for a, b in contra): return "RECONCILIATION_REQUIRED"
+    return "SUPPORTED" if req <= retrieved_files else "INSUFFICIENT_EVIDENCE"
+
+def _xb_ev_loc(G: nx.MultiDiGraph, ev: str) -> Dict[str, Any]:
+    return {"file": (_xb_files_of(G, ev) or [None])[0], "location": G.nodes[ev].get("source_location")}
+
+def _xb_run_case(case: Dict[str, Any], workdir: str) -> List[Dict[str, Any]]:
+    paths = []
+    for name, text in case["documents"].items():
+        p = os.path.join(workdir, name)
+        with open(p, "w", encoding="utf-8") as fh: fh.write(text)
+        paths.append(p)
+    G = build_evidence_graph(paths, None)
+    obj = case["objective"]
+    inv = [n for n, _ in _investigation_evidence(G)]
+    inv_set = set(inv)
+    top = ranked_evidence_ids(G, obj)[:V2_TOP_K]
+    expanded = [i["evidence_id"] for i in traverse_graph_context(G, top, V2_EXPANSION_LIMIT)["evidence"]] if top else []
+    eg_ev = [e for e in dict.fromkeys(top + expanded) if e in inv_set]
+    xd = traverse_cross_document_context(G, eg_ev, obj) if eg_ev else {"explicit_items": [], "weak_signals": [], "conflict_signals": [], "missing_references": [], "unresolved_signals": []}
+    cd_ev = list(dict.fromkeys(eg_ev + [i["evidence_id"] for i in xd["explicit_items"]] + [s["evidence_id"] for s in xd["conflict_signals"] if s.get("evidence_id")]))
+    payload = _build_v1_payload(paths, "", G)
+    v1_files = {n for n in case["documents"] if f"FILE NAME: {n}\n" in payload}
+    v1_ev = [e for e in inv if set(_xb_files_of(G, e)) & v1_files]
+    eg_links, (cd_links, unresolved_links) = _xb_eg_links(G), _xb_cd_links(G)
+    eg_contra = _xb_eg_contradictions(G)
+    cd_contra = dict(eg_contra)
+    for s in xd["conflict_signals"]:
+        k = _xb_pair(str(s["filename"]), str(s["related_filename"]))
+        cd_contra.setdefault(k, {"source": "CONFLICTING cross-document link", "link_reason": s["link_reason"], "conflicts": s["conflicts"], "is_violation": False, "requires_reconciliation": True,
+                                 "evidence": sorted(({"file": p_.get("filename"), "location": p_.get("location"), "evidence": "stable key: file @ location"} for p_ in s["matched_evidence"]), key=lambda x: (str(x["file"]), str(x["location"])))})
+    cd_links_all = {**eg_links, **cd_links}
+    for k, v in eg_links.items():
+        if v["strength"] == "strong": cd_links_all[k] = v
+    obs_prov = [{"file": i["filename"], "reached_from": i["related_filename"], "relationship_type": i["relationship_type"], "link_status": i["link_status"], "link_reason": i["link_reason"],
+                 "match_methods": i["match_methods"], "hops": i["hops"], "location": i["location"]} for i in xd["explicit_items"]]
+    obs_prov += [{"file": s["filename"], "reached_from": s["related_filename"], "relationship_type": s["relationship_type"], "link_status": s["link_status"], "link_reason": s["link_reason"],
+                  "match_methods": s["match_methods"], "hops": s.get("hops"), "location": s["location"]} for s in xd["conflict_signals"]]
+    missing_pred = {(m["reference_type"], m["reference"]) for m in xd["missing_references"]}
+    shared = dict(case=case, G=G, inv=inv)
+    return [_xb_record(**shared, variant="V1", retrieved=v1_ev, links=None, contra=None, missing_pred=None, obs_prov=None,
+                       notes=["V1 has no retrieval stage / graph: retrieved = documents present in the V1 payload; decision, links and contradictions are NOT_MEASURED (free-text LLM verdicts)"]),
+            _xb_record(**shared, variant="EVIDENCE_GRAPH", retrieved=eg_ev, links=eg_links, contra=eg_contra, missing_pred=None, obs_prov=None,
+                       notes=["missing-evidence detection and provenance relationships are Phase A/B features: NOT_MEASURED for this variant"]),
+            _xb_record(**shared, variant="CROSS_DOCUMENT", retrieved=cd_ev, links=cd_links_all, contra=cd_contra, missing_pred=missing_pred, obs_prov=obs_prov,
+                       notes=[f"weak-link documents surfaced (not counted as retrieved): {sorted({s['filename'] for s in xd['weak_signals']})}", f"unresolved links (not entity links): {unresolved_links}"])]
+
+def _xb_record(case, G, inv, variant, retrieved, links, contra, missing_pred, obs_prov, notes) -> Dict[str, Any]:
+    NM = NOT_MEASURED
+    req = [e["file"] for e in case["required_evidence"]]
+    rel = list(dict.fromkeys(e["file"] for k in ("required_evidence", "supporting_evidence", "contradicting_evidence") for e in case[k]))
+    ret_set = set(retrieved)
+    ret_files = sorted({f for e in retrieved for f in _xb_files_of(G, e)})
+    pool = {e for e in inv if set(_xb_files_of(G, e)) & set(rel)}
+    covered = lambda files: sum(1 for f in files if any(f in _xb_files_of(G, e) for e in ret_set))
+    tp_ev = len(ret_set & pool)
+    p = _xb_r(tp_ev / len(ret_set)) if ret_set else NM
+    r = _xb_r(covered(rel) / len(rel)) if rel else NM
+    f1 = _xb_r(2 * p * r / (p + r)) if _xb_num(p) and _xb_num(r) and (p + r) > 0 else (0.0 if _xb_num(p) and _xb_num(r) else NM)
+    rec: Dict[str, Any] = {"case_id": case["case_id"], "system_variant": variant, "category": case["category"], "difficulty": case["difficulty"], "expected_decision": case["expected_decision"],
+                           "required_documents": req, "retrieved_documents": ret_files, "evidence_precision": p, "evidence_recall": r, "evidence_f1": f1,
+                           "evidence_completeness": _xb_r(covered(req) / len(req)) if req else NM, "evidence_counts": {"retrieved": len(ret_set), "true_positive": tp_ev, "relevant_entries": len(rel), "entries_covered": covered(rel), "required": len(req), "required_covered": covered(req)}}
+    exp_links = {_xb_pair(e["a"], e["b"]): e["strength"] for e in case["expected_entity_links"]}
+    exp_contra = {_xb_pair(e["a"], e["b"]) for e in case["expected_contradictions"]}
+    rec["expected_entity_links"] = [{"a": k[0], "b": k[1], "strength": s} for k, s in sorted(exp_links.items())]
+    rec["expected_contradictions"] = [{"a": a, "b": b} for a, b in sorted(exp_contra)]
+    if links is None:
+        rec.update(predicted_entity_links=NM, entity_link_precision=NM, entity_link_recall=NM, entity_link_f1=NM, entity_link_counts=NM, entity_link_strong=NM, entity_link_weak=NM,
+                   predicted_decision=NM, decision_correct=NM, predicted_contradictions=NM, contradiction_precision=NM, contradiction_recall=NM, contradiction_f1=NM,
+                   false_contradiction_rate=NM, missed_contradiction_rate=NM, contradiction_counts=NM)
+    else:
+        rec["predicted_entity_links"] = [{"a": k[0], "b": k[1], "strength": v["strength"], "status": v.get("status"), "basis": v.get("basis")} for k, v in sorted(links.items())]
+        m = _xb_set_metrics(set(links), set(exp_links))
+        rec.update(entity_link_precision=m["precision"], entity_link_recall=m["recall"], entity_link_f1=m["f1"], entity_link_counts={k: m[k] for k in ("tp", "fp", "fn")})
+        for name, strength in (("entity_link_strong", "strong"), ("entity_link_weak", "weak")):  # weaker links are reported separately; semantic similarity alone is never strong
+            sm = _xb_set_metrics({k for k, v in links.items() if v["strength"] == strength}, {k for k, s in exp_links.items() if s == strength})
+            rec[name] = {k: sm[k] for k in ("tp", "fp", "fn", "precision", "recall", "f1")}
+        rec["predicted_contradictions"] = [{"a": k[0], "b": k[1], "is_violation": False} for k in sorted(contra)]
+        cm = _xb_set_metrics(set(contra), exp_contra)
+        rec.update(contradiction_precision=cm["precision"], contradiction_recall=cm["recall"], contradiction_f1=cm["f1"],
+                   false_contradiction_rate=_xb_r(cm["fp"] / len(contra)) if contra else NM, missed_contradiction_rate=_xb_r(cm["fn"] / len(exp_contra)) if exp_contra else NM,
+                   contradiction_counts={k: cm[k] for k in ("tp", "fp", "fn")})
+        rec["predicted_decision"] = _xb_decide(req, set(ret_files), contra)
+        rec["decision_correct"] = rec["predicted_decision"] == case["expected_decision"]
+    exp_missing = {(m_["reference_type"], m_["reference"]) for m_ in case["missing_evidence"]}
+    mm = _xb_set_metrics(missing_pred, exp_missing) if missing_pred is not None else None
+    rec["missing_evidence"] = {"expected": [{"reference_type": t, "reference": x} for t, x in sorted(exp_missing)],
+                               "predicted": ([{"reference_type": t, "reference": x} for t, x in sorted(missing_pred)] if missing_pred is not None else NM),
+                               "counts": ({k: mm[k] for k in ("tp", "fp", "fn")} if mm else NM), "precision": mm["precision"] if mm else NM, "recall": mm["recall"] if mm else NM}
+    dis = case["distractors"]
+    rec["distractors"] = {"expected": dis, "retrieved": sorted(set(dis) & set(ret_files)), "retrieval_rate": _xb_r(len(set(dis) & set(ret_files)) / len(dis)) if dis else NM}
+    exp_prov = case["expected_provenance"]
+    if obs_prov is None: rec["provenance"] = {"expected": exp_prov, "observed": NM, "expected_matched": NM, "recall": NM}
+    else:
+        key = lambda x: (x["file"], x["reached_from"], x["relationship_type"], x["link_status"])
+        matched = sum(1 for e in exp_prov if key(e) in {key(o) for o in obs_prov})
+        rec["provenance"] = {"expected": exp_prov, "observed": obs_prov, "expected_matched": matched, "recall": _xb_r(matched / len(exp_prov)) if exp_prov else NM}
+        rec["provenance"]["contradiction_evidence"] = {f"{a}|{b}": v.get("evidence") for (a, b), v in sorted(contra.items())}
+    rec["notes"] = notes
+    return rec
+
+# ---- aggregation (derived from the raw records only) ----
+def _xb_pool(recs: List[Dict[str, Any]], field: str) -> Dict[str, Any]:
+    rows = [r[field] for r in recs if isinstance(r.get(field), dict) and "tp" in r[field]]
+    if not rows: return {"status": NOT_MEASURED, "reason": "no case produced this measurement"}
+    tp, fp, fn = (sum(x[k] for x in rows) for k in ("tp", "fp", "fn"))
+    return {"status": "MEASURED", "cases_measured": len(rows), "tp": tp, "fp": fp, "fn": fn, "micro": _xb_prf(tp, fp, fn)}
+
+def _xb_aggregate_group(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    n = len(recs)
+    meas = [r for r in recs if isinstance(r.get("decision_correct"), bool)]
+    if meas:
+        classes = {}
+        for c in XBENCH_DECISIONS:
+            tp = sum(1 for r in meas if r["expected_decision"] == c and r["predicted_decision"] == c)
+            fp = sum(1 for r in meas if r["expected_decision"] != c and r["predicted_decision"] == c)
+            fn = sum(1 for r in meas if r["expected_decision"] == c and r["predicted_decision"] != c)
+            classes[c] = {"support": tp + fn, "predicted": tp + fp, **_xb_prf(tp, fp, fn)}
+        used = [v for v in classes.values() if v["support"] or v["predicted"]]
+        decision = {"status": "MEASURED", "cases_measured": len(meas), "accuracy": _xb_r(sum(r["decision_correct"] for r in meas) / len(meas)), "per_class": classes,
+                    "macro_precision": _xb_mean([v["precision"] for v in used]), "macro_recall": _xb_mean([v["recall"] for v in used]), "macro_f1": _xb_mean([v["f1"] for v in used]),
+                    "confusion": dict(Counter(f"{r['expected_decision']}->{r['predicted_decision']}" for r in meas))}
+    else: decision = {"status": NOT_MEASURED, "reason": "decision not derivable for this variant (V1 verdicts are free LLM text) or no cases"}
+    ec = [r["evidence_counts"] for r in recs]
+    tp_ev, ret_n, ent_cov, ent_n, rq_cov, rq_n = (sum(c[k] for c in ec) for k in ("true_positive", "retrieved", "entries_covered", "relevant_entries", "required_covered", "required"))
+    mp, mr = (tp_ev / ret_n if ret_n else NOT_MEASURED), (ent_cov / ent_n if ent_n else NOT_MEASURED)
+    retrieval = {"status": "MEASURED" if ec else NOT_MEASURED, "micro": {"precision": _xb_r(mp), "recall": _xb_r(mr), "f1": _xb_r(2 * mp * mr / (mp + mr)) if _xb_num(mp) and _xb_num(mr) and mp + mr > 0 else NOT_MEASURED},
+                 "macro": {"precision": _xb_mean([r["evidence_precision"] for r in recs]), "recall": _xb_mean([r["evidence_recall"] for r in recs]), "f1": _xb_mean([r["evidence_f1"] for r in recs])},
+                 "evidence_completeness": {"micro": _xb_r(rq_cov / rq_n) if rq_n else NOT_MEASURED, "macro": _xb_mean([r["evidence_completeness"] for r in recs])}}
+    ent = _xb_pool(recs, "entity_link_counts")
+    if ent["status"] == "MEASURED":
+        ent["macro"] = {k: _xb_mean([r[f"entity_link_{k}"] for r in recs]) for k in ("precision", "recall", "f1")}
+        ent["strong"], ent["weak"] = _xb_pool(recs, "entity_link_strong"), _xb_pool(recs, "entity_link_weak")
+    con = _xb_pool(recs, "contradiction_counts")
+    if con["status"] == "MEASURED":
+        con["macro"] = {k: _xb_mean([r[f"contradiction_{k}"] for r in recs]) for k in ("precision", "recall", "f1")}
+        con["false_contradiction_rate"] = _xb_r(con["fp"] / (con["tp"] + con["fp"])) if con["tp"] + con["fp"] else NOT_MEASURED
+        con["missed_contradiction_rate"] = _xb_r(con["fn"] / (con["tp"] + con["fn"])) if con["tp"] + con["fn"] else NOT_MEASURED
+        none_exp = [r for r in recs if not r["expected_contradictions"] and isinstance(r["predicted_contradictions"], list)]
+        con["case_false_positive_rate"] = _xb_r(sum(1 for r in none_exp if r["predicted_contradictions"]) / len(none_exp)) if none_exp else NOT_MEASURED
+        con["note"] = "heuristic conflict signals; none is a compliance violation"
+    me = [r["missing_evidence"] for r in recs if isinstance(r["missing_evidence"].get("counts"), dict)]
+    miss = {"status": NOT_MEASURED, "reason": "variant has no missing-reference mechanism"} if not me else {"status": "MEASURED", "cases_measured": len(me), **{k: sum(x["counts"][k] for x in me) for k in ("tp", "fp", "fn")}}
+    if me: miss["micro"] = _xb_prf(miss["tp"], miss["fp"], miss["fn"])
+    dis_exp = sum(len(r["distractors"]["expected"]) for r in recs)
+    prv = [r["provenance"] for r in recs if _xb_num(r["provenance"].get("expected_matched"))]
+    pe = sum(len(x["expected"]) for x in prv)
+    return {"cases": n, "decision": decision, "retrieval": retrieval, "entity_links": ent if ent["status"] == "MEASURED" else {"status": NOT_MEASURED, "reason": "variant produces no document links"},
+            "contradictions": con if con["status"] == "MEASURED" else {"status": NOT_MEASURED, "reason": "variant produces no contradiction signals"}, "missing_evidence": miss,
+            "distractors": {"expected": dis_exp, "retrieved": sum(len(r["distractors"]["retrieved"]) for r in recs), "retrieval_rate": _xb_r(sum(len(r["distractors"]["retrieved"]) for r in recs) / dis_exp) if dis_exp else NOT_MEASURED},
+            "provenance_relationships": {"status": "MEASURED", "expected": pe, "matched": sum(x["expected_matched"] for x in prv), "recall": _xb_r(sum(x["expected_matched"] for x in prv) / pe) if pe else NOT_MEASURED} if prv else {"status": NOT_MEASURED, "reason": "variant has no relationship provenance"}}
+
+def aggregate_cross_document_results(records: List[Dict[str, Any]], cases: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    cases = CROSS_DOCUMENT_BENCHMARK if cases is None else cases
+    by_var = {v: [r for r in records if r["system_variant"] == v] for v in XBENCH_VARIANTS}
+    agg = {v: _xb_aggregate_group(rs) for v, rs in by_var.items()}
+    per_cat = {v: {c: _xb_aggregate_group([r for r in rs if r["category"] == c]) for c in sorted({r["category"] for r in rs})} for v, rs in by_var.items()}
+    def pick(a, path):
+        for k in path: a = a.get(k) if isinstance(a, dict) else None
+        return a if a is not None else NOT_MEASURED
+    metrics = {"decision_accuracy": ("decision", "accuracy"), "decision_macro_f1": ("decision", "macro_f1"), "retrieval_micro_f1": ("retrieval", "micro", "f1"), "retrieval_macro_f1": ("retrieval", "macro", "f1"),
+               "evidence_completeness_micro": ("retrieval", "evidence_completeness", "micro"), "entity_link_micro_f1": ("entity_links", "micro", "f1"), "contradiction_micro_f1": ("contradictions", "micro", "f1"),
+               "false_contradiction_rate": ("contradictions", "false_contradiction_rate"), "missed_contradiction_rate": ("contradictions", "missed_contradiction_rate")}
+    comparison: Dict[str, Any] = {"order": list(XBENCH_VARIANTS), "note": "same benchmark cases for every variant; raw values only, no superiority claim; a delta exists only where both values are measured"}
+    for name, path in metrics.items():
+        vals = [pick(agg[v], path) for v in XBENCH_VARIANTS]
+        comparison[name] = {"values": dict(zip(XBENCH_VARIANTS, vals)), "delta_EG_vs_V1": _xb_r(vals[1] - vals[0]) if _xb_num(vals[0]) and _xb_num(vals[1]) else NOT_MEASURED,
+                            "delta_CD_vs_EG": _xb_r(vals[2] - vals[1]) if _xb_num(vals[1]) and _xb_num(vals[2]) else NOT_MEASURED}
+    return {"benchmark": {"id": XBENCH_ID, "version": XBENCH_VERSION, "size": len(cases), "category_counts": dict(Counter(c["category"] for c in cases)), "difficulty_counts": dict(Counter(c["difficulty"] for c in cases)),
+                          "expected_decision_counts": dict(Counter(c["expected_decision"] for c in cases)), "seed": None},
+            "variants": agg, "per_category": per_cat, "comparison": comparison, "protocol": XBENCH_PROTOCOL}
+
+def run_cross_document_benchmark(cases: Optional[List[Dict[str, Any]]] = None, output_path: Optional[str] = None) -> Dict[str, Any]:
+    """Runs the benchmark offline (no LLM / network). Returns {"records": raw per-case/per-variant results, "aggregate": derived from them}; writes JSON only if output_path is given."""
+    import tempfile
+    cases = CROSS_DOCUMENT_BENCHMARK if cases is None else cases
+    probs = validate_cross_document_benchmark(cases)
+    if probs: raise ValueError("benchmark labels inconsistent: " + "; ".join(probs[:5]))
+    records: List[Dict[str, Any]] = []
+    for c in cases:
+        with tempfile.TemporaryDirectory() as td: records += _xb_run_case(c, td)
+    result = _json_safe({"benchmark_id": XBENCH_ID, "version": XBENCH_VERSION, "records": records, "aggregate": aggregate_cross_document_results(records, cases)})
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
+
+# --- CONTRADICTION BENCHMARK + EVALUATION (extends the cross-document benchmark; scores classify_contradictions against deterministic labels) ---
+# A "contradiction" = a finding in MINOR_/MAJOR_CONTRADICTION. Findings are matched by (documents, field). Precision / recall / F1 / false- and missed-contradiction rates use that
+# match; severity accuracy = among expected contradictions that were detected, the share classified with the labelled MINOR/MAJOR category; category accuracy covers every expected finding
+# (all six categories). NOT_MEASURED when a denominator is empty. No LLM, no randomness. Labels are written from the document semantics, not from system output.
+def _xc_case(cid, category, difficulty, docs, findings, rulebook=None):
+    return {"case_id": cid, "category": category, "difficulty": difficulty, "documents": dict(docs), "rulebook": rulebook,
+            "expected_findings": [{"a": a, "b": b, "field": f, "category": c} for a, b, f, c in findings]}
+
+CONTRADICTION_BENCHMARK: List[Dict[str, Any]] = [
+    _xc_case("XC-01-consistent", "consistent", "easy",
+             {"invoice_c01.txt": "Invoice No: INV-C011\nPO Number: PO-C011\nVendor: Aster Foods\nBilled amount INR 5,000\nQuantity: 10\n", "po_c01.txt": "Purchase Order No: PO-C011\nVendor: Aster Foods\nOrder value INR 5,000\nQuantity: 10\n"},
+             [("invoice_c01.txt", "po_c01.txt", "*", "CONSISTENT")]),
+    _xc_case("XC-02-amount-major", "amount_contradiction", "easy",
+             {"invoice_c02.txt": "Invoice No: INV-C021\nPO Number: PO-C021\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "po_c02.txt": "Purchase Order No: PO-C021\nVendor: Boreal Metals\nOrder value INR 12,000\n"},
+             [("invoice_c02.txt", "po_c02.txt", "amount", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-03-amount-minor", "amount_contradiction", "medium",
+             {"invoice_c03.txt": "Invoice No: INV-C031\nPO Number: PO-C031\nVendor: Boreal Metals\nBilled amount INR 10,200\n", "po_c03.txt": "Purchase Order No: PO-C031\nVendor: Boreal Metals\nOrder value INR 10,000\n"},
+             [("invoice_c03.txt", "po_c03.txt", "amount", "MINOR_CONTRADICTION")]),
+    _xc_case("XC-04-legitimate-partial-payment", "legitimate_partial_payment", "medium",
+             {"invoice_c04.txt": "Invoice No: INV-4041\nVendor: Cobalt Tools\nBilled amount INR 20,000\n", "payment_c04.txt": "Payment UTR: UTR-4041 partial payment against INV-4041\nSettled INR 8,000\n"},
+             [("invoice_c04.txt", "payment_c04.txt", "amount", "CONSISTENT")]),
+    _xc_case("XC-05-date-contradiction", "date_contradiction", "medium",
+             {"invoice_c05.txt": "Invoice No: INV-5051\nInvoice date: 2024-03-10\nBilled amount INR 3,000\n", "payment_c05.txt": "Payment UTR: UTR-5051 against INV-5051\nInvoice date: 2024-04-20\nSettled INR 3,000\n"},
+             [("invoice_c05.txt", "payment_c05.txt", "date", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-06-vendor-major", "vendor_contradiction", "easy",
+             {"invoice_c06.txt": "Invoice No: INV-C061\nPO Number: PO-C061\nVendor: Alder Foods\nBilled amount INR 5,000\n", "po_c06.txt": "Purchase Order No: PO-C061\nVendor: Birch Foods\nOrder value INR 5,000\n"},
+             [("invoice_c06.txt", "po_c06.txt", "vendor", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-07-vendor-minor-variant", "vendor_contradiction", "hard",
+             {"invoice_c07.txt": "Invoice No: INV-C071\nPO Number: PO-C071\nVendor: Birch Foods\nBilled amount INR 5,000\n", "po_c07.txt": "Purchase Order No: PO-C071\nVendor: Birch Foods India\nOrder value INR 5,000\n"},
+             [("invoice_c07.txt", "po_c07.txt", "vendor", "MINOR_CONTRADICTION")]),
+    _xc_case("XC-08-identity-person", "identity_contradiction", "medium",
+             {"claim_c08.txt": "Expense claim\nReference: REF-C0801\nEmployee: Priya Nair\nBilled amount INR 2,100\n", "approval_c08.txt": "Approval note\nReference: REF-C0801\nEmployee: Rahul Menon\nStatus: granted\n"},
+             [("approval_c08.txt", "claim_c08.txt", "identity", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-09-transaction-id-major", "transaction_id_contradiction", "medium",
+             {"invoice_c09.txt": "Invoice No: INV-C091\nPO Number: PO-C090\nBilled amount INR 4,000\n", "payment_c09.txt": "Payment UTR: UTR-C091\nPO Number: PO-C090\nInvoice No: INV-X778\nSettled INR 4,000\n"},
+             [("invoice_c09.txt", "payment_c09.txt", "transaction_id", "MAJOR_CONTRADICTION"), ("payment_c09.txt", None, "reference", "MISSING_EVIDENCE")]),
+    _xc_case("XC-10-transaction-id-typo", "transaction_id_contradiction", "hard",
+             {"invoice_c10.txt": "Invoice No: INV-C101\nPO Number: PO-C100\nBilled amount INR 4,000\n", "payment_c10.txt": "Payment UTR: UTR-C101\nPO Number: PO-C100\nInvoice No: INV-C102\nSettled INR 4,000\n"},
+             [("invoice_c10.txt", "payment_c10.txt", "transaction_id", "MINOR_CONTRADICTION"), ("payment_c10.txt", None, "reference", "MISSING_EVIDENCE")]),
+    _xc_case("XC-11-approval-contradiction", "approval_contradiction", "medium",
+             {"po_c11.txt": "Purchase Order No: PO-C110\nApproval ID: APPR-C11\nApproval status: approved\n", "approval_c11.txt": "Approval ID: APPR-C11\nApproval status: rejected\n"},
+             [("approval_c11.txt", "po_c11.txt", "approval_status", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-12-factual-quantity", "factual_claim_contradiction", "medium",
+             {"invoice_c12.txt": "Invoice No: INV-C121\nPO Number: PO-C121\nQuantity: 10\nBilled amount INR 1,000\n", "po_c12.txt": "Purchase Order No: PO-C121\nQuantity: 25\nOrder value INR 1,000\n"},
+             [("invoice_c12.txt", "po_c12.txt", "factual_claim", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-13-factual-delivery", "factual_claim_contradiction", "medium",
+             {"invoice_c13.txt": "Invoice No: INV-C131\nPO Number: PO-C131\nDelivery status: delivered\nBilled amount INR 1,500\n", "po_c13.txt": "Purchase Order No: PO-C131\nDelivery status: not delivered\nOrder value INR 1,500\n"},
+             [("invoice_c13.txt", "po_c13.txt", "factual_claim", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-14-missing-evidence", "missing_evidence", "medium",
+             {"invoice_c14.txt": "Invoice No: INV-C141\nPO Number: PO-C149\nVendor: Dune Freight\nBilled amount INR 6,500\n"},
+             [("invoice_c14.txt", None, "reference", "MISSING_EVIDENCE")]),
+    _xc_case("XC-15-unresolved-payment", "unresolved_ambiguity", "hard",
+             {"invoice_c15.txt": "Invoice No: INV-1511\nBilled amount INR 9,000\n", "payment_c15.txt": "Payment UTR: UTR-1511 against INV-1511\nSettled INR 4,000\n"},
+             [("invoice_c15.txt", "payment_c15.txt", "amount", "UNRESOLVED")]),
+    _xc_case("XC-16-multiple-contradictions", "multiple_contradictions", "hard",
+             {"invoice_c16.txt": "Invoice No: INV-C161\nPO Number: PO-C161\nVendor: Alder Foods\nQuantity: 10\nBilled amount INR 20,000\n", "po_c16.txt": "Purchase Order No: PO-C161\nVendor: Birch Foods\nQuantity: 25\nOrder value INR 12,000\n"},
+             [("invoice_c16.txt", "po_c16.txt", "vendor", "MAJOR_CONTRADICTION"), ("invoice_c16.txt", "po_c16.txt", "amount", "MAJOR_CONTRADICTION"), ("invoice_c16.txt", "po_c16.txt", "factual_claim", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-17-distractors", "distractors", "hard",
+             {"invoice_c17.txt": "Invoice No: INV-C171\nPO Number: PO-C171\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "po_c17.txt": "Purchase Order No: PO-C171\nVendor: Boreal Metals\nOrder value INR 12,000\n",
+              "stray_c17a.txt": "Payment UTR: UTR-Z1\nVendor: Globex Corp\nSettled INR 900\n", "stray_c17b.txt": "Meeting minutes\nAgenda: office plants\n", "stray_c17c.txt": "Invoice No: INV-Z9\nVendor: Globex Corp\nBilled amount INR 77\n"},
+             [("invoice_c17.txt", "po_c17.txt", "amount", "MAJOR_CONTRADICTION")]),
+    _xc_case("XC-18-semantic-only", "semantic_only", "hard",
+             {"invoice_c18.txt": "Invoice for consulting services rendered to the client during the quarter\nBilled amount INR 90,000\n", "payment_c18.txt": "Payment for consulting services rendered to the client during the quarter\nSettled INR 80,000\n"},
+             []),
+    _xc_case("XC-19-policy-violation-existing-decision", "policy_violation", "medium",
+             {"invoice_c19.txt": "Invoice No: INV-C191\nBilled amount INR 5,000\n"},
+             [("invoice_c19.txt", None, "policy", "POLICY_VIOLATION")], rulebook="FORBID TRANSACTION > INR 1000\n"),
+    _xc_case("XC-20-contradiction-is-not-a-violation", "contradiction_not_violation", "hard",
+             {"invoice_c20.txt": "Invoice No: INV-C201\nPO Number: PO-C201\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "po_c20.txt": "Purchase Order No: PO-C201\nVendor: Boreal Metals\nOrder value INR 12,000\n"},
+             [("invoice_c20.txt", "po_c20.txt", "amount", "MAJOR_CONTRADICTION")], rulebook="FORBID TRANSACTION > INR 100000\n"),
+]
+
+def validate_contradiction_benchmark(cases: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    cases = CONTRADICTION_BENCHMARK if cases is None else cases
+    probs = [f"duplicate case_id {i}" for i, n in Counter(c["case_id"] for c in cases).items() if n > 1]
+    for c in cases:
+        for f in c["expected_findings"]:
+            if f["category"] not in XCON_CATEGORIES: probs.append(f"{c['case_id']}: unknown category {f['category']}")
+            for k in ("a", "b"):
+                if f[k] is not None and f[k] not in c["documents"]: probs.append(f"{c['case_id']}: {k}={f[k]} is not a document")
+    return probs
+
+def _xc_key(files: List[str], field: str) -> Tuple[Tuple[str, ...], str]:
+    return (tuple(sorted(set(f for f in files if f))), field)
+
+def _xc_predicted(G: nx.MultiDiGraph) -> Dict[Tuple[Tuple[str, ...], str], Dict[str, Any]]:
+    out: Dict[Tuple[Tuple[str, ...], str], Dict[str, Any]] = {}
+    for f in G.graph.get("contradiction_findings") or []:
+        files = f["files"] if f.get("files") else [s["filename"] for s in (f["claim_a"], f["claim_b"]) if s]
+        k = _xc_key(files, f["field"])
+        if k not in out or _XCON_PRIO[f["category"]] < _XCON_PRIO[out[k]["category"]]:
+            out[k] = {"category": f["category"], "severity": f["severity"], "finding_id": f["finding_id"], "reason": f["reason"], "is_policy_violation": f["is_policy_violation"],
+                      "claim_a": f["claim_a"] and {"filename": f["claim_a"]["filename"], "value": ({k: v for k, v in f["claim_a"]["value"].items() if not k.endswith("_id")} if isinstance(f["claim_a"]["value"], dict) else f["claim_a"]["value"]), "provenance": [{"file": p.get("filename"), "location": p.get("location")} for p in f["claim_a"]["provenance"]]},
+                      "claim_b": f["claim_b"] and {"filename": f["claim_b"]["filename"], "value": ({k: v for k, v in f["claim_b"]["value"].items() if not k.endswith("_id")} if isinstance(f["claim_b"]["value"], dict) else f["claim_b"]["value"]), "provenance": [{"file": p.get("filename"), "location": p.get("location")} for p in f["claim_b"]["provenance"]]}}
+    return out
+
+def _xc_run_case(case: Dict[str, Any], workdir: str) -> Dict[str, Any]:
+    paths = []
+    for name, text in case["documents"].items():
+        p = os.path.join(workdir, name)
+        with open(p, "w", encoding="utf-8") as fh: fh.write(text)
+        paths.append(p)
+    rb = None
+    if case.get("rulebook"):
+        rb = os.path.join(workdir, "rulebook.txt")
+        with open(rb, "w", encoding="utf-8") as fh: fh.write(case["rulebook"])
+    G = build_evidence_graph(paths, rb)
+    pred = _xc_predicted(G)
+    exp = {_xc_key([f["a"], f["b"]], f["field"]): f["category"] for f in case["expected_findings"]}
+    exp_c = {k for k, c in exp.items() if c in XCON_CONTRADICTION}
+    pred_c = {k for k, v in pred.items() if v["category"] in XCON_CONTRADICTION}
+    m = _xb_set_metrics(pred_c, exp_c)
+    detected = exp_c & pred_c
+    sev_ok = sum(1 for k in detected if pred[k]["category"] == exp[k])
+    cat_ok = sum(1 for k, c in exp.items() if pred.get(k, {}).get("category") == c)
+    fp_pv = [k for k, v in pred.items() if v["category"] == "POLICY_VIOLATION" and exp.get(k) != "POLICY_VIOLATION"]
+    return {"case_id": case["case_id"], "category": case["category"], "difficulty": case["difficulty"],
+            "expected_findings": [{"files": list(k[0]), "field": k[1], "category": c} for k, c in sorted(exp.items())],
+            "predicted_findings": [{"files": list(k[0]), "field": k[1], **v} for k, v in sorted(pred.items())],
+            "contradiction_precision": m["precision"], "contradiction_recall": m["recall"], "contradiction_f1": m["f1"],
+            "false_contradiction_rate": _xb_r(m["fp"] / len(pred_c)) if pred_c else NOT_MEASURED, "missed_contradiction_rate": _xb_r(m["fn"] / len(exp_c)) if exp_c else NOT_MEASURED,
+            "counts": {"tp": m["tp"], "fp": m["fp"], "fn": m["fn"], "predicted_contradictions": len(pred_c), "expected_contradictions": len(exp_c), "severity_correct": sev_ok, "severity_total": len(detected),
+                       "category_correct": cat_ok, "category_total": len(exp), "false_policy_violations": len(fp_pv)},
+            "severity_accuracy": _xb_r(sev_ok / len(detected)) if detected else NOT_MEASURED, "category_accuracy": _xb_r(cat_ok / len(exp)) if exp else NOT_MEASURED,
+            "unexpected_findings": [{"files": list(k[0]), "field": k[1], "category": v["category"]} for k, v in sorted(pred.items()) if k not in exp and v["category"] in XCON_CONTRADICTION + ("POLICY_VIOLATION",)],
+            "contradictions_flagged_as_violation": sum(1 for v in pred.values() if v["category"] in XCON_CONTRADICTION and v["is_policy_violation"])}
+
+def _xc_group(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not recs: return {"cases": 0, "status": NOT_MEASURED}
+    s = lambda k: sum(r["counts"][k] for r in recs)
+    tp, fp, fn = s("tp"), s("fp"), s("fn")
+    pooled = _xb_prf(tp, fp, fn)
+    per_cat: Dict[str, Any] = {}
+    for c in XCON_CATEGORIES:
+        exp = sum(1 for r in recs for f in r["expected_findings"] if f["category"] == c)
+        hit = sum(1 for r in recs for f in r["expected_findings"] if f["category"] == c and any(p["files"] == f["files"] and p["field"] == f["field"] and p["category"] == c for p in r["predicted_findings"]))
+        per_cat[c] = {"expected": exp, "correctly_classified": hit, "recall": _xb_r(hit / exp) if exp else NOT_MEASURED}
+    return {"cases": len(recs), "status": "MEASURED",
+            "contradiction": {"tp": tp, "fp": fp, "fn": fn, "precision": pooled["precision"], "recall": pooled["recall"], "f1": pooled["f1"],
+                              "macro": {k: _xb_mean([r[f"contradiction_{k}"] for r in recs]) for k in ("precision", "recall", "f1")},
+                              "false_contradiction_rate": _xb_r(fp / (tp + fp)) if tp + fp else NOT_MEASURED, "missed_contradiction_rate": _xb_r(fn / (tp + fn)) if tp + fn else NOT_MEASURED,
+                              "case_false_positive_rate": (lambda ne: _xb_r(sum(1 for r in ne if r["counts"]["predicted_contradictions"]) / len(ne)) if ne else NOT_MEASURED)([r for r in recs if not r["counts"]["expected_contradictions"]])},
+            "severity_classification": {"accuracy": _xb_r(s("severity_correct") / s("severity_total")) if s("severity_total") else NOT_MEASURED, "correct": s("severity_correct"), "detected_contradictions": s("severity_total")},
+            "category_classification": {"accuracy": _xb_r(s("category_correct") / s("category_total")) if s("category_total") else NOT_MEASURED, "correct": s("category_correct"), "expected_findings": s("category_total"), "per_category": per_cat},
+            "false_policy_violations": s("false_policy_violations"), "contradictions_flagged_as_violation": sum(r["contradictions_flagged_as_violation"] for r in recs)}
+
+def aggregate_contradiction_results(records: List[Dict[str, Any]], cases: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    cases = CONTRADICTION_BENCHMARK if cases is None else cases
+    return {"benchmark": {"id": "omnicheck-contradiction-bench", "version": "1.0", "size": len(cases), "category_counts": dict(Counter(c["category"] for c in cases)), "difficulty_counts": dict(Counter(c["difficulty"] for c in cases)),
+                          "expected_category_counts": dict(Counter(f["category"] for c in cases for f in c["expected_findings"])), "seed": None, "llm_used": False},
+            "overall": _xc_group(records), "per_category": {c: _xc_group([r for r in records if r["category"] == c]) for c in sorted({r["category"] for r in records})},
+            "scope_note": "Evaluates the deterministic classifier only. Severity is measured only for expected contradictions that were detected. Heuristic contradictions are never compliance violations."}
+
+def run_contradiction_benchmark(cases: Optional[List[Dict[str, Any]]] = None, output_path: Optional[str] = None) -> Dict[str, Any]:
+    import tempfile
+    cases = CONTRADICTION_BENCHMARK if cases is None else cases
+    probs = validate_contradiction_benchmark(cases)
+    if probs: raise ValueError("contradiction benchmark labels inconsistent: " + "; ".join(probs[:5]))
+    records = []
+    for c in cases:
+        with tempfile.TemporaryDirectory() as td: records.append(_xc_run_case(c, td))
+    result = _json_safe({"records": records, "aggregate": aggregate_contradiction_results(records, cases)})
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
+
+# --- SELF-VERIFICATION EVALUATION BENCHMARK (Phase 7D; evaluation layer only: 7A-7C, the policy engine, contradiction detection and lineage are REUSED unchanged) ---
+# Deterministic labelled cases; each case builds its OWN private graph with the existing offline pipeline (the production graph is never touched). The label block of a case (expected_*) is written by hand and is
+# NEVER read from system output; predictions are produced by the existing functions and scored against the labels afterwards. No LLM, no network, no randomness (seed: none).
+# Variants (all start from the SAME initial engine Decision; none changes it):
+#   BASELINE                                                   = the initial Decision verdict only: no evidence lineage, no grounding / contradiction / verification mechanism.
+#   EVIDENCE_GRAPH                                             = verdict + 7A lineage (supporting evidence ids / provenance, contradiction findings); evidence EXISTENCE is its only grounding signal; status NOT_MEASURED.
+#   EVIDENCE_GRAPH_SELF_VERIFICATION                           = verify_self_verification_result (7B): FAILED -> conclusion rejected (NO_CONCLUSION), ESCALATE -> ESCALATE, VERIFIED / non-asserting verdict as-is.
+#   EVIDENCE_GRAPH_SELF_VERIFICATION_POLICY_APPLICABILITY      = verify_policy_applicability (7C), same mapping.
+# Ground truth per case: expected_outcome (VIOLATION | SATISFIED | NO_CONCLUSION | ESCALATE = the correct SUPPORTABLE handling of the case), decision_supported, claims_grounded (None = not applicable),
+# expected_major_contradiction (None = not assessed), expected_verification_status, policy_applicable. Escalation truth = (expected_verification_status == ESCALATE).
+# Metrics are {value, numerator, denominator}; value is NOT_MEASURED (never 0) when the denominator is empty or the variant has no such mechanism.
+SV7D_ID, SV7D_VERSION = "omnicheck-selfverification-bench", "1.0"
+SV7D_VARIANTS = ("BASELINE", "EVIDENCE_GRAPH", "EVIDENCE_GRAPH_SELF_VERIFICATION", "EVIDENCE_GRAPH_SELF_VERIFICATION_POLICY_APPLICABILITY")
+SV7D_OUTCOMES = ("VIOLATION", "SATISFIED", "NO_CONCLUSION", "ESCALATE")
+SV7D_CATEGORIES = ("positive", "negative", "ambiguous", "missing_evidence", "contradiction", "policy_applicability", "wrong_but_supported", "unsupported")
+SV7D_PROTOCOL = {"seed": None, "randomness": "none", "llm_used": False, "network_used": False, "confidence": "NOT_MEASURED (None) everywhere; never aggregated or invented",
+                 "ground_truth": "hand-written per-case labels, independent of every system output; the benchmark never derives a label from a prediction",
+                 "faults": "a case may inject a declared fault into its OWN private graph copy (e.g. evidence text no longer contains the claimed value) to create a wrong-but-superficially-supported decision or a grounded-but-inapplicable rule",
+                 "metrics_not_measured_when": "the denominator is empty or the variant has no such mechanism (BASELINE has no evidence / verification; EVIDENCE_GRAPH has no verification status)",
+                 "id_policy": "records keep evidence provenance and stable aliases; real (random) graph ids are verified against the graph at run time (id_integrity) rather than stored, so records are reproducible"}
+_SV7D_FAULTS = ("evidence_text_5000_to_500", "evidence_text_to_1", "heuristic_support", "remove_support", "rule_condition_9000", "basis_amount_none", "wrong_scope", "weak_location")
+_SV7D_RB = "FORBID TRANSACTION > INR 1000\n"
+_SV7D_INV = "Invoice No: INV-{n}\nBilled amount INR {amt}\n"
+_SV7D_CON_INV, _SV7D_CON_PO = "Invoice No: INV-1101\nPO Number: PO-1101\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "Purchase Order No: PO-1101\nVendor: Boreal Metals\nOrder value INR {v}\n"
+
+def _sv7d_case(cid, category, docs, rulebook, target, outcome, status, supported, grounded, contradiction, applicable=True, fault=None, note=""):
+    return {"case_id": cid, "category": category, "documents": dict(docs), "rulebook": rulebook, "target_rule": target, "fault": fault, "note": note,
+            "expected_outcome": outcome, "expected_verification_status": status, "decision_supported": supported, "claims_grounded": grounded, "expected_major_contradiction": contradiction, "policy_applicable": applicable}
+
+SELF_VERIFICATION_BENCHMARK: List[Dict[str, Any]] = [
+    _sv7d_case("sv7d_pos_violation", "positive", {"invoice_a.txt": _SV7D_INV.format(n=9001, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "VIOLATION", "VERIFIED", True, True, False, note="grounded violation of an applicable rule"),
+    _sv7d_case("sv7d_pos_satisfied", "positive", {"invoice_b.txt": _SV7D_INV.format(n=9002, amt="5,000")}, "FORBID TRANSACTION > INR 10000\n", "FORBID TRANSACTION", "SATISFIED", "VERIFIED", True, True, False),
+    _sv7d_case("sv7d_neg_under_limit", "negative", {"invoice_c.txt": _SV7D_INV.format(n=9003, amt="800")}, _SV7D_RB, "FORBID TRANSACTION", "SATISFIED", "VERIFIED", True, True, False, note="no violation exists; a pass is supported"),
+    _sv7d_case("sv7d_pos_absence_in_scope", "positive", {"memo_a.txt": "Meeting notes\nNothing else to report\n"}, 'REQUIRE KEYWORD "approval"\n', "REQUIRE KEYWORD", "VIOLATION", "VERIFIED", True, True, False, note="absence holds within the extracted scope"),
+    _sv7d_case("sv7d_ambiguous_free_text_rule", "ambiguous", {"invoice_d.txt": _SV7D_INV.format(n=9004, amt="5,000")}, _SV7D_RB + "Vendors should behave reasonably in spirit.\n", "Vendors should behave", "NO_CONCLUSION", "NOT_VERIFIED", False, None, None, note="rule not expressible deterministically: no conclusion"),
+    _sv7d_case("sv7d_missing_unlinked_records", "missing_evidence", {"invoice_e.txt": _SV7D_CON_INV, "po_e.txt": _SV7D_CON_PO.format(v="12,000")}, "Transaction amounts must match.\n", "amounts must match", "NO_CONCLUSION", "NOT_VERIFIED", False, None, None, note="records not reliably linked: nothing may be compared"),
+    _sv7d_case("sv7d_contradiction_major", "contradiction", {"invoice_f.txt": _SV7D_CON_INV, "po_f.txt": _SV7D_CON_PO.format(v="12,000")}, "FORBID TRANSACTION > INR 15000\n", "FORBID TRANSACTION", "ESCALATE", "ESCALATE", False, True, True, note="grounded claims, unresolved major cross-document contradiction"),
+    _sv7d_case("sv7d_contradiction_consistent", "contradiction", {"invoice_g.txt": _SV7D_CON_INV, "po_g.txt": _SV7D_CON_PO.format(v="20,000")}, "FORBID TRANSACTION > INR 15000\n", "FORBID TRANSACTION", "VIOLATION", "VERIFIED", True, True, False, note="documents agree: nothing to escalate"),
+    _sv7d_case("sv7d_wrong_but_supported_text", "wrong_but_supported", {"invoice_h.txt": _SV7D_INV.format(n=9005, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "NO_CONCLUSION", "FAILED", False, False, None, fault="evidence_text_5000_to_500",
+                 note="initial VIOLATION has linked evidence, but the source text says 500: superficially supported, wrong"),
+    _sv7d_case("sv7d_wrong_but_supported_heuristic", "wrong_but_supported", {"invoice_i.txt": _SV7D_INV.format(n=9006, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "NO_CONCLUSION", "FAILED", False, False, None, fault="heuristic_support",
+                 note="evidence is linked only by heuristic edges: not grounding"),
+    _sv7d_case("sv7d_unsupported_no_evidence", "unsupported", {"invoice_j.txt": _SV7D_INV.format(n=9007, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "NO_CONCLUSION", "FAILED", False, False, None, fault="remove_support", note="decision asserted with no supporting evidence"),
+    _sv7d_case("sv7d_failed_beats_escalate", "unsupported", {"invoice_k.txt": _SV7D_CON_INV, "po_k.txt": _SV7D_CON_PO.format(v="12,000")}, "FORBID TRANSACTION > INR 15000\n", "FORBID TRANSACTION", "NO_CONCLUSION", "FAILED", False, False, None, fault="evidence_text_to_1",
+                 note="contradiction present AND claim ungrounded: FAILED takes precedence"),
+    _sv7d_case("sv7d_policy_rule_text_changed", "policy_applicability", {"invoice_l.txt": _SV7D_INV.format(n=9008, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "ESCALATE", "ESCALATE", False, True, False, applicable=False, fault="rule_condition_9000",
+                 note="evidence grounded, but the rule on file is no longer the rule the Decision used"),
+    _sv7d_case("sv7d_policy_missing_fact", "policy_applicability", {"invoice_m.txt": _SV7D_INV.format(n=9009, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "ESCALATE", "ESCALATE", False, True, False, applicable=False, fault="basis_amount_none",
+                 note="required amount fact absent on the basis node: applicability cannot be established"),
+    _sv7d_case("sv7d_policy_wrong_scope", "policy_applicability", {"invoice_n.txt": _SV7D_INV.format(n=9010, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "ESCALATE", "ESCALATE", False, True, False, applicable=False, fault="wrong_scope",
+                 note="Decision belongs to a Policy that does not own the cited rule"),
+    _sv7d_case("sv7d_ambiguous_weak_grounding", "ambiguous", {"invoice_o.txt": _SV7D_INV.format(n=9011, amt="5,000")}, _SV7D_RB, "FORBID TRANSACTION", "ESCALATE", "ESCALATE", False, True, False, fault="weak_location",
+                 note="claim present in text but source location lost: weakly grounded, human review"),
+]
+
+def validate_self_verification_benchmark(cases: Optional[List[Dict[str, Any]]] = None, require_coverage: bool = True) -> List[str]:
+    cases = SELF_VERIFICATION_BENCHMARK if cases is None else cases
+    probs: List[str] = []
+    ids = [c.get("case_id") for c in cases]
+    probs += [f"duplicate case_id {i}" for i, n in Counter(ids).items() if n > 1]
+    for c in cases:
+        cid = c.get("case_id")
+        for k in ("category", "documents", "rulebook", "target_rule", "expected_outcome", "expected_verification_status", "decision_supported", "claims_grounded", "expected_major_contradiction", "policy_applicable"):
+            if k not in c: probs.append(f"{cid}: missing {k}")
+        if c.get("expected_outcome") not in SV7D_OUTCOMES: probs.append(f"{cid}: unknown expected_outcome {c.get('expected_outcome')}")
+        if c.get("expected_verification_status") not in SELF_VERIFICATION_STATUSES: probs.append(f"{cid}: unknown expected_verification_status")
+        if c.get("fault") is not None and c["fault"] not in _SV7D_FAULTS: probs.append(f"{cid}: unknown fault {c['fault']}")
+        o, s = c.get("expected_outcome"), c.get("expected_verification_status")
+        if c.get("decision_supported") != (o in SV_ASSERTING_VERDICTS): probs.append(f"{cid}: decision_supported inconsistent with expected_outcome")
+        if (s == "VERIFIED") != (o in SV_ASSERTING_VERDICTS) or (s == "ESCALATE") != (o == "ESCALATE") or (s in ("FAILED", "NOT_VERIFIED") and o != "NO_CONCLUSION"): probs.append(f"{cid}: expected_verification_status inconsistent with expected_outcome")
+        if s == "VERIFIED" and c.get("policy_applicable") is not True: probs.append(f"{cid}: VERIFIED requires an applicable rule")
+    if require_coverage: probs += [f"category {x} not covered" for x in SV7D_CATEGORIES if x not in {c.get("category") for c in cases}]
+    return probs
+
+def _sv7d_outcome(verdict: Optional[str], status: Optional[str]) -> str:
+    if verdict not in SV_ASSERTING_VERDICTS: return "NO_CONCLUSION"
+    return "NO_CONCLUSION" if status == "FAILED" else "ESCALATE" if status == "ESCALATE" else verdict
+
+def self_verification_variant_predictions(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Dict[str, Any]]:
+    """Read-only (no graph mutation, idempotent). Per variant: outcome, verification_status, escalation_reason, grounding_predicted, contradiction_predicted, supporting_evidence (real ids + provenance as stored), confidence.
+    A field a variant has no mechanism for is NOT_MEASURED. The Decision, its verdict and every verification result are only READ."""
+    NM = NOT_MEASURED
+    verdict = G.nodes[decision_id].get("verdict") if G.has_node(decision_id) else None
+    asserting = verdict in SV_ASSERTING_VERDICTS
+    base = build_self_verification_result(G, decision_id)
+    r7b, r7c = verify_self_verification_result(G, decision_id), verify_policy_applicability(G, decision_id)
+    conf = {"value": None, "status": "NOT_MEASURED"}
+    out: Dict[str, Dict[str, Any]] = {"BASELINE": {"outcome": _sv7d_outcome(verdict, None), "verification_status": NM, "escalation_reason": NM, "grounding_predicted": NM, "contradiction_predicted": NM, "supporting_evidence": [], "confidence": dict(conf)}}
+    out["EVIDENCE_GRAPH"] = {"outcome": _sv7d_outcome(verdict, None), "verification_status": NM, "escalation_reason": NM, "grounding_predicted": (bool(base["supporting_evidence"]) if asserting else NM),
+                             "contradiction_predicted": (any(c.get("source") == "contradiction_finding" and c.get("category") == "MAJOR_CONTRADICTION" for c in base["contradicting_evidence"]) if asserting else NM),
+                             "supporting_evidence": _sv_json(base["supporting_evidence"]), "confidence": dict(conf)}
+    for name, r in (("EVIDENCE_GRAPH_SELF_VERIFICATION", r7b), ("EVIDENCE_GRAPH_SELF_VERIFICATION_POLICY_APPLICABILITY", r7c)):
+        out[name] = {"outcome": _sv7d_outcome(verdict, r["verification_status"]), "verification_status": r["verification_status"], "escalation_reason": r["escalation_reason"],
+                     "grounding_predicted": (r["verification_status"] != "FAILED" if asserting else NM), "contradiction_predicted": ("major contradiction" in (r["escalation_reason"] or "") if asserting else NM),
+                     "supporting_evidence": _sv_json(r["supporting_evidence"]), "confidence": {"value": r["confidence"]["value"], "status": r["confidence"]["status"]}}
+    return out
+
+def _sv7d_stable_refs(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Evidence refs without the random graph ids: filename / location / provenance (minus the random source_document_id) kept, stable aliases E1.. assigned in a deterministic order."""
+    rows = [{"filename": r.get("filename"), "location": r.get("location"), "file_hash": r.get("file_hash"), "provenance": {k: v for k, v in (r.get("provenance") or {}).items() if k != "source_document_id"}} for r in refs]
+    rows.sort(key=lambda x: (str(x["filename"]), str(x["location"]), str((x["provenance"] or {}).get("source_text_sha256"))))
+    return [{"evidence_alias": f"E{i + 1}", **x} for i, x in enumerate(rows)]
+
+def _sv7d_snapshot(G: nx.MultiDiGraph) -> str:
+    return json.dumps([sorted(G.nodes(data=True), key=lambda kv: kv[0]), sorted(((u, v, k, d) for u, v, k, d in G.edges(keys=True, data=True)), key=lambda e: (e[0], e[1], str(e[2]))), G.graph.get("contradiction_findings")], sort_keys=True, default=str)
+
+def _sv7d_apply_fault(G: nx.MultiDiGraph, d: str, fault: Optional[str]) -> None:
+    """Fault injection into the benchmark's PRIVATE graph only (declared in the case; never applied to a caller's graph)."""
+    if not fault: return
+    dd = G.nodes[d]; basis = list(dd.get("basis_node_ids") or [])
+    ev = [e for b in basis for e in _supporting_evidence_ids(G, b)]
+    if fault == "evidence_text_5000_to_500":
+        for e in ev: G.nodes[e]["text"] = G.nodes[e]["text"].replace("5,000", "500")
+    elif fault == "evidence_text_to_1":
+        for e in ev: G.nodes[e]["text"] = "Billed amount INR 1"
+    elif fault in ("heuristic_support", "remove_support"):
+        for b in basis:
+            for u, v, k, ed in list(G.in_edges(b, keys=True, data=True)):
+                if ed.get("relation") != "SUPPORTS": continue
+                if fault == "heuristic_support": ed["heuristic"] = True
+                else: G.remove_edge(u, v, k)
+    elif fault == "rule_condition_9000": G.nodes[dd["rule_id"]]["condition"] = "FORBID TRANSACTION > INR 9000"
+    elif fault == "basis_amount_none":
+        if basis: G.nodes[basis[0]]["amount"] = None
+    elif fault == "wrong_scope":
+        for u, v, k, e in list(G.out_edges(d, keys=True, data=True)):
+            if e.get("relation") == "BELONGS_TO": G.remove_edge(u, v, k)
+        G.add_node("pol_other_bench", type="Policy", name="other policy"); G.add_edge(d, "pol_other_bench", relation="BELONGS_TO")
+    elif fault == "weak_location":
+        for e in ev:
+            G.nodes[e]["source_location"] = None
+            for _, _, ed in G.out_edges(e, data=True):
+                if ed.get("relation") == "DERIVED_FROM": ed["location"] = None
+
+def _sv7d_target_decision(G: nx.MultiDiGraph, target: str) -> Optional[str]:
+    hits = [n for n, x in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0]) if target.lower() in str((G.nodes.get(x.get("rule_id")) or {}).get("condition") or "").lower()]
+    return hits[0] if len(hits) == 1 else None
+
+def _sv7d_records_for_graph(case: Dict[str, Any], G: nx.MultiDiGraph, d: str) -> List[Dict[str, Any]]:
+    before = _sv7d_snapshot(G)
+    preds = self_verification_variant_predictions(G, d)
+    if _sv7d_snapshot(G) != before: raise RuntimeError("self-verification benchmark mutated the graph")
+    recs = []
+    for v in SV7D_VARIANTS:
+        p = preds[v]
+        ids = [r.get("evidence_id") for r in p["supporting_evidence"]]
+        integ = {"evidence_ids_in_graph": all(G.has_node(i) and G.nodes[i].get("type") == "Evidence" for i in ids),
+                 "provenance_matches_graph": all(r.get("provenance") == _sv_json(G.nodes[r["evidence_id"]].get("provenance")) for r in p["supporting_evidence"] if G.has_node(r.get("evidence_id")))}
+        recs.append({"case_id": case["case_id"], "category": case["category"], "system_variant": v, "fault": case.get("fault"),
+                     "expected_outcome": case["expected_outcome"], "predicted_outcome": p["outcome"], "decision_correct": p["outcome"] == case["expected_outcome"],
+                     "decision_asserted": p["outcome"] in SV_ASSERTING_VERDICTS, "decision_supported_label": case["decision_supported"],
+                     "claims_grounded_expected": case["claims_grounded"], "grounding_predicted": p["grounding_predicted"],
+                     "expected_major_contradiction": case["expected_major_contradiction"], "contradiction_predicted": p["contradiction_predicted"],
+                     "policy_applicable_expected": case["policy_applicable"],
+                     "expected_verification_status": case["expected_verification_status"], "predicted_verification_status": p["verification_status"], "escalation_reason": (re.sub(r"\b([a-z]+)_[0-9a-f]{16}\b", r"<\1>", p["escalation_reason"]) if isinstance(p["escalation_reason"], str) else p["escalation_reason"]),  # random graph ids -> <type> so records are reproducible
+                     "supporting_evidence": _sv7d_stable_refs(p["supporting_evidence"]), "id_integrity": integ, "graph_unchanged": True, "confidence": p["confidence"]})
+    return recs
+
+def _sv7d_run_case(case: Dict[str, Any], workdir: str) -> List[Dict[str, Any]]:
+    paths = []
+    for name, text in case["documents"].items():
+        p = os.path.join(workdir, name)
+        with open(p, "w", encoding="utf-8") as fh: fh.write(text)
+        paths.append(p)
+    rb = os.path.join(workdir, "rulebook.txt")
+    with open(rb, "w", encoding="utf-8") as fh: fh.write(case["rulebook"])
+    G = build_evidence_graph(paths, rb)
+    d = _sv7d_target_decision(G, case["target_rule"])
+    if d is None: raise ValueError(f"{case['case_id']}: target rule did not map to exactly one Decision")
+    _sv7d_apply_fault(G, d, case.get("fault"))
+    return _sv7d_records_for_graph(case, G, d)
+
+def _sv7d_metric(num: int, den: int, reason: Optional[str] = None) -> Dict[str, Any]:
+    if den == 0: return {"value": NOT_MEASURED, "numerator": None, "denominator": 0, "reason": reason or "no valid denominator"}
+    return {"value": round(num / den, 4), "numerator": num, "denominator": den}
+
+def _sv7d_variant_metrics(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    nm = lambda r: NOT_MEASURED
+    asserted = [r for r in recs if r["decision_asserted"]]
+    grd = [r for r in recs if isinstance(r["claims_grounded_expected"], bool) and isinstance(r["grounding_predicted"], bool)]
+    con = [r for r in recs if isinstance(r["expected_major_contradiction"], bool) and isinstance(r["contradiction_predicted"], bool)]
+    ver = [r for r in recs if r["predicted_verification_status"] != NOT_MEASURED]
+    nov = [r for r in ver if r["expected_verification_status"] != "VERIFIED"]
+    noe = [r for r in ver if r["expected_verification_status"] != "ESCALATE"]
+    no_mech = "variant has no verification mechanism"
+    return {"cases": len(recs),
+            "decision_accuracy": _sv7d_metric(sum(r["decision_correct"] for r in recs), len(recs)),
+            "unsupported_decision_rate": _sv7d_metric(sum(1 for r in asserted if r["decision_supported_label"] is False), len(asserted), "no asserted (VIOLATION / SATISFIED) decisions"),
+            "evidence_grounding_accuracy": _sv7d_metric(sum(r["claims_grounded_expected"] == r["grounding_predicted"] for r in grd), len(grd), "variant has no grounding mechanism or no labelled case"),
+            "contradiction_handling_accuracy": _sv7d_metric(sum(r["expected_major_contradiction"] == r["contradiction_predicted"] for r in con), len(con), "variant has no contradiction mechanism or no labelled case"),
+            "verification_status_accuracy": _sv7d_metric(sum(r["predicted_verification_status"] == r["expected_verification_status"] for r in ver), len(ver), no_mech),
+            "escalation_accuracy": _sv7d_metric(sum((r["predicted_verification_status"] == "ESCALATE") == (r["expected_verification_status"] == "ESCALATE") for r in ver), len(ver), no_mech),
+            "false_verification_rate": _sv7d_metric(sum(r["predicted_verification_status"] == "VERIFIED" for r in nov), len(nov), no_mech + " or no case that must not be VERIFIED"),
+            "false_escalation_rate": _sv7d_metric(sum(r["predicted_verification_status"] == "ESCALATE" for r in noe), len(noe), no_mech + " or no case that must not be ESCALATE")}
+
+def aggregate_self_verification_results(records: List[Dict[str, Any]], cases: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Derived from the raw per-case / per-variant records only."""
+    cases = SELF_VERIFICATION_BENCHMARK if cases is None else cases
+    variants = {v: _sv7d_variant_metrics([r for r in records if r["system_variant"] == v]) for v in SV7D_VARIANTS}
+    names = [k for k in variants[SV7D_VARIANTS[0]] if k != "cases"]
+    val = lambda v, k: variants[v][k]["value"]
+    isnum = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    comparison = {"order": list(SV7D_VARIANTS), "note": "same cases for every variant; raw values only; a delta exists only where both values are measured"}
+    for k in names:
+        vals = [val(v, k) for v in SV7D_VARIANTS]
+        comparison[k] = {"values": dict(zip(SV7D_VARIANTS, vals)), **{f"delta_{a}_vs_{b}": (round(vals[j] - vals[i], 4) if isnum(vals[i]) and isnum(vals[j]) else NOT_MEASURED) for a, b, i, j in (("SV", "EG", 1, 2), ("SVPA", "SV", 2, 3))}}
+    return {"benchmark": {"id": SV7D_ID, "version": SV7D_VERSION, "size": len(cases), "category_counts": dict(Counter(c["category"] for c in cases)), "expected_outcome_counts": dict(Counter(c["expected_outcome"] for c in cases)),
+                          "expected_status_counts": dict(Counter(c["expected_verification_status"] for c in cases)), "seed": None, "llm_used": False},
+            "variants": variants, "comparison": comparison, "protocol": SV7D_PROTOCOL}
+
+def run_self_verification_benchmark(cases: Optional[List[Dict[str, Any]]] = None, output_path: Optional[str] = None) -> Dict[str, Any]:
+    """Offline and deterministic. Every case builds its own private graph; returns {"records", "aggregate"}; writes JSON only if output_path is given."""
+    import tempfile
+    cases = SELF_VERIFICATION_BENCHMARK if cases is None else cases
+    probs = validate_self_verification_benchmark(cases, require_coverage=cases is SELF_VERIFICATION_BENCHMARK)  # a custom / subset list is label-checked but need not cover every category
+    if probs: raise ValueError("self-verification benchmark labels inconsistent: " + "; ".join(probs[:5]))
+    records: List[Dict[str, Any]] = []
+    for c in cases:
+        with tempfile.TemporaryDirectory() as td: records += _sv7d_run_case(c, td)
+    result = _json_safe({"benchmark_id": SV7D_ID, "version": SV7D_VERSION, "records": records, "aggregate": aggregate_self_verification_results(records, cases)})
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
 
 def run_v1_v2_experiment(case: Dict[str, Any], runs: int = 1, run_llm: bool = False, config: Optional[Dict[str, Any]] = None, criteria: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Runs the V1/V2 comparison for ONE labelled case and returns {"records": [...], "summary": {...}}.
@@ -3954,7 +6252,8 @@ def analyze_compliance_with_matrix(context_payload: str, rulebook_text: str, obj
             "22. Links relevant to this investigation (section LINKS RELEVANT TO THIS INVESTIGATION, from system retrieval records) must be reported as not retrieved with contents not inspected, wherever a related finding or the summary mentions them; keep that retrieval status separate from the finding's Status. Never call an unretrieved link invalid, fraudulent, legitimate, or proof for or against any claim. Do not add a Key Findings row for a link that is not relevant, and do not list links yourself.\n"
             "23. Policy-listed amounts, thresholds and limits are POLICY CONTEXT, not transaction records, unless the source evidence says otherwise. Never recommend that a transaction, claim, invoice or submission be changed, resubmitted, or made to match, equal or stay within a policy-listed amount merely because the policy lists it. Recommended Actions must follow from the actual evidence and findings, for example: obtain the source transaction records, or clarify what the policy-listed amount represents. Never recommend linking, associating, tying or mapping a policy-listed amount to an actual expense claim, transaction, invoice or employee; the policy amount stays separate context. Apply this in the Executive Summary, Key Findings and Recommended Actions alike.\n"
             "24. Graph trace statements must match the system trace: complete only for the inspected edges when all are listed, otherwise a sample with inspected / shown / omitted counts. Never claim complete evidence lineage and never invent a traversal path. Label a fully listed trace 'Complete trace' and a partial one 'Sample trace (X of N edges shown; omitted edges were inspected but are not displayed)'.\n"
-            "25. Government ID recommendations are conditional: first identify the jurisdiction and ID format; then determine whether an applicable checksum method exists and its configuration is available; run checksum validation only if both are true, otherwise keep UNVERIFIED and request an independent verification method. A checksum never proves authenticity, ownership or document validity, and ID validation of any kind (format or checksum) never confirms that an ID is authentic, genuine, issued or owned by anyone: never write that validating the ID confirms, proves or establishes any of these.\n\n"
+            "25. Government ID recommendations are conditional: first identify the jurisdiction and ID format; then determine whether an applicable checksum method exists and its configuration is available; run checksum validation only if both are true, otherwise keep UNVERIFIED and request an independent verification method. A checksum never proves authenticity, ownership or document validity, and ID validation of any kind (format or checksum) never confirms that an ID is authentic, genuine, issued or owned by anyone: never write that validating the ID confirms, proves or establishes any of these.\n"
+            "26. If the context has a CROSS-DOCUMENT EVIDENCE section: [XDOC-EXPLICIT] items were reached through an established document link from a retrieved document (say 'retrieved through a cross-document link', give the relationship type, link status and reason); they are NOT lexical matches and do not by themselves show compliance or a violation. [XDOC-POSSIBLE] is a possibility, never identity; semantic-only links never show the same entity. [XDOC-CONFLICT] must be reported as a conflict needing reconciliation, never resolved by you. [XDOC-UNRESOLVED] establishes nothing. [MISSING-REFERENCE] is missing evidence: say the referenced document was not supplied and do not assume its contents. Cite the evidence ID and file @ location of every cross-document item. Only DETERMINISTIC policy results can be VIOLATION.\n\n"
             f"INVESTIGATION OBJECTIVE: {objective}\n\n"
             "OUTPUT FORMAT (exactly these sections, in this order):\n"
             "## 1. Executive Summary: 2-3 sentences with the overall result.\n"
@@ -4324,8 +6623,10 @@ def build_evidence_graph(file_paths: List[str], rulebook_path: Optional[str] = N
         doc_id = _add_document_node(G, path)
         _ingest_facts(G, doc_id, os.path.basename(path), path, entity_cache)
     link_shared_terms(G)
+    link_cross_documents(G)
     evaluate_policy_rules(G)
     if ENABLE_CONTRADICTION_HEURISTIC: detect_contradictions(G)
+    classify_contradictions(G)
     return G
 
 def _mark_record(db, inv_id: str, objective: str, message: str) -> None:
@@ -4510,12 +6811,26 @@ def process_document_batch_task(self, file_paths: list, url_list: list, rulebook
         try:
             term_links = link_shared_terms(G)
         except Exception as e: logger.exception(f"Term linking failed (continuing): {e}")
+        xdoc_summary: Dict[str, Any] = {"status": "NOT_RUN"}
+        try:  # Phase A cross-document evidence linking: graph-only, no decision / verdict; failure never kills the task
+            xdoc_summary = link_cross_documents(G)
+        except Exception as e:
+            xdoc_summary = {"status": "ERROR", "reason": str(e)[:200]}
+            logger.exception(f"Cross-document linking failed (continuing): {e}")
+        try:  # rulebook -> compiler -> graph-derived facts/evidence -> deterministic rule engine; results go onto the PolicyRule nodes used by evaluate_policy_rules below
+            apply_compiled_policy(G, rulebook_text)
+        except Exception as e: logger.exception(f"Compiled policy stage failed (continuing with legacy engine): {e}")
         try:
             decisions_created = len(evaluate_policy_rules(G))
         except Exception as e: logger.exception(f"Policy engine failed (continuing without decisions): {e}")
         try:
             if ENABLE_CONTRADICTION_HEURISTIC: contradiction_edges = detect_contradictions(G)
         except Exception as e: logger.exception(f"Contradiction detection failed (continuing): {e}")
+        xcon_summary: Dict[str, Any] = {"status": "NOT_RUN"}
+        try: xcon_summary = classify_contradictions(G)  # graph-only classification of linked-document contradictions; never a violation
+        except Exception as e:
+            xcon_summary = {"status": "ERROR", "reason": str(e)[:200]}
+            logger.exception(f"Contradiction classification failed (continuing): {e}")
 
         link_log = normalize_link_log(link_log)  # ONE de-duplicated record set; V1 and V2 report sections below both read exactly this
 
@@ -4556,12 +6871,12 @@ def process_document_batch_task(self, file_paths: list, url_list: list, rulebook
         except Exception as e: _chain_summary = {"status": "ERROR", "reason": str(e)[:200]}
         try: _gq_structural = evaluate_graph_queries(G)["structural_checks"]
         except Exception as e: _gq_structural = {"status": "ERROR", "reason": str(e)[:200]}
-        ai_report_v2 = assemble_report(ai_report_v2, v2_audit_section(G), report_appendix_details(G, v2_latency, link_log) + v2_trace_section(v2_stats), report_key_limits(G, link_log), {l["key"] for l in link_log})
+        ai_report_v2 = assemble_report(ai_report_v2, v2_audit_section(G), report_appendix_details(G, v2_latency, link_log) + v2_trace_section(v2_stats) + v2_cross_document_section(v2_stats) + v2_contradiction_section(G), report_key_limits(G, link_log), {l["key"] for l in link_log})
 
         # Final DB Update & Batch Saving (idempotent: a retried task replaces, never duplicates, graph rows)
         inv_record.baseline_v1_result = _json_safe(ai_report_v1)
         inv_record.research_v2_result = _json_safe(ai_report_v2)
-        inv_record.metrics = _json_safe({"v1_latency": v1_latency, "v2_latency": v2_latency, "ceg_nodes": G.number_of_nodes(), "ceg_edges": G.number_of_edges(), "decisions": decisions_created, "violations": sum(1 for _, d in G.nodes(data=True) if d.get("type") == "Decision" and d.get("verdict") == "VIOLATION"), "contradiction_edges": contradiction_edges, "policy_coverage": policy_coverage(G), "policy_rules": policy_rule_report(G), "supporting_links": _links_for_output(link_log), "term_links": term_links, "evaluation": evaluation, "graph_chain": _chain_summary, "graph_query_structural_checks": _gq_structural, "v2_nodes_reached": v2_stats.get("nodes_reached", 0), "v2_retrieved": v2_stats["retrieved"], "v2_expanded": v2_stats["expanded"], "v2_traversal_edges": v2_stats.get("traversal_edges", 0), "v2_inspected_edges": v2_stats.get("inspected_edges", 0), "v2_context_only_expanded": v2_stats.get("context_only_expanded", 0), "v2_expansion_trace": v2_stats.get("expansion_trace", [])})
+        inv_record.metrics = _json_safe({"v1_latency": v1_latency, "v2_latency": v2_latency, "ceg_nodes": G.number_of_nodes(), "ceg_edges": G.number_of_edges(), "decisions": decisions_created, "violations": sum(1 for _, d in G.nodes(data=True) if d.get("type") == "Decision" and d.get("verdict") == "VIOLATION"), "contradiction_edges": contradiction_edges, "policy_coverage": policy_coverage(G), "policy_rules": policy_rule_report(G), "supporting_links": _links_for_output(link_log), "term_links": term_links, "cross_document_links": xdoc_summary, "cross_document_reasoning": v2_stats.get("cross_document"), "contradiction_classification": xcon_summary, "evaluation": evaluation, "graph_chain": _chain_summary, "graph_query_structural_checks": _gq_structural, "v2_nodes_reached": v2_stats.get("nodes_reached", 0), "v2_retrieved": v2_stats["retrieved"], "v2_expanded": v2_stats["expanded"], "v2_traversal_edges": v2_stats.get("traversal_edges", 0), "v2_inspected_edges": v2_stats.get("inspected_edges", 0), "v2_context_only_expanded": v2_stats.get("context_only_expanded", 0), "v2_expansion_trace": v2_stats.get("expansion_trace", [])})
         db.add(inv_record)
 
         db.query(EvidenceEdge).filter(EvidenceEdge.investigation_id == inv_id).delete(synchronize_session=False)
