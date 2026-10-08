@@ -98,7 +98,7 @@ COMPILED_POLICY_ENABLED = os.getenv("COMPILED_POLICY_ENABLED", "true").lower() =
 COMPILED_POLICY_STRICT_UNITS = os.getenv("COMPILED_POLICY_STRICT_UNITS", "true").lower() == "true"  # unit-less fact => INDETERMINATE, never assumed
 try:
     from .policy_compiler import compile_policy as _compile_policy, CompilationError as _CompilationError, DEFAULT_MIN_CONFIDENCE as _COMPILER_MIN_CONFIDENCE
-    from .rule_engine import evaluate_policy as _evaluate_compiled_rules
+    from .rule_engine import evaluate_policy as _evaluate_compiled_rules, norm_unit as _compiled_norm_unit
     HAS_POLICY_COMPILER = True
 except ImportError as _pc_err:
     HAS_POLICY_COMPILER = False
@@ -5924,6 +5924,911 @@ def run_self_verification_benchmark(cases: Optional[List[Dict[str, Any]]] = None
         with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
     return result
 
+# --- COUNTERFACTUAL COMPLIANCE (Phase 8; READ-ONLY layer: decision / policy-rule / Evidence Graph / cross-document / contradiction / self-verification layers are REUSED unchanged) ---
+# For every NON-COMPLIANT (VIOLATION) or CONDITIONAL (INCONCLUSIVE / UNEVALUATED) Decision: "what MINIMUM change or missing evidence would make this case compliant?". Everything is derived from the
+# rule the Decision cites (its stored parsed_spec, never from the rule text of a particular scenario) and from the Evidence the Decision / contradiction findings already reference. No node / edge is created, no verdict,
+# evidence or rule is altered, nothing is invented, no LLM / network / randomness. Recomputed on every call (idempotent). Result contract (all six requested fields always present):
+#   current_decision | violated_rule | evidence_causing_violation | missing_requirement | recommended_corrective_condition | expected_resulting_state     (+ status, change_type, minimum_changes, ...)
+#   status:      ESTABLISHED (policy-supported counterfactual) | UNRESOLVED (none can be established: fields not derivable are NOT_MEASURED, `unresolved_reason` says why) | NOT_REQUIRED (decision is not NON-COMPLIANT / CONDITIONAL)
+#   change_type: CORRECTIVE_ACTION (the case itself must change: amount, identifier, offending text) | SUPPLY_EVIDENCE (the case may already be compliant; the rule cannot be checked until evidence exists)
+# Compiled-rule Decisions (result_source compiled_policy_engine) are UNRESOLVED except ONE re-derivable semantic (see _cf_compiled: single leaf `amount <ordering-op> number` on a transaction entity); rules outside the DSL
+# are UNRESOLVED: no corrective condition is guessed for rule semantics this layer cannot re-derive.
+CF_VERSION = "CF1"
+CF_FIELDS = ("current_decision", "violated_rule", "evidence_causing_violation", "missing_requirement", "recommended_corrective_condition", "expected_resulting_state")
+CF_STATUSES = ("ESTABLISHED", "UNRESOLVED", "NOT_REQUIRED")
+CF_CHANGE_TYPES = ("CORRECTIVE_ACTION", "SUPPLY_EVIDENCE")
+CF_SCOPE_CLASS = {"VIOLATION": "NON_COMPLIANT", "INCONCLUSIVE": "CONDITIONAL", "UNEVALUATED": "CONDITIONAL"}
+_CF_NEGATE = {">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+
+def _cf_ev_ref(G: nx.MultiDiGraph, eid: str, role: str = "violation_basis") -> Dict[str, Any]:
+    docs = _evidence_source_docs(G, eid)
+    return {"evidence_id": eid, "role": role, "document_id": docs[0]["document_id"] if docs else None, "document_ids": [x["document_id"] for x in docs], "filename": docs[0]["filename"] if docs else None,
+            "location": G.nodes[eid].get("source_location") or (docs[0].get("location") if docs else None), "provenance": _sv_json(G.nodes[eid].get("provenance"))}
+
+def _cf_case_evidence(G: nx.MultiDiGraph, node_id: str) -> List[str]:
+    """Qualifying case evidence behind a node: policy-source / context-only evidence never counts as the case."""
+    if not G.has_node(node_id): return []
+    return [e for e in _supporting_evidence_ids(G, node_id) if G.has_node(e) and G.nodes[e].get("type") == "Evidence" and not G.nodes[e].get("context_only") and not _is_policy_source_evidence(G.nodes[e])]
+
+def _cf_rule_ref(G: nx.MultiDiGraph, dd: Dict[str, Any]) -> Dict[str, Any]:
+    rid = dd.get("rule_id"); rd = G.nodes[rid] if rid and G.has_node(rid) and G.nodes[rid].get("type") == "PolicyRule" else {}
+    pols = sorted(v for _, v, e in G.out_edges(rid, data=True) if e.get("relation") == "BELONGS_TO" and G.nodes[v].get("type") == "Policy") if rd else []
+    return {"rule_id": rid, "condition": rd.get("condition"), "source_file": rd.get("source_file"), "source_location": rd.get("source_location"), "policy_ids": pols, "rulebook_provenance": _sv_json(dd.get("rulebook_provenance")),
+            "parsed_spec": _sv_json(dd.get("parsed_spec")), "result_source": dd.get("result_source")}
+
+def _cf_unresolved(res: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    res.update(status="UNRESOLVED", change_type=None, unresolved_reason=reason, missing_requirement=NOT_MEASURED, recommended_corrective_condition=NOT_MEASURED, expected_resulting_state=NOT_MEASURED, minimum_changes=[], required_condition=None)
+    return res
+
+def _cf_fmt(v: float) -> str:
+    return f"{v:g}"
+
+def _cf_transaction(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any], basis: List[str]) -> Dict[str, Any]:
+    op, val, cur = spec["op"], spec["value"], spec.get("currency")
+    region = op if spec["mode"] == "REQUIRE" else _CF_NEGATE[op]  # the compliant region of an amount
+    incl, direction = region in (">=", "<="), ("decrease" if region in ("<", "<=") else "increase")
+    changes: List[Dict[str, Any]] = []
+    for b in basis:
+        d = G.nodes[b] if G.has_node(b) else {}; a = d.get("amount")
+        if d.get("type") != "Transaction" or not isinstance(a, (int, float)) or not math.isfinite(a): return {"reason": f"basis node {b} has no usable transaction amount"}
+        if _CMP_OPS[region](a, val): return {"reason": f"basis amount {_cf_fmt(a)} already meets {region} {_cf_fmt(val)}; stored Decision and rule disagree"}
+        changes.append({"kind": "amount_change", "transaction_id": b, "currency": d.get("currency"), "current_value": a, "direction": direction, "boundary": val, "boundary_inclusive": incl,
+                        "minimum_delta": round(abs(a - val), 10), "delta_is_strict_lower_bound": not incl, "target_value": (val if incl else None), "evidence_ids": _cf_case_evidence(G, b)})
+    unit = cur or "(any currency)"
+    return {"change_type": "CORRECTIVE_ACTION", "required_condition": {"subject": "TRANSACTION", "relation": region, "value": val, "currency": cur}, "minimum_changes": changes,
+            "missing_requirement": f"each in-scope transaction amount must be {region} {_cf_fmt(val)} {unit} (rule {spec['mode']} TRANSACTION {op} {_cf_fmt(val)}); {len(changes)} amount(s) do not meet it",
+            "recommended": (f"Correct each listed transaction amount so it is {region} {_cf_fmt(val)} {unit}; the smallest change moves it {direction} to the boundary {_cf_fmt(val)}" if incl else
+                            f"Correct each listed transaction amount so it is {region} {_cf_fmt(val)} {unit}; the boundary itself is not compliant, so the amount must move {direction} by more than the listed minimum_delta"),
+            "resulting": {"state": "COMPLIANT_WITH_RULE", "expected_verdict": "SATISFIED", "condition": f"every listed amount meets {region} {_cf_fmt(val)}; other rules are not re-evaluated"}}
+
+def _cf_amount_pairs(G: nx.MultiDiGraph, basis: List[str]) -> List[Tuple[str, str]]:
+    return [(a, b) for i, a in enumerate(basis) for b in basis[i + 1:] if G.has_node(a) and G.has_node(b) and G.nodes[a].get("currency") == G.nodes[b].get("currency") and _match_transactions(G.nodes[a], G.nodes[b])[0] == "strong"
+            and G.nodes[a].get("amount") != G.nodes[b].get("amount")]
+
+def _cf_amount_match(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any], basis: List[str]) -> Dict[str, Any]:
+    pairs = _cf_amount_pairs(G, basis)
+    if not pairs: return {"reason": "no reliably linked basis pair with differing amounts is recorded"}
+    ch = []
+    for a, b in pairs:
+        va, vb = G.nodes[a]["amount"], G.nodes[b]["amount"]
+        ch.append({"kind": "amount_reconciliation", "transaction_ids": [a, b], "currency": G.nodes[a].get("currency"), "values": [va, vb], "minimum_delta": round(abs(va - vb), 10), "authoritative_record": NOT_MEASURED,
+                   "evidence_ids": list(dict.fromkeys(_cf_case_evidence(G, a) + _cf_case_evidence(G, b)))})
+    return {"change_type": "CORRECTIVE_ACTION", "required_condition": {"subject": "AMOUNT_MATCH", "relation": "==", "value": NOT_MEASURED, "currency": None}, "minimum_changes": ch,
+            "missing_requirement": f"reliably linked records must carry the same amount (rule REQUIRE amounts to match); {len(ch)} linked pair(s) differ",
+            "recommended": "Reconcile each listed pair so both records carry the same amount (smallest change = the listed minimum_delta applied to one record); the policy does not say which record is authoritative, so that is not decided here",
+            "resulting": {"state": "COMPLIANT_WITH_RULE", "expected_verdict": "SATISFIED", "condition": "every linked pair carries equal amounts"}}
+
+def _cf_entity(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any], basis: List[str]) -> Dict[str, Any]:
+    subj, verdict = spec["subject"], dd.get("verdict")
+    if spec["mode"] != "REQUIRE": return {"reason": f"a FORBID {subj} VALID rule has no policy-supported corrective condition"}
+    et = "GovID" if subj == "GOVID" else "Phone"
+    ents = [n for n in basis if G.has_node(n) and G.nodes[n].get("type") == "Entity" and G.nodes[n].get("entity_type") == et]
+    if not ents: return {"reason": f"no {subj} basis entity recorded"}
+    if verdict == "VIOLATION":
+        ch = [{"kind": "identifier_correction", "entity_id": n, "entity_type": et, "current_validity": G.nodes[n].get("is_valid"), "evidence_ids": _cf_case_evidence(G, n)} for n in ents]
+        return {"change_type": "CORRECTIVE_ACTION", "required_condition": {"subject": subj, "relation": "is_valid", "value": True, "currency": None}, "minimum_changes": ch,
+                "missing_requirement": f"every {subj} must be valid (rule REQUIRE {subj} VALID); {len(ch)} value(s) are invalid",
+                "recommended": f"Correct each listed {subj} value in the source document so it passes the configured validation; which digits are wrong is not determined here",
+                "resulting": {"state": "COMPLIANT_WITH_RULE", "expected_verdict": "SATISFIED", "condition": f"every listed {subj} validates"}}
+    return {}
+
+def _cf_keyword(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any], basis: List[str]) -> Dict[str, Any]:
+    phrase, verdict = str(spec.get("value") or ""), dd.get("verdict")
+    if not phrase: return {"reason": "rule carries no phrase"}
+    if spec["mode"] == "REQUIRE" and verdict == "VIOLATION":
+        scope = [e for e in dd.get("absence_scope_evidence_ids") or [] if G.has_node(e) and G.nodes[e].get("type") == "Evidence"]
+        return {"change_type": "SUPPLY_EVIDENCE", "required_condition": {"subject": "KEYWORD", "relation": "present", "value": phrase, "currency": None}, "evidence": [_cf_ev_ref(G, e, "absence_scope") for e in scope],
+                "minimum_changes": [{"kind": "phrase_presence", "phrase": phrase, "action": "add", "evidence_ids": scope}],
+                "missing_requirement": f"case evidence containing the phrase '{phrase}' (rule REQUIRE KEYWORD); it is absent within the extracted scope of {len(scope)} evidence item(s)",
+                "recommended": f"Supply case evidence whose text contains '{phrase}'; the rule checks for that text only, so it does not establish whether the underlying action took place",
+                "resulting": {"state": "RE_EVALUATION_REQUIRED", "expected_verdict": "SATISFIED", "condition": f"the supplied evidence text contains '{phrase}'"}}
+    if spec["mode"] == "FORBID" and verdict == "VIOLATION":
+        hits = list(dict.fromkeys(e for b in basis for e in ([b] if G.has_node(b) and G.nodes[b].get("type") == "Evidence" else [])))
+        if not hits: return {"reason": "no offending evidence recorded as the basis"}
+        return {"change_type": "CORRECTIVE_ACTION", "required_condition": {"subject": "KEYWORD", "relation": "absent", "value": phrase, "currency": None}, "evidence_ids_override": hits,
+                "minimum_changes": [{"kind": "phrase_removal", "phrase": phrase, "action": "remove", "evidence_ids": hits}],
+                "missing_requirement": f"the phrase '{phrase}' must not appear in case evidence (rule FORBID KEYWORD); it appears in {len(hits)} evidence item(s)",
+                "recommended": f"Revise the documents behind the listed evidence so they no longer contain '{phrase}'",
+                "resulting": {"state": "COMPLIANT_WITH_RULE", "expected_verdict": "SATISFIED", "condition": f"no case evidence contains '{phrase}'"}}
+    if spec["mode"] == "REQUIRE" and verdict == "INCONCLUSIVE":
+        gaps = [g_ for g_ in dd.get("extraction_gap_documents") or [] if G.has_node(g_)]
+        if not gaps: return {"reason": "INCONCLUSIVE without recorded extraction-gap documents"}
+        return {"change_type": "SUPPLY_EVIDENCE", "required_condition": {"subject": "KEYWORD", "relation": "present", "value": phrase, "currency": None}, "gap_documents": gaps,
+                "minimum_changes": [{"kind": "readable_text_for_documents", "phrase": phrase, "document_ids": gaps, "filenames": [G.nodes[g_].get("filename") for g_ in gaps]}],
+                "missing_requirement": f"readable extracted text for {len(gaps)} document(s) whose extraction failed or was empty, so the presence of '{phrase}' can be checked",
+                "recommended": "Supply a readable version of each listed document; the rule can then be evaluated. The result may still be a violation if the phrase is not in them",
+                "resulting": {"state": "RE_EVALUATION_REQUIRED", "expected_verdict": NOT_MEASURED, "condition": f"SATISFIED only if a re-extracted document contains '{phrase}'"}}
+    return {}
+
+def _cf_compiled(G: nx.MultiDiGraph, dd: Dict[str, Any], basis: List[str]) -> Dict[str, Any]:
+    """Compiled-rule Decisions: exactly ONE semantic is re-derived, from the STORED compiled rule (no LLM, no text parsing): a single VALID, executed, VIOLATION compiled rule whose REQUIRE / PROHIBIT
+    condition is one leaf `amount <, <=, >, >= number` on a transaction entity (no temporal, exception or evidence clause, no unit conversion). It maps to the existing TRANSACTION amount-boundary
+    derivation (_cf_transaction). Anything else returns only a reason -> UNRESOLVED."""
+    rid = dd.get("rule_id"); rn = G.nodes[rid] if rid and G.has_node(rid) and G.nodes[rid].get("type") == "PolicyRule" else None
+    ents = (rn or {}).get("compiled_rules") or []
+    if len(ents) != 1: return {"reason": "compiled semantics not re-derived: the cited rule line does not carry exactly one compiled rule"}
+    e = ents[0]; cr = e.get("compiled_rule") or {}; r = e.get("result") or {}
+    if e.get("status") != "VALID" or not r.get("executed") or r.get("verdict") != "VIOLATION": return {"reason": "compiled rule is not a VALID, executed VIOLATION"}
+    if not basis or not set(basis) <= set(r.get("violating_node_ids") or []): return {"reason": "Decision basis is not a subset of the compiled rule's violating records"}
+    if cr.get("rule_type") not in ("REQUIRE", "PROHIBIT") or cr.get("temporal") or cr.get("exception") or cr.get("required_evidence"): return {"reason": "compiled rule form (type / temporal / exception / evidence) is not a plain amount bound"}
+    cond, ent = cr.get("condition") or {}, str(cr.get("entity") or "").lower()
+    if ent not in _COMPILED_TXN_ENTITIES or cond.get("children") or str(cond.get("entity") or "").lower() != ent or str(cond.get("field") or "").lower() != "amount": return {"reason": "compiled condition is not a single leaf on a transaction amount"}
+    op, val = cond.get("operator"), cond.get("value")
+    if op not in _CMP_OPS or isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val): return {"reason": "compiled condition is not an ordering comparison against a number"}
+    unit = _compiled_norm_unit(cond.get("unit"))
+    if unit is not None and (unit not in _KNOWN_CURRENCIES or any((G.nodes[b].get("currency") if G.has_node(b) else None) != unit for b in basis)): return {"reason": "compiled unit is not the basis currency: conversion is not re-derived"}
+    return _cf_transaction(G, dd, {"mode": "REQUIRE" if cr["rule_type"] == "REQUIRE" else "FORBID", "op": op, "value": val, "currency": unit}, basis)
+
+def _cf_conditional(G: nx.MultiDiGraph, dd: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, Any]:
+    """CONDITIONAL (INCONCLUSIVE) Decisions: the rule was attempted but evidence is insufficient; the counterfactual is the evidence the rule itself needs."""
+    subj = spec["subject"]
+    if subj == "KEYWORD": return _cf_keyword(G, dd, spec, [])
+    if subj == "AMOUNT_MATCH":
+        recs = [n for n, d in _nodes_of_type(G, "Transaction") if not _is_policy_role(d.get("amount_role"))]
+        docs = {x["document_id"] for n in recs for e in _cf_case_evidence(G, n) for x in _evidence_source_docs(G, e)}
+        if len(recs) < 2 or len(docs) < 2: return {"reason": "fewer than two records from different documents: nothing to link"}
+        return {"change_type": "SUPPLY_EVIDENCE", "required_condition": {"subject": "AMOUNT_MATCH", "relation": "linked_records_equal", "value": NOT_MEASURED, "currency": None},
+                "evidence_ids_override": list(dict.fromkeys(e for n in recs for e in _cf_case_evidence(G, n))),
+                "minimum_changes": [{"kind": "link_evidence", "record_ids": recs, "requirement": "shared reference / transaction ID, or the same date + party + expense type, on the records to be compared"}],
+                "missing_requirement": f"evidence that the {len(recs)} records from {len(docs)} documents refer to the same transaction (shared reference / transaction ID, or same date + party + expense type); without it nothing may be compared",
+                "recommended": "Supply the linking reference (or date + party + expense type) for the records; no amount is changed. The rule then compares the linked amounts",
+                "resulting": {"state": "RE_EVALUATION_REQUIRED", "expected_verdict": NOT_MEASURED, "condition": "SATISFIED only if the linked amounts are equal; a differing pair would be a VIOLATION"}}
+    if subj in ("GOVID", "PHONE"):
+        et = "GovID" if subj == "GOVID" else "Phone"
+        pend = [n for n, d in _nodes_of_type(G, "Entity", et) if d.get("is_valid") is None]
+        if not pend: return {"reason": f"no unverified {subj} entity recorded"}
+        return {"change_type": "SUPPLY_EVIDENCE", "required_condition": {"subject": subj, "relation": "is_valid", "value": True, "currency": None}, "evidence_ids_override": list(dict.fromkeys(e for n in pend for e in _cf_case_evidence(G, n))),
+                "minimum_changes": [{"kind": "validity_determination", "entity_ids": pend, "entity_type": et}],
+                "missing_requirement": f"a validity determination for {len(pend)} detected {subj} value(s) (rule REQUIRE/FORBID {subj} VALID)",
+                "recommended": f"Supply the validation result for each listed {subj} under a configured, jurisdiction-specific method; nothing is changed in the documents",
+                "resulting": {"state": "RE_EVALUATION_REQUIRED", "expected_verdict": NOT_MEASURED, "condition": "outcome depends on the validation result"}}
+    if subj == "TRANSACTION":
+        unc = [n for n, d in _nodes_of_type(G, "Transaction") if d.get("amount_role") == ROLE_UNCLEAR and (not spec.get("currency") or d.get("currency") == spec["currency"])]
+        if not unc: return {"reason": "no UNCLEAR-role amount recorded"}
+        return {"change_type": "SUPPLY_EVIDENCE", "required_condition": {"subject": "TRANSACTION", "relation": spec["op"], "value": spec["value"], "currency": spec.get("currency")}, "evidence_ids_override": list(dict.fromkeys(e for n in unc for e in _cf_case_evidence(G, n))),
+                "minimum_changes": [{"kind": "amount_role_clarification", "transaction_ids": unc}],
+                "missing_requirement": f"evidence establishing whether {len(unc)} amount(s) are actual transactions (their role is UNCLEAR), so the rule can be applied",
+                "recommended": "Supply source evidence that states what each listed amount represents; no amount is changed",
+                "resulting": {"state": "RE_EVALUATION_REQUIRED", "expected_verdict": NOT_MEASURED, "condition": "outcome depends on what the amounts turn out to be"}}
+    return {}
+
+def _cf_contradiction_context(G: nx.MultiDiGraph, ev_ids: List[str], docs: set, region: Optional[Tuple[str, float]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []; evs = set(ev_ids)
+    for f in sorted(G.graph.get("contradiction_findings") or [], key=lambda x: x["finding_id"]):
+        cat = f.get("category"); sides = [s for s in (f.get("claim_a"), f.get("claim_b")) if s]
+        if cat not in XCON_CONTRADICTION and cat != "MISSING_EVIDENCE": continue
+        touch = any(p.get("evidence_id") in evs for s in sides for p in s.get("provenance") or []) or (cat == "MISSING_EVIDENCE" and any(s.get("document_id") in docs for s in sides))
+        if not touch: continue
+        ent = {"finding_id": f["finding_id"], "category": cat, "field": f.get("field"), "reason": f.get("reason"), "claims": [{"document_id": s.get("document_id"), "filename": s.get("filename"), "value": _sv_json(s.get("value")),
+               "evidence_ids": [p.get("evidence_id") for p in s.get("provenance") or [] if p.get("evidence_id")]} for s in sides], "other_side_amounts": [], "other_side_satisfies_rule": NOT_MEASURED}
+        if f.get("field") == "amount" and region:
+            others = sorted({x for s in sides if not any(p.get("evidence_id") in evs for p in s.get("provenance") or []) for x in ((s.get("value") or {}).get("amounts") or [])})
+            ent["other_side_amounts"] = others
+            if others: ent["other_side_satisfies_rule"] = all(_CMP_OPS[region[0]](x, region[1]) for x in others)
+        out.append(ent)
+    return out
+
+def _cf_conflict(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Phase 8B: contradicting evidence already recorded for the Decision (self-verification layer, reused as stored). Metadata only: never changes status, change_type or the proposed change."""
+    items = [x for x in build_self_verification_result(G, decision_id).get("contradicting_evidence") or [] if x.get("evidence_id") or x.get("finding_id")]
+    ev = list(dict.fromkeys(x["evidence_id"] for x in items if x.get("evidence_id") and G.has_node(x["evidence_id"])))
+    fin = list(dict.fromkeys(x["finding_id"] for x in items if x.get("finding_id")))
+    return {"status": "UNRESOLVED_CONTRADICTION" if items else "NONE", "sources": sorted({x["source"] for x in items}), "finding_ids": fin, "evidence_ids": ev, "evidence": [_cf_ev_ref(G, e, "contradicting") for e in ev],
+            "note": "recorded contradicting evidence is not resolved by this counterfactual: the proposed change presumes the cited evidence is the record that is wrong" if items else None}
+
+def build_counterfactual(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Read-only; recomputed on every call (idempotent); deterministic. All six contract fields are always present."""
+    NM = NOT_MEASURED
+    res: Dict[str, Any] = {"contract_version": CF_VERSION, "counterfactual_id": f"cf::{decision_id}", "decision_id": decision_id, "target_kind": "decision", "found": False, "in_scope": False, "scope_class": None, "status": "NOT_REQUIRED", "change_type": None,
+                           "unresolved_reason": None, "current_decision": NM, "violated_rule": NM, "evidence_causing_violation": [], "missing_requirement": NM, "recommended_corrective_condition": NM, "expected_resulting_state": NM,
+                           "required_condition": None, "minimum_changes": [], "contradiction_context": [], "verification": {"verification_status": NM, "policy_applicability": NM}, "notes": [],
+                           "satisfaction_asserted": False, "requires_reevaluation": False, "evidence_conflict": {"status": "NONE", "sources": [], "finding_ids": [], "evidence_ids": [], "evidence": [], "note": None}}
+    if not G.has_node(decision_id) or G.nodes[decision_id].get("type") != "Decision": res["notes"].append("start node missing or not a Decision"); return res
+    dd = G.nodes[decision_id]; verdict = dd.get("verdict"); res["found"] = True
+    res["current_decision"] = {"decision_id": decision_id, "verdict": verdict, "scope_class": CF_SCOPE_CLASS.get(verdict), "rule_id": dd.get("rule_id"), "rationale": dd.get("rationale"), "result_source": dd.get("result_source"), "violation_status": dd.get("violation_status")}
+    res["violated_rule"] = _cf_rule_ref(G, dd)
+    if verdict not in CF_SCOPE_CLASS: res["notes"].append(f"verdict {verdict} is neither NON-COMPLIANT nor CONDITIONAL: no counterfactual required"); return res
+    res["in_scope"], res["scope_class"] = True, CF_SCOPE_CLASS[verdict]
+    res["evidence_conflict"] = _cf_conflict(G, decision_id)
+    if verdict == "VIOLATION":  # reuse the self-verification layers: an unsupported / inapplicable decision is no premise for a counterfactual
+        v = verify_policy_applicability(G, decision_id)
+        res["verification"] = {"verification_status": v["verification_status"], "policy_applicability": (v.get("policy_applicability") or {}).get("status", NM), "escalation_reason": v.get("escalation_reason")}
+    basis = list(dd.get("basis_node_ids") or [])
+    if verdict == "UNEVALUATED": return _cf_unresolved(res, f"rule was never evaluated ({dd.get('unevaluated_reason') or 'unspecified'}); a corrective condition for an unchecked rule is not guessed")
+    compiled = dd.get("result_source") == "compiled_policy_engine"
+    d_c = _cf_compiled(G, dd, basis) if compiled and verdict == "VIOLATION" else None
+    if compiled and not (d_c or {}).get("change_type"): return _cf_unresolved(res, "compiled-rule Decision: its expression semantics are not re-derived by this layer, so no corrective condition is inferred")
+    spec = dd.get("parsed_spec")
+    if not spec and d_c is None: return _cf_unresolved(res, "no parsed rule spec recorded on the Decision: the rule cannot be turned into a corrective condition")
+    if res["verification"]["verification_status"] == "FAILED": return _cf_unresolved(res, "self-verification FAILED: the violation itself is not grounded, so no counterfactual rests on it")
+    if res["verification"]["policy_applicability"] == "MISMATCH": return _cf_unresolved(res, "policy applicability MISMATCH: the cited rule does not apply to the verified facts")
+    if res["verification"]["policy_applicability"] == "UNESTABLISHED": return _cf_unresolved(res, "policy applicability UNESTABLISHED: facts needed to show the cited rule applies are missing, so no counterfactual rests on it")
+    rid_ = dd.get("rule_id"); rn_ = G.nodes[rid_] if rid_ and G.has_node(rid_) and G.nodes[rid_].get("type") == "PolicyRule" else None
+    if d_c is None and (rn_ is None or parse_policy_rule(rn_.get("condition", "")) != spec): return _cf_unresolved(res, "cited rule is not a PolicyRule in the graph or its text no longer parses to the spec the Decision used: the corrective condition cannot be derived from it")
+    subj = (spec or {}).get("subject")
+    if d_c is not None: d_ = d_c
+    elif verdict == "INCONCLUSIVE": d_ = _cf_conditional(G, dd, spec)
+    elif subj == "TRANSACTION": d_ = _cf_transaction(G, dd, spec, basis)
+    elif subj == "AMOUNT_MATCH": d_ = _cf_amount_match(G, dd, spec, basis)
+    elif subj in ("GOVID", "PHONE"): d_ = _cf_entity(G, dd, spec, basis)
+    elif subj == "KEYWORD": d_ = _cf_keyword(G, dd, spec, basis)
+    else: d_ = {}
+    if not d_.get("change_type"): return _cf_unresolved(res, d_.get("reason") or f"no policy-supported counterfactual exists for rule subject {subj} with verdict {verdict}")
+    if not d_.get("minimum_changes"): return _cf_unresolved(res, "no policy-supported minimum change could be derived from the cited rule")
+    ev_ids = list(d_.get("evidence_ids_override") or [])
+    if "evidence" in d_: refs = d_["evidence"]
+    else:
+        if not ev_ids: ev_ids = list(dict.fromkeys(e for b in basis for e in _cf_case_evidence(G, b)))
+        refs = [_cf_ev_ref(G, e) for e in ev_ids]
+    refs += [{"evidence_id": None, "role": "extraction_gap_document", "document_id": g_, "document_ids": [g_], "filename": G.nodes[g_].get("filename"), "location": None, "provenance": None} for g_ in d_.get("gap_documents") or []]
+    all_ev = [r["evidence_id"] for r in refs if r.get("evidence_id")]
+    docs = {x for r in refs for x in r.get("document_ids") or []}
+    region = (d_["required_condition"]["relation"], d_["required_condition"]["value"]) if d_["required_condition"]["subject"] == "TRANSACTION" and isinstance(d_["required_condition"]["value"], (int, float)) and d_["required_condition"]["relation"] in _CMP_OPS else None
+    res.update(status="ESTABLISHED", change_type=d_["change_type"], evidence_causing_violation=refs, missing_requirement=d_["missing_requirement"], recommended_corrective_condition=d_["recommended"],
+               expected_resulting_state={**d_["resulting"], "rule_id": dd.get("rule_id")}, required_condition=d_["required_condition"], minimum_changes=_sv_json(d_["minimum_changes"]), unresolved_reason=None,
+               contradiction_context=_cf_contradiction_context(G, all_ev, docs, region), requires_reevaluation=True)
+    return res
+
+def build_counterfactuals(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    """One counterfactual per NON-COMPLIANT / CONDITIONAL Decision, in a stable order."""
+    return [r for r in (build_counterfactual(G, n) for n, _ in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0])) if r["in_scope"]]
+
+def build_finding_counterfactual(G: nx.MultiDiGraph, finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Counterfactual for a cross-document contradiction / missing-evidence finding. Policy-supported ONLY where an existing parsed policy rule (REQUIRE amounts to match) governs the finding's field; otherwise UNRESOLVED."""
+    NM = NOT_MEASURED; fid = finding["finding_id"]
+    res: Dict[str, Any] = {"contract_version": CF_VERSION, "counterfactual_id": f"cf::{fid}", "decision_id": None, "finding_id": fid, "target_kind": "finding", "found": True, "in_scope": True, "scope_class": "CONDITIONAL", "status": "UNRESOLVED", "change_type": None,
+                           "unresolved_reason": None, "current_decision": {"finding_id": fid, "category": finding.get("category"), "field": finding.get("field"), "reason": finding.get("reason"), "resolution": finding.get("resolution")}, "violated_rule": NM,
+                           "evidence_causing_violation": [], "missing_requirement": NM, "recommended_corrective_condition": NM, "expected_resulting_state": NM, "required_condition": None, "minimum_changes": [], "contradiction_context": [],
+                           "verification": {"verification_status": NM, "policy_applicability": NM}, "notes": [],
+                           "satisfaction_asserted": False, "requires_reevaluation": False, "evidence_conflict": {"status": "SUBJECT_OF_COUNTERFACTUAL", "sources": ["contradiction_finding"], "finding_ids": [fid], "evidence_ids": [], "evidence": [], "note": None}}
+    sides = [s for s in (finding.get("claim_a"), finding.get("claim_b")) if s]
+    evs = list(dict.fromkeys(p["evidence_id"] for s in sides for p in s.get("provenance") or [] if p.get("evidence_id") and G.has_node(p["evidence_id"]) and G.nodes[p["evidence_id"]].get("type") == "Evidence"))
+    res["evidence_causing_violation"] = [_cf_ev_ref(G, e, "finding_claim") for e in evs]
+    rule = next(((n, d) for n, d in sorted(_nodes_of_type(G, "PolicyRule"), key=lambda kv: kv[0]) if (parse_policy_rule(d.get("condition", "")) or {}).get("subject") == "AMOUNT_MATCH"), None)
+    if finding.get("category") not in XCON_CONTRADICTION: return _cf_unresolved(res, f"{finding.get('category')} finding: no policy rule states what evidence would resolve it")
+    if finding.get("field") != "amount" or rule is None: return _cf_unresolved(res, f"no policy rule in the graph requires '{finding.get('field')}' to agree between linked documents; no corrective condition is invented")
+    amts = [((s.get("value") or {}).get("amounts") or []) for s in sides]; cur = {(s.get("value") or {}).get("currency") for s in sides}
+    if len(sides) != 2 or any(len(a) != 1 for a in amts) or len(cur) != 1: return _cf_unresolved(res, "the contradicting claims do not carry one amount each in one currency")
+    rid, rd = rule; spec = parse_policy_rule(rd["condition"]); delta = round(abs(amts[0][0] - amts[1][0]), 10)
+    res["violated_rule"] = {"rule_id": rid, "condition": rd.get("condition"), "source_file": rd.get("source_file"), "source_location": rd.get("source_location"),
+                            "policy_ids": sorted(v for _, v, e in G.out_edges(rid, data=True) if e.get("relation") == "BELONGS_TO" and G.nodes[v].get("type") == "Policy"), "rulebook_provenance": NM, "parsed_spec": _sv_json(spec), "result_source": "parsed_rule_text"}
+    res.update(status="ESTABLISHED", change_type="CORRECTIVE_ACTION", required_condition={"subject": "AMOUNT_MATCH", "relation": "==", "value": NM, "currency": next(iter(cur))},
+               minimum_changes=[{"kind": "amount_reconciliation", "currency": next(iter(cur)), "values": [amts[0][0], amts[1][0]], "minimum_delta": delta, "authoritative_record": NM, "evidence_ids": evs}],
+               missing_requirement=f"the two linked documents state different amounts ({_cf_fmt(amts[0][0])} vs {_cf_fmt(amts[1][0])} {next(iter(cur))}); rule REQUIRE amounts to match requires them to agree",
+               recommended_corrective_condition="Reconcile the two documents so they carry the same amount (smallest change = the listed minimum_delta applied to one document); the policy does not say which document is authoritative, so that is not decided here",
+               requires_reevaluation=True, expected_resulting_state={"state": "AMOUNTS_CONSISTENT", "expected_verdict": NM, "rule_id": rid, "condition": "the rule engine compares only reliably linked records, so its verdict after the correction also depends on that linkage"})
+    return res
+
+def build_finding_counterfactuals(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    return [build_finding_counterfactual(G, f) for f in sorted(G.graph.get("contradiction_findings") or [], key=lambda x: x["finding_id"]) if f.get("category") in XCON_CONTRADICTION or f.get("category") == "MISSING_EVIDENCE"]
+
+def validate_counterfactual(G: nx.MultiDiGraph, r: Dict[str, Any]) -> List[str]:
+    """Contract check: fields present, status / change_type allowed, rule and evidence references exist and trace to their documents (nothing invented), ESTABLISHED is complete and UNRESOLVED carries NOT_MEASURED."""
+    probs = [f"missing field {k}" for k in CF_FIELDS if k not in r]
+    if r.get("status") not in CF_STATUSES: probs.append(f"unknown status {r.get('status')}")
+    if r.get("change_type") is not None and r["change_type"] not in CF_CHANGE_TYPES: probs.append(f"unknown change_type {r.get('change_type')}")
+    if (r.get("status") == "ESTABLISHED") != (r.get("change_type") is not None): probs.append("change_type must be set exactly when status is ESTABLISHED")
+    if r.get("status") == "UNRESOLVED":
+        if not r.get("unresolved_reason"): probs.append("UNRESOLVED needs unresolved_reason")
+        probs += [f"UNRESOLVED must keep {k} NOT_MEASURED" for k in ("missing_requirement", "recommended_corrective_condition", "expected_resulting_state") if r.get(k) != NOT_MEASURED]
+    if r.get("status") == "ESTABLISHED":
+        rid = (r.get("violated_rule") or {}).get("rule_id") if isinstance(r.get("violated_rule"), dict) else None
+        if not (rid and G.has_node(rid) and G.nodes[rid].get("type") == "PolicyRule"): probs.append("ESTABLISHED counterfactual must reference an existing PolicyRule")
+        probs += [f"ESTABLISHED must set {k}" for k in ("missing_requirement", "recommended_corrective_condition", "expected_resulting_state") if r.get(k) in (None, NOT_MEASURED)]
+        if not r.get("evidence_causing_violation"): probs.append("ESTABLISHED counterfactual must cite evidence")
+        if rid and G.has_node(rid) and G.nodes[rid].get("type") == "PolicyRule" and r["violated_rule"].get("result_source") != "compiled_policy_engine" and not parse_policy_rule(G.nodes[rid].get("condition", "")): probs.append("ESTABLISHED counterfactual rests on a rule whose text is not a supported rule form")
+        if not r.get("minimum_changes"): probs.append("ESTABLISHED counterfactual must list a minimum change")
+        if r.get("satisfaction_asserted") is not False or r.get("requires_reevaluation") is not True: probs.append("ESTABLISHED counterfactual must not assert satisfaction and must require re-evaluation")
+        if r.get("change_type") == "SUPPLY_EVIDENCE" and isinstance(r.get("expected_resulting_state"), dict) and r["expected_resulting_state"].get("state") == "COMPLIANT_WITH_RULE": probs.append("SUPPLY_EVIDENCE must not claim compliance: supplied evidence is not proof of the requirement")
+    for ref in r.get("evidence_causing_violation") or []:
+        eid = ref.get("evidence_id")
+        if eid is None:
+            if not (ref.get("document_id") and G.has_node(ref["document_id"]) and G.nodes[ref["document_id"]].get("type") == "Document"): probs.append(f"document reference {ref.get('document_id')} not in graph")
+            continue
+        if not (G.has_node(eid) and G.nodes[eid].get("type") == "Evidence"): probs.append(f"evidence {eid} not in graph"); continue
+        if ref.get("document_id") and ref["document_id"] not in {x["document_id"] for x in _evidence_source_docs(G, eid)}: probs.append(f"evidence {eid} is not derived from document {ref['document_id']}")
+    return probs
+
+# --- COUNTERFACTUAL COMPLIANCE BENCHMARK (Phase 8 evaluation; layer only) ---
+# Deterministic labelled cases. Each case builds its OWN private graph with the existing offline pipeline. The label block (expected_*) is hand-written and NEVER read from system output; predictions come from
+# build_counterfactual / build_finding_counterfactual and are scored against the labels afterwards. No LLM, no network, no randomness. A case may declare a fault (reused from the 7D fault set) injected into its OWN graph.
+# Counterfactual VALIDITY is checked by REPLAY: the predicted counterfactual is applied to a copy of the case documents (declared per case in `replay`; the replacement value / phrase comes from the PREDICTION), the
+# unchanged pipeline is re-run and the target rule must reach the labelled verdict. Metrics are {value, numerator, denominator}; value is NOT_MEASURED (never 0.0) when the denominator is empty.
+CFB_ID, CFB_VERSION = "omnicheck-counterfactual-bench", "1.0"
+CFB_CATEGORIES = ("positive", "negative", "conditional", "missing_evidence", "contradiction", "ambiguous", "no_valid_counterfactual")
+CFB_PROTOCOL = {"seed": None, "randomness": "none", "llm_used": False, "network_used": False, "confidence": "not produced; nothing is estimated",
+                "ground_truth": "hand-written per-case labels (status, change type, required condition, minimum change, evidence files, replay outcome); never derived from a prediction",
+                "validity": "replay: the predicted change is applied to a private copy of the documents and the unchanged engine must return the labelled verdict for the target rule",
+                "metrics_not_measured_when": "the denominator is empty (no case that the metric applies to)",
+                "id_policy": "records carry stable evidence aliases, filenames, locations and provenance; random graph ids are verified against the graph at run time (id_integrity) and not stored"}
+
+def _cfb_case(cid, category, docs, rulebook, target, status, decision=None, change_type=None, requirement=None, changes=None, ev_files=None, replay=None, after=None, fault=None, kind="decision", field=None, finding_category=None, note=""):
+    return {"case_id": cid, "category": category, "documents": dict(docs), "rulebook": rulebook, "target_rule": target, "target_kind": kind, "target_field": field, "target_finding_category": finding_category, "fault": fault, "note": note,
+            "expected_status": status, "expected_decision": decision, "expected_change_type": change_type, "expected_required_condition": requirement, "expected_minimum_changes": changes, "expected_evidence_files": ev_files, "replay": replay, "expected_after_verdict": after}
+
+_CFB_INV = "Invoice No: INV-{n}\nBilled amount INR {amt}\n"
+_CFB_LINK_I, _CFB_LINK_R = "Invoice No: INV-77\nVendor: Boreal Metals\nInvoice date 2024-03-10\nBilled amount INR 20,000\n", "Receipt for Invoice No: INV-77\nVendor: Boreal Metals\nInvoice date 2024-03-10\nPaid amount INR {v}\n"
+_CFB_CON_I, _CFB_CON_P = "Invoice No: INV-1101\nPO Number: PO-1101\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "Purchase Order No: PO-1101\nVendor: Boreal Metals\nOrder value INR 12,000\n"
+_CFB_AMT = lambda d, b, i, inc, dl, tv: {"kind": "amount_change", "direction": d, "boundary": b, "boundary_inclusive": inc, "minimum_delta": dl, "target_value": tv}
+
+COUNTERFACTUAL_BENCHMARK: List[Dict[str, Any]] = [
+    _cfb_case("cfb_pos_amount_over_limit", "positive", {"inv_a.txt": _CFB_INV.format(n=8001, amt="5,000")}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "TRANSACTION", "relation": "<=", "value": 1000.0, "currency": "INR"}, [_CFB_AMT("decrease", 1000.0, 0, True, 4000.0, 1000.0)], ["inv_a.txt"], {"kind": "amount_replace", "file": "inv_a.txt", "old": "5,000", "step": 0.0}, "SATISFIED",
+              note="incorrect transaction amount: the minimum change is the rule boundary"),
+    _cfb_case("cfb_pos_require_minimum", "positive", {"inv_b.txt": _CFB_INV.format(n=8002, amt="800")}, "REQUIRE TRANSACTION >= INR 1000\n", "REQUIRE TRANSACTION", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "TRANSACTION", "relation": ">=", "value": 1000.0, "currency": "INR"}, [_CFB_AMT("increase", 1000.0, 0, True, 200.0, 1000.0)], ["inv_b.txt"], {"kind": "amount_replace", "file": "inv_b.txt", "old": "800", "step": 0.0}, "SATISFIED"),
+    _cfb_case("cfb_pos_exclusive_boundary", "positive", {"inv_c.txt": _CFB_INV.format(n=8003, amt="5,000")}, "FORBID TRANSACTION >= INR 1000\n", "FORBID TRANSACTION", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "TRANSACTION", "relation": "<", "value": 1000.0, "currency": "INR"}, [_CFB_AMT("decrease", 1000.0, 0, False, 4000.0, None)], ["inv_c.txt"], {"kind": "amount_replace", "file": "inv_c.txt", "old": "5,000", "step": -1.0}, "SATISFIED",
+              note="the boundary value itself is non-compliant: no exact minimum value exists, only a strict bound"),
+    _cfb_case("cfb_pos_two_amounts", "positive", {"inv_d1.txt": _CFB_INV.format(n=8004, amt="5,000"), "inv_d2.txt": _CFB_INV.format(n=8005, amt="3,000")}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "TRANSACTION", "relation": "<=", "value": 1000.0, "currency": "INR"}, [_CFB_AMT("decrease", 1000.0, 0, True, 4000.0, 1000.0), _CFB_AMT("decrease", 1000.0, 0, True, 2000.0, 1000.0)], ["inv_d1.txt", "inv_d2.txt"],
+              {"kind": "amount_replace_many", "files": {"inv_d1.txt": "5,000", "inv_d2.txt": "3,000"}, "step": 0.0}, "SATISFIED", note="every violating amount needs its own minimum change"),
+    _cfb_case("cfb_pos_missing_manager_approval", "missing_evidence", {"memo_a.txt": "Expense memo\nTravel booked for the team\n"}, 'REQUIRE KEYWORD "manager approval"\n', "REQUIRE KEYWORD", "ESTABLISHED", "VIOLATION", "SUPPLY_EVIDENCE",
+              {"subject": "KEYWORD", "relation": "present", "value": "manager approval", "currency": None}, [{"kind": "phrase_presence", "phrase": "manager approval", "action": "add"}], ["memo_a.txt"], {"kind": "append_phrase", "file": "memo_a.txt"}, "SATISFIED",
+              note="supplying evidence, not a corrective action on the case"),
+    _cfb_case("cfb_pos_missing_receipt", "missing_evidence", {"claim_b.txt": "Claim form\nMeal expense for the team\n"}, 'REQUIRE KEYWORD "receipt attached"\n', "REQUIRE KEYWORD", "ESTABLISHED", "VIOLATION", "SUPPLY_EVIDENCE",
+              {"subject": "KEYWORD", "relation": "present", "value": "receipt attached", "currency": None}, [{"kind": "phrase_presence", "phrase": "receipt attached", "action": "add"}], ["claim_b.txt"], {"kind": "append_phrase", "file": "claim_b.txt"}, "SATISFIED"),
+    _cfb_case("cfb_pos_policy_exception", "positive", {"inv_e.txt": _CFB_INV.format(n=8006, amt="5,000")}, 'FORBID TRANSACTION > INR 1000\nREQUIRE KEYWORD "policy exception granted"\n', "policy exception", "ESTABLISHED", "VIOLATION", "SUPPLY_EVIDENCE",
+              {"subject": "KEYWORD", "relation": "present", "value": "policy exception granted", "currency": None}, [{"kind": "phrase_presence", "phrase": "policy exception granted", "action": "add"}], ["inv_e.txt"], {"kind": "append_phrase", "file": "inv_e.txt"}, "SATISFIED",
+              note="an exception requirement exists only as a policy rule; it is derived from that rule, not hard-coded"),
+    _cfb_case("cfb_pos_forbidden_phrase", "positive", {"pay_f.txt": "Settlement note\nSettled by cash payment on delivery\n"}, 'FORBID KEYWORD "cash payment"\n', "FORBID KEYWORD", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "KEYWORD", "relation": "absent", "value": "cash payment", "currency": None}, [{"kind": "phrase_removal", "phrase": "cash payment", "action": "remove"}], ["pay_f.txt"], {"kind": "remove_phrase", "file": "pay_f.txt"}, "SATISFIED"),
+    _cfb_case("cfb_pos_linked_amount_mismatch", "positive", {"inv_g.txt": _CFB_LINK_I, "rcpt_g.txt": _CFB_LINK_R.format(v="12,000")}, "Transaction amounts must match.\n", "amounts must match", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "AMOUNT_MATCH", "relation": "==", "value": NOT_MEASURED, "currency": None}, [{"kind": "amount_reconciliation", "minimum_delta": 8000.0}], ["inv_g.txt", "rcpt_g.txt"], {"kind": "amount_replace", "file": "rcpt_g.txt", "old": "12,000", "to": "20,000"}, "SATISFIED",
+              note="which record is authoritative is not decided by policy; replay equalises the amounts"),
+    _cfb_case("cfb_neg_satisfied", "negative", {"inv_h.txt": _CFB_INV.format(n=8007, amt="800")}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "NOT_REQUIRED", "SATISFIED", note="compliant: no counterfactual is required"),
+    _cfb_case("cfb_neg_not_applicable", "negative", {"memo_i.txt": "Meeting notes\nNothing to report\n"}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "NOT_REQUIRED", "NOT_APPLICABLE", note="rule does not apply: no counterfactual is required"),
+    _cfb_case("cfb_cond_unlinked_records", "conditional", {"inv_j.txt": _CFB_CON_I, "po_j.txt": _CFB_CON_P}, "Transaction amounts must match.\n", "amounts must match", "ESTABLISHED", "INCONCLUSIVE", "SUPPLY_EVIDENCE",
+              {"subject": "AMOUNT_MATCH", "relation": "linked_records_equal", "value": NOT_MEASURED, "currency": None}, [{"kind": "link_evidence"}], ["inv_j.txt", "po_j.txt"], None, None, note="no amount may be changed: the records first have to be linked"),
+    _cfb_case("cfb_cond_extraction_gap", "conditional", {"empty_k.txt": "", "memo_k.txt": "Meeting notes\n"}, 'REQUIRE KEYWORD "approval"\n', "REQUIRE KEYWORD", "ESTABLISHED", "INCONCLUSIVE", "SUPPLY_EVIDENCE",
+              {"subject": "KEYWORD", "relation": "present", "value": "approval", "currency": None}, [{"kind": "readable_text_for_documents", "phrase": "approval"}], ["empty_k.txt"], None, None, note="the unreadable document is the missing evidence; it is a document reference, not an Evidence node"),
+    _cfb_case("cfb_contradiction_decision", "contradiction", {"inv_l.txt": _CFB_CON_I, "po_l.txt": _CFB_CON_P}, "FORBID TRANSACTION > INR 15000\n", "FORBID TRANSACTION", "ESTABLISHED", "VIOLATION", "CORRECTIVE_ACTION",
+              {"subject": "TRANSACTION", "relation": "<=", "value": 15000.0, "currency": "INR"}, [_CFB_AMT("decrease", 15000.0, 0, True, 5000.0, 15000.0)], ["inv_l.txt"], {"kind": "amount_replace", "file": "inv_l.txt", "old": "20,000", "step": 0.0}, "SATISFIED",
+              note="the linked PO states 12,000, which already meets the rule: the contradiction context must say so"),
+    _cfb_case("cfb_contradiction_amount_finding", "contradiction", {"inv_m.txt": _CFB_CON_I, "po_m.txt": _CFB_CON_P}, "Transaction amounts must match.\n", "amounts must match", "ESTABLISHED", None, "CORRECTIVE_ACTION",
+              {"subject": "AMOUNT_MATCH", "relation": "==", "value": NOT_MEASURED, "currency": "INR"}, [{"kind": "amount_reconciliation", "minimum_delta": 8000.0}], ["inv_m.txt", "po_m.txt"], None, None, kind="finding", field="amount", finding_category="MAJOR_CONTRADICTION",
+              note="the amount contradiction is governed by the amounts-must-match rule"),
+    _cfb_case("cfb_contradiction_vendor_no_policy", "no_valid_counterfactual", {"inv_n.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 800\n", "po_n.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"},
+              "FORBID TRANSACTION > INR 100000\n", "vendor", "UNRESOLVED", kind="finding", field="vendor", finding_category="MAJOR_CONTRADICTION", ev_files=["inv_n.txt", "po_n.txt"], note="vendor identity mismatch, but no rule requires vendors to agree: nothing may be invented"),
+    _cfb_case("cfb_contradiction_date_no_policy", "no_valid_counterfactual", {"inv_o.txt": "Invoice No: INV-6\nPO Number: PO-6\nVendor: Boreal Metals\nInvoice date 2024-03-10\nBilled amount INR 800\n",
+              "po_o.txt": "Purchase Order No: PO-6\nVendor: Boreal Metals\nInvoice date 2024-04-02\nOrder value INR 800\n"}, "FORBID TRANSACTION > INR 100000\n", "date", "UNRESOLVED", kind="finding", field="date", finding_category="MAJOR_CONTRADICTION",
+              ev_files=["inv_o.txt", "po_o.txt"], note="date mismatch with no governing rule"),
+    _cfb_case("cfb_ambiguous_free_text_rule", "ambiguous", {"inv_p.txt": _CFB_INV.format(n=8008, amt="5,000")}, "FORBID TRANSACTION > INR 1000\nVendors should behave reasonably in spirit.\n", "Vendors should behave", "UNRESOLVED", "UNEVALUATED",
+              note="rule not expressible deterministically: no corrective condition"),
+    _cfb_case("cfb_ambiguous_govid_unconfigured", "ambiguous", {"id_q.txt": "Employee record\nGov ID 1234 5678 9012\n"}, "REQUIRE GOVID VALID\n", "REQUIRE GOVID", "UNRESOLVED", "UNEVALUATED", note="validation configuration unavailable: the rule was never checked"),
+    _cfb_case("cfb_unsupported_violation", "no_valid_counterfactual", {"inv_r.txt": _CFB_INV.format(n=8009, amt="5,000")}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "UNRESOLVED", "VIOLATION", fault="evidence_text_5000_to_500",
+              ev_files=None, note="the violation is no longer grounded in its source text (self-verification FAILED): no counterfactual rests on it"),
+    _cfb_case("cfb_inapplicable_rule", "no_valid_counterfactual", {"inv_s.txt": _CFB_INV.format(n=8010, amt="5,000")}, "FORBID TRANSACTION > INR 1000\n", "FORBID TRANSACTION", "UNRESOLVED", "VIOLATION", fault="rule_condition_9000",
+              note="the rule on file is not the rule the Decision used (policy applicability MISMATCH)"),
+]
+
+def validate_counterfactual_benchmark(cases: Optional[List[Dict[str, Any]]] = None, require_coverage: bool = True) -> List[str]:
+    cases = COUNTERFACTUAL_BENCHMARK if cases is None else cases
+    probs: List[str] = []
+    probs += [f"duplicate case_id {i}" for i, n in Counter(c.get("case_id") for c in cases).items() if n > 1]
+    for c in cases:
+        cid = c.get("case_id")
+        for k in ("category", "documents", "rulebook", "target_rule", "target_kind", "expected_status", "expected_decision", "expected_change_type", "expected_required_condition", "expected_minimum_changes", "expected_evidence_files", "replay", "expected_after_verdict"):
+            if k not in c: probs.append(f"{cid}: missing {k}")
+        if c.get("category") not in CFB_CATEGORIES: probs.append(f"{cid}: unknown category {c.get('category')}")
+        if c.get("expected_status") not in CF_STATUSES: probs.append(f"{cid}: unknown expected_status {c.get('expected_status')}")
+        if c.get("target_kind") not in ("decision", "finding"): probs.append(f"{cid}: unknown target_kind")
+        if c.get("fault") is not None and c["fault"] not in _SV7D_FAULTS: probs.append(f"{cid}: unknown fault {c['fault']}")
+        est = c.get("expected_status") == "ESTABLISHED"
+        if est != (c.get("expected_change_type") in CF_CHANGE_TYPES): probs.append(f"{cid}: expected_change_type must be set exactly when expected_status is ESTABLISHED")
+        if est and (not c.get("expected_required_condition") or not c.get("expected_minimum_changes")): probs.append(f"{cid}: ESTABLISHED needs expected_required_condition and expected_minimum_changes")
+        if not est and (c.get("expected_required_condition") is not None or c.get("expected_minimum_changes") is not None or c.get("replay") is not None): probs.append(f"{cid}: only ESTABLISHED cases carry condition / minimum change / replay labels")
+        if (c.get("replay") is None) != (c.get("expected_after_verdict") is None): probs.append(f"{cid}: replay and expected_after_verdict go together")
+        if c.get("expected_status") == "NOT_REQUIRED" and c.get("expected_decision") not in ("SATISFIED", "NOT_APPLICABLE"): probs.append(f"{cid}: NOT_REQUIRED only for SATISFIED / NOT_APPLICABLE decisions")
+        if c.get("target_kind") == "decision" and c.get("expected_decision") is None: probs.append(f"{cid}: decision target needs expected_decision")
+        if c.get("target_kind") == "finding" and not (c.get("target_field") and c.get("target_finding_category")): probs.append(f"{cid}: finding target needs target_field and target_finding_category")
+    if require_coverage: probs += [f"category {x} not covered" for x in CFB_CATEGORIES if x not in {c.get("category") for c in cases}]
+    return probs
+
+def _cfb_target(G: nx.MultiDiGraph, case: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """(kind, id) of the unique target: a Decision whose rule text contains target_rule, or a finding with the labelled category + field whose claims touch the target documents."""
+    if case["target_kind"] == "decision":
+        d = _sv7d_target_decision(G, case["target_rule"])
+        return ("decision", d) if d else None
+    hits = [f for f in sorted(G.graph.get("contradiction_findings") or [], key=lambda x: x["finding_id"]) if f.get("category") == case["target_finding_category"] and f.get("field") == case["target_field"]]
+    return ("finding", hits[0]["finding_id"]) if len(hits) == 1 else None
+
+def _cfb_predict(G: nx.MultiDiGraph, case: Dict[str, Any], target: Tuple[str, Optional[str]]) -> Dict[str, Any]:
+    if target[0] == "decision": return build_counterfactual(G, target[1])
+    return build_finding_counterfactual(G, next(f for f in G.graph.get("contradiction_findings") or [] if f["finding_id"] == target[1]))
+
+def _cfb_norm_change(c: Dict[str, Any], keys: Tuple[str, ...]) -> Tuple:
+    return tuple((k, (round(c[k], 6) if isinstance(c.get(k), float) else c.get(k))) for k in keys if k in c)
+
+def _cfb_change_match(pred: List[Dict[str, Any]], exp: List[Dict[str, Any]]) -> bool:
+    """Predicted minimum changes equal the labelled ones (as multisets), compared only on the keys the label states."""
+    if len(pred) != len(exp): return False
+    left = [dict(p) for p in pred]
+    for e in exp:
+        keys = tuple(sorted(e))
+        hit = next((i for i, p in enumerate(left) if _cfb_norm_change(p, keys) == _cfb_norm_change(e, keys)), None)
+        if hit is None: return False
+        left.pop(hit)
+    return True
+
+def _cfb_replay_docs(case: Dict[str, Any], pred: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The case documents with the PREDICTED counterfactual applied (replacement value / phrase taken from the prediction). None when the prediction cannot be applied."""
+    rp, docs = case["replay"], dict(case["documents"]); mc = pred.get("minimum_changes") or []
+    def fmt(v: float) -> str: return f"{int(v):,}" if float(v).is_integer() else f"{v:,}"
+    try:
+        if rp["kind"] == "amount_replace":
+            if "to" in rp: new = rp["to"]  # amounts-must-match: the replay equalises the two records (which one is authoritative is a human decision, declared by the case)
+            else:
+                m = mc[0]; tgt = m["boundary"] if m["boundary_inclusive"] else m["boundary"] + rp["step"]; new = fmt(tgt)
+            docs[rp["file"]] = docs[rp["file"]].replace(rp["old"], new)
+        elif rp["kind"] == "amount_replace_many":
+            for (fn, old), m in zip(sorted(rp["files"].items()), sorted(mc, key=lambda x: -x["current_value"])):
+                tgt = m["boundary"] if m["boundary_inclusive"] else m["boundary"] + rp["step"]; docs[fn] = docs[fn].replace(old, fmt(tgt))
+        elif rp["kind"] == "append_phrase": docs[rp["file"]] = docs[rp["file"]] + f"Note: {mc[0]['phrase']}\n"
+        elif rp["kind"] == "remove_phrase": docs[rp["file"]] = re.sub(re.escape(mc[0]["phrase"]), "bank transfer", docs[rp["file"]], flags=re.IGNORECASE)
+        else: return None
+    except (KeyError, IndexError, TypeError): return None
+    return docs
+
+def _cfb_build(docs: Dict[str, str], rulebook: str, workdir: str) -> nx.MultiDiGraph:
+    paths = []
+    for name, text in docs.items():
+        p = os.path.join(workdir, name)
+        with open(p, "w", encoding="utf-8") as fh: fh.write(text)
+        paths.append(p)
+    rb = os.path.join(workdir, "rulebook.txt")
+    with open(rb, "w", encoding="utf-8") as fh: fh.write(rulebook)
+    return build_evidence_graph(paths, rb)
+
+def _cfb_stable_text(x: Any) -> Any:
+    return re.sub(r"\b([a-z]+)_[0-9a-f]{16}\b", r"<\1>", x) if isinstance(x, str) else x
+
+def _cfb_record(case: Dict[str, Any], G: nx.MultiDiGraph, workdir: str) -> Dict[str, Any]:
+    import tempfile
+    target = _cfb_target(G, case)
+    if target is None: raise ValueError(f"{case['case_id']}: target did not map to exactly one {case['target_kind']}")
+    if case["target_kind"] == "decision": _sv7d_apply_fault(G, target[1], case.get("fault"))
+    before = _sv7d_snapshot(G)
+    pred = _cfb_predict(G, case, target); pred2 = _cfb_predict(G, case, target)
+    if _sv7d_snapshot(G) != before: raise RuntimeError("counterfactual benchmark mutated the graph")
+    refs = pred.get("evidence_causing_violation") or []
+    ids = [r["evidence_id"] for r in refs if r.get("evidence_id")]
+    integ = {"evidence_ids_in_graph": all(G.has_node(i) and G.nodes[i].get("type") == "Evidence" for i in ids),
+             "provenance_matches_graph": all(r.get("provenance") == _sv_json(G.nodes[r["evidence_id"]].get("provenance")) for r in refs if r.get("evidence_id") and G.has_node(r["evidence_id"])),
+             "contract_problems": validate_counterfactual(G, pred)}
+    rule = pred.get("violated_rule") if isinstance(pred.get("violated_rule"), dict) else {}
+    rule_ok = bool(rule.get("rule_id") and G.has_node(rule["rule_id"]) and G.nodes[rule["rule_id"]].get("type") == "PolicyRule")
+    rule_is_target = bool(rule_ok and case["target_rule"].lower() in str(G.nodes[rule["rule_id"]].get("condition") or "").lower())
+    after = None
+    if pred["status"] == "ESTABLISHED" and case.get("replay"):
+        rd = _cfb_replay_docs(case, pred)
+        if rd is not None:
+            with tempfile.TemporaryDirectory() as td2:
+                G2 = _cfb_build(rd, case["rulebook"], td2); d2 = _sv7d_target_decision(G2, case["target_rule"])
+                after = G2.nodes[d2].get("verdict") if d2 else None
+    stable = _sv7d_stable_refs([{"filename": r.get("filename"), "location": r.get("location"), "file_hash": None, "provenance": r.get("provenance")} for r in refs if r.get("evidence_id")])
+    files = sorted({r.get("filename") for r in refs if r.get("filename")})
+    return {"case_id": case["case_id"], "category": case["category"], "fault": case.get("fault"), "target_kind": case["target_kind"], "counterfactual_id_stable": pred["counterfactual_id"] == pred2["counterfactual_id"],
+            "deterministic": json.dumps(_sv_json(pred), sort_keys=True) == json.dumps(_sv_json(pred2), sort_keys=True),
+            "expected_status": case["expected_status"], "predicted_status": pred["status"], "status_correct": pred["status"] == case["expected_status"],
+            "expected_change_type": case["expected_change_type"], "predicted_change_type": pred["change_type"],
+            "expected_required_condition": case["expected_required_condition"], "predicted_required_condition": _sv_json(pred.get("required_condition")),
+            "expected_minimum_changes": case["expected_minimum_changes"], "predicted_minimum_changes": [{k: v for k, v in m.items() if not k.endswith("_id") and not k.endswith("_ids")} for m in pred.get("minimum_changes") or []],
+            "expected_evidence_files": case["expected_evidence_files"], "predicted_evidence_files": files, "evidence_refs": stable,
+            "rule_referenced": rule_ok, "rule_is_target": rule_is_target, "rule_condition": rule.get("condition"), "rule_source_location": rule.get("source_location"),
+            "replay_expected_verdict": case["expected_after_verdict"], "replay_verdict": after if after is not None else (NOT_MEASURED if case.get("replay") is None else "REPLAY_NOT_APPLICABLE"),
+            "unresolved_reason": _cfb_stable_text(pred.get("unresolved_reason")), "contradiction_context": [{k: v for k, v in c.items() if k not in ("claims",)} for c in pred.get("contradiction_context") or []],
+            "id_integrity": integ, "graph_unchanged": True}
+
+def _cfb_run_case(case: Dict[str, Any], workdir: str) -> Dict[str, Any]:
+    G = _cfb_build(case["documents"], case["rulebook"], workdir)
+    return _cfb_record(case, G, workdir)
+
+def _cfb_metric(num: int, den: int, reason: Optional[str] = None) -> Dict[str, Any]:
+    return _sv7d_metric(num, den, reason)
+
+def aggregate_counterfactual_results(records: List[Dict[str, Any]], cases: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Derived from the raw per-case records only. A metric with an empty denominator is NOT_MEASURED, never 0.0."""
+    cases = COUNTERFACTUAL_BENCHMARK if cases is None else cases
+    est = [r for r in records if r["expected_status"] == "ESTABLISHED" and r["predicted_status"] == "ESTABLISHED"]
+    rep = [r for r in est if r["replay_expected_verdict"] is not None]
+    minc = [r for r in records if r["expected_status"] == "ESTABLISHED" and r["expected_minimum_changes"] is not None]
+    cond = [r for r in records if r["expected_required_condition"] is not None]
+    grd = [r for r in records if r["expected_evidence_files"] is not None]
+    nonest = [r for r in records if r["expected_status"] != "ESTABLISHED"]
+    ctx = [r for r in records if r["predicted_status"] == "ESTABLISHED"]
+    m = {"counterfactual_validity": _cfb_metric(sum(r["replay_verdict"] == r["replay_expected_verdict"] for r in rep), len(rep), "no established counterfactual with a replay label"),
+         "policy_consistency": _cfb_metric(sum(r["rule_referenced"] and r["rule_is_target"] and r["predicted_required_condition"] == r["expected_required_condition"] for r in cond), len(cond), "no case labelled with a required condition"),
+         "evidence_grounding": _cfb_metric(sum(r["predicted_evidence_files"] == sorted(r["expected_evidence_files"]) and r["id_integrity"]["evidence_ids_in_graph"] and r["id_integrity"]["provenance_matches_graph"] and not r["id_integrity"]["contract_problems"] for r in grd), len(grd), "no case labelled with expected evidence files"),
+         "minimum_change_accuracy": _cfb_metric(sum(r["predicted_status"] == "ESTABLISHED" and r["predicted_change_type"] == r["expected_change_type"] and _cfb_change_match(r["predicted_minimum_changes"], r["expected_minimum_changes"]) for r in minc), len(minc), "no established case labelled with a minimum change"),
+         "status_accuracy": _cfb_metric(sum(r["status_correct"] for r in records), len(records)),
+         "change_type_accuracy": _cfb_metric(sum(r["predicted_change_type"] == r["expected_change_type"] for r in records if r["expected_status"] == "ESTABLISHED"), len([r for r in records if r["expected_status"] == "ESTABLISHED"]), "no established case"),
+         "invented_counterfactual_rate": _cfb_metric(sum(r["predicted_status"] == "ESTABLISHED" for r in nonest), len(nonest), "no case where no counterfactual may exist"),
+         "contract_validity": _cfb_metric(sum(not r["id_integrity"]["contract_problems"] for r in ctx), len(ctx), "no established counterfactual")}
+    return {"benchmark": {"id": CFB_ID, "version": CFB_VERSION, "size": len(cases), "category_counts": dict(Counter(c["category"] for c in cases)), "expected_status_counts": dict(Counter(c["expected_status"] for c in cases)),
+                          "expected_change_type_counts": dict(Counter(str(c["expected_change_type"]) for c in cases)), "seed": None, "llm_used": False}, "metrics": m, "protocol": CFB_PROTOCOL}
+
+def run_counterfactual_benchmark(cases: Optional[List[Dict[str, Any]]] = None, output_path: Optional[str] = None) -> Dict[str, Any]:
+    """Offline and deterministic. Every case builds its own private graph; returns {"records", "aggregate"}; writes JSON only if output_path is given."""
+    import tempfile
+    cases = COUNTERFACTUAL_BENCHMARK if cases is None else cases
+    probs = validate_counterfactual_benchmark(cases, require_coverage=cases is COUNTERFACTUAL_BENCHMARK)
+    if probs: raise ValueError("counterfactual benchmark labels inconsistent: " + "; ".join(probs[:5]))
+    records: List[Dict[str, Any]] = []
+    for c in cases:
+        with tempfile.TemporaryDirectory() as td: records.append(_cfb_run_case(c, td))
+    result = _json_safe({"benchmark_id": CFB_ID, "version": CFB_VERSION, "records": records, "aggregate": aggregate_counterfactual_results(records, cases)})
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
+
+# --- UNCERTAINTY LAYER (Phase 9; READ-ONLY, additive: the Decision verdict, rule engine, evidence graph, contradiction, self-verification (7A-7C) and counterfactual (Phase 8) layers are REUSED unchanged) ---
+# Maps each existing evidence-backed Decision into ONE of four uncertainty states and derives measurable indicators from EXISTING deterministic information only (7C result, stored Decision / Risk / PolicyRule
+# attributes, contradiction findings). No node / edge is created, no verdict / evidence / rule / provenance is altered, nothing is invented, no LLM / network / randomness. Recomputed on every call (idempotent).
+#   uncertainty_status:   COMPLIANT | NON_COMPLIANT | CONDITIONAL | INSUFFICIENT_EVIDENCE   (NOT_MEASURED only when the Decision does not exist)
+#     asserting verdicts (VIOLATION / SATISFIED), first match wins:
+#       7B FAILED or any UNSUPPORTED material claim ................................ INSUFFICIENT_EVIDENCE (the conclusion is not grounded)
+#       policy applicability MISMATCH / UNESTABLISHED (7C) ............................ CONDITIONAL
+#       critical evidence missing or a WEAKLY grounded material claim ................ INSUFFICIENT_EVIDENCE
+#       unresolved MAJOR contradiction / opposite-verdict evidence ................... CONDITIONAL
+#       otherwise ..................................................................... NON_COMPLIANT (VIOLATION) / COMPLIANT (SATISFIED)
+#     INCONCLUSIVE -> INSUFFICIENT_EVIDENCE | UNEVALUATED (rule not interpretable / configurable) -> CONDITIONAL | NOT_APPLICABLE (no fact the rule applies to) -> INSUFFICIENT_EVIDENCE (never COMPLIANT: absence of facts is not compliance)
+#   Indicators are {value, status, basis}: value is a categorical label or None; status MEASURED | NOT_MEASURED. No numeric score is produced (no calibrated confidence / completeness ratio exists).
+#     decision_confidence    always None / NOT_MEASURED (no calibrated decision-level confidence); stored components are listed, never aggregated; `low_components` = compiler-reported rule confidences below the compiler's own minimum
+#     evidence_completeness  COMPLETE | INCOMPLETE | NOT_MEASURED     contradiction_severity  NONE | MINOR | MAJOR | UNCLASSIFIED | NOT_MEASURED (NONE only when the contradiction classifier has run)
+#     policy_alignment       ALIGNED | MISALIGNED | UNESTABLISHED | NOT_APPLICABLE | NOT_MEASURED (from 7C / verdict)     risk_level  stored Risk.severity (LOW | MEDIUM | HIGH | CRITICAL) or None / NOT_MEASURED
+#   escalation_required is True exactly when escalation_reasons is non-empty; reasons: LOW_CONFIDENCE | CRITICAL_EVIDENCE_MISSING | UNRESOLVED_CONTRADICTION | POLICY_APPLICABILITY_UNESTABLISHED | HIGH_RISK (HIGH / CRITICAL).
+UNC_VERSION = "UNC1"
+UNC_STATES = ("COMPLIANT", "NON_COMPLIANT", "CONDITIONAL", "INSUFFICIENT_EVIDENCE")
+UNC_ESCALATION_CODES = ("LOW_CONFIDENCE", "CRITICAL_EVIDENCE_MISSING", "UNRESOLVED_CONTRADICTION", "POLICY_APPLICABILITY_UNESTABLISHED", "HIGH_RISK")
+UNC_INDICATORS = ("decision_confidence", "evidence_completeness", "contradiction_severity", "policy_alignment", "risk_level")
+UNC_FIELDS = ("decision_id", "found", "decision", "uncertainty_status") + UNC_INDICATORS + ("escalation_required", "escalation_reasons", "uncertainty_state_reason")
+UNC_HIGH_RISK = ("HIGH", "CRITICAL")
+
+def _unc_ind(value: Optional[str], basis: str, **extra) -> Dict[str, Any]:
+    return {"value": value, "status": "MEASURED" if value is not None else NOT_MEASURED, "basis": basis, **extra}
+
+def build_uncertainty_assessment(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Any]:
+    """Read-only; recomputed on every call (idempotent). All contract fields are always present; the Decision verdict is copied, never changed."""
+    res: Dict[str, Any] = {"contract_version": UNC_VERSION, "decision_id": decision_id, "found": False, "decision": None, "uncertainty_status": NOT_MEASURED, "uncertainty_state_reason": None,
+                           **{k: _unc_ind(None, "decision not found") for k in UNC_INDICATORS}, "escalation_required": False, "escalation_reasons": [],
+                           "verification_status": None, "policy_applicability_status": None, "supporting_evidence": [], "contradicting_evidence": [], "policy_rules": [], "missing_evidence": [], "gaps": []}
+    if not G.has_node(decision_id) or G.nodes[decision_id].get("type") != "Decision":
+        res["gaps"].append("start node missing or not a Decision"); return res
+    vr = verify_policy_applicability(G, decision_id)  # reused unchanged: 7A lineage + 7B material claims + 7C applicability
+    dd = G.nodes[decision_id]; verdict = dd.get("verdict")
+    pa = (vr.get("policy_applicability") or {}).get("status", "NOT_CHECKED"); vs = vr.get("verification_status")
+    res.update(found=True, decision={k: vr["decision"].get(k) for k in ("decision_id", "verdict", "rule_id", "result_source", "violation_status")}, verification_status=vs, policy_applicability_status=pa,
+               supporting_evidence=_sv_json(vr["supporting_evidence"]), contradicting_evidence=_sv_json(vr["contradicting_evidence"]), policy_rules=_sv_json(vr["policy_rules"]), gaps=list(vr.get("gaps") or []))
+    claims = vr.get("material_claims") or []
+    ungrounded, weak = [c for c in claims if c["grounding"] == "UNSUPPORTED"], [c for c in claims if c["grounding"] == "WEAK"]
+    asserting = verdict in SV_ASSERTING_VERDICTS
+    absence_ok = dd.get("violation_status") == "ABSENCE_OF_REQUIRED_TEXT_WITHIN_EXTRACTED_SCOPE" and any(c["kind"] == "absence_within_scope" and c["grounding"] != "UNSUPPORTED" for c in claims)
+    miss = [m for m in vr["missing_evidence"] if m.get("kind") != "rule_not_evaluated" and not (absence_ok and m.get("kind") == "no_supporting_evidence")]  # an unevaluated rule is a policy problem (policy_alignment), not missing evidence
+    res["missing_evidence"] = _sv_json(miss)
+    # decision_confidence: never aggregated, never invented
+    comps = vr["confidence"]["components"]; floor = globals().get("_COMPILER_MIN_CONFIDENCE")
+    _num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not _num(floor): floor = None
+    low = [c for c in comps["compiled_rules"] if floor is not None and _num(c.get("value")) and c["value"] < floor]
+    res["decision_confidence"] = _unc_ind(None, "no calibrated decision-level confidence exists; stored components are listed, never aggregated", components=_sv_json(comps), low_components=_sv_json(low), low_confidence_floor=floor)
+    # evidence_completeness
+    if asserting:
+        gone = bool(miss or ungrounded or weak)
+        res["evidence_completeness"] = _unc_ind("INCOMPLETE" if gone else "COMPLETE", f"{len(miss)} missing-evidence item(s), {len(ungrounded)} unsupported and {len(weak)} weakly grounded material claim(s), {len(vr['supporting_evidence'])} supporting evidence reference(s)")
+    elif verdict == "INCONCLUSIVE": res["evidence_completeness"] = _unc_ind("INCOMPLETE", f"verdict INCONCLUSIVE: the rule was attempted without a determinate result; {len(miss)} recorded missing-evidence item(s)")
+    else: res["evidence_completeness"] = _unc_ind(None, f"verdict {verdict} asserts no conclusion to complete evidence for")
+    # contradiction_severity
+    cs = [c for c in vr["contradicting_evidence"] if c.get("source") == "contradiction_finding"]
+    major = [c for c in cs if c.get("category") == "MAJOR_CONTRADICTION"] + [c for c in vr["contradicting_evidence"] if c.get("source") == "opposite_verdict_basis"]
+    minor = [c for c in cs if c.get("category") == "MINOR_CONTRADICTION"]
+    edges = [c for c in vr["contradicting_evidence"] if c.get("source") == "CONTRADICTS_edge"]
+    unresolved_c = [c for c in cs if c.get("resolution") != "RESOLVED"] + [c for c in vr["contradicting_evidence"] if c.get("source") != "contradiction_finding"]
+    major_open = [c for c in major if c.get("source") != "contradiction_finding" or c.get("resolution") != "RESOLVED"]  # MAJOR severity is reported as classified; only an UNRESOLVED major drives the state
+    cb = f"{len(major)} major / opposite-verdict, {len(minor)} minor classified finding(s); {len(edges)} heuristic CONTRADICTS edge(s) without a severity classification"
+    if major: res["contradiction_severity"] = _unc_ind("MAJOR", cb)
+    elif minor: res["contradiction_severity"] = _unc_ind("MINOR", cb)
+    elif edges: res["contradiction_severity"] = _unc_ind("UNCLASSIFIED", cb)
+    elif G.graph.get("contradiction_findings") is not None: res["contradiction_severity"] = _unc_ind("NONE", "contradiction classifier ran: no finding touches this decision's supporting evidence")
+    else: res["contradiction_severity"] = _unc_ind(None, "contradiction classifier has not run on this graph")
+    # policy_alignment
+    pal = {"VERIFIED": "ALIGNED", "MISMATCH": "MISALIGNED", "UNESTABLISHED": "UNESTABLISHED"}.get(pa) if asserting else {"UNEVALUATED": "UNESTABLISHED", "NOT_APPLICABLE": "NOT_APPLICABLE"}.get(verdict)
+    res["policy_alignment"] = _unc_ind(pal, f"7C policy applicability {pa}" if asserting else f"verdict {verdict}" + (f": {dd.get('unevaluated_reason')}" if verdict == "UNEVALUATED" and dd.get("unevaluated_reason") else ""))
+    # risk_level: only a stored Risk node (created by the rule engine for VIOLATION) is a risk classification
+    rk = [(v, G.nodes[v]) for _, v, e in G.out_edges(decision_id, data=True) if e.get("relation") == "HAS_RISK" and G.has_node(v) and G.nodes[v].get("type") == "Risk" and str(G.nodes[v].get("severity")).lower() in _COMPILED_SEV]  # unrecognised severity text is not a risk classification
+    if rk:
+        top = max(rk, key=lambda x: (_COMPILED_SEV.get(str(x[1]["severity"]).lower(), 0), x[0]))
+        res["risk_level"] = _unc_ind(str(top[1]["severity"]).upper(), "stored Risk node severity (highest when several)", risk_ids=sorted(v for v, _ in rk), severity_source=top[1].get("severity_source"))
+    else: res["risk_level"] = _unc_ind(None, "no Risk node recorded for this decision (the rule engine records one only for VIOLATION)")
+    # uncertainty_status
+    if asserting:
+        if vs == "FAILED" or ungrounded: st, why = "INSUFFICIENT_EVIDENCE", f"{len(ungrounded)} unsupported material claim(s): the {verdict} conclusion is not grounded in source evidence"
+        elif pa in ("MISMATCH", "UNESTABLISHED"): st, why = "CONDITIONAL", f"policy applicability {pa}: the cited rule is not established to apply to the verified facts"
+        elif miss or weak: st, why = "INSUFFICIENT_EVIDENCE", f"{len(miss)} missing-evidence item(s) and {len(weak)} weakly grounded material claim(s): the {verdict} conclusion is not adequately supported"
+        elif major_open: st, why = "CONDITIONAL", f"{len(major_open)} unresolved major contradiction / opposite-verdict evidence item(s)"
+        elif pa != "VERIFIED": st, why = "CONDITIONAL", f"policy applicability {pa}: not established"
+        else: st, why = ("COMPLIANT", "SATISFIED with established policy applicability, complete evidence and no unresolved major contradiction") if verdict == "SATISFIED" else ("NON_COMPLIANT", "VIOLATION adequately supported: grounded evidence, established policy applicability, no unresolved major contradiction")
+    elif verdict == "INCONCLUSIVE": st, why = "INSUFFICIENT_EVIDENCE", "verdict INCONCLUSIVE: the rule was attempted but evidence was insufficient for a determinate result"
+    elif verdict == "UNEVALUATED": st, why = "CONDITIONAL", "verdict UNEVALUATED: the rule was not interpretable / configurable, so policy applicability is unestablished and compliance was not checked"
+    elif verdict == "NOT_APPLICABLE": st, why = "INSUFFICIENT_EVIDENCE", "verdict NOT_APPLICABLE: no fact the rule applies to was found; absence of facts is not evidence of compliance"
+    else: st, why = "INSUFFICIENT_EVIDENCE", f"verdict {verdict} has no defined uncertainty mapping"; res["gaps"].append(why)
+    res["uncertainty_status"], res["uncertainty_state_reason"] = st, why
+    # escalation: every reason is backed by existing deterministic information
+    R = res["escalation_reasons"]
+    if low: R.append({"reason": "LOW_CONFIDENCE", "detail": f"{len(low)} compiler-reported rule confidence value(s) below the compiler minimum {floor}"})
+    if miss or ungrounded or weak or vs == "FAILED" or verdict == "INCONCLUSIVE":
+        R.append({"reason": "CRITICAL_EVIDENCE_MISSING", "detail": "; ".join(([f"{len(miss)} missing-evidence item(s): " + ", ".join(sorted({m.get('kind') for m in miss}))] if miss else []) + ([f"{len(ungrounded)} unsupported material claim(s)"] if ungrounded else []) + ([f"{len(weak)} weakly grounded material claim(s)"] if weak else []) + (["verdict INCONCLUSIVE"] if verdict == "INCONCLUSIVE" else []) + (["7B self-verification FAILED"] if vs == "FAILED" else []))})
+    if unresolved_c: R.append({"reason": "UNRESOLVED_CONTRADICTION", "detail": f"{len(unresolved_c)} unresolved contradicting evidence item(s); severity {res['contradiction_severity']['value']}"})
+    if (asserting and vs != "FAILED" and pa != "VERIFIED") or verdict == "UNEVALUATED": R.append({"reason": "POLICY_APPLICABILITY_UNESTABLISHED", "detail": (f"7C policy applicability {pa}" if asserting else "verdict UNEVALUATED: rule not evaluated")})
+    if res["risk_level"]["value"] in UNC_HIGH_RISK: R.append({"reason": "HIGH_RISK", "detail": f"stored Risk severity {res['risk_level']['value']}"})
+    res["escalation_required"] = bool(R)
+    return res
+
+def build_uncertainty_assessments(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    """One assessment per Decision, in a stable order."""
+    return [build_uncertainty_assessment(G, n) for n, _ in sorted(_nodes_of_type(G, "Decision"), key=lambda kv: kv[0])]
+
+def validate_uncertainty_assessment(G: nx.MultiDiGraph, r: Dict[str, Any]) -> List[str]:
+    """Contract check: fields present, state allowed, no numeric indicator, verdict equals the stored Decision verdict, every cited id exists (nothing invented)."""
+    probs = [f"missing field {k}" for k in UNC_FIELDS if k not in r]
+    codes = [e.get("reason") for e in r.get("escalation_reasons") or []]
+    if r.get("found"):
+        if r.get("uncertainty_status") not in UNC_STATES: probs.append(f"unknown uncertainty_status {r.get('uncertainty_status')}")
+        if G.has_node(r.get("decision_id")) and (r.get("decision") or {}).get("verdict") != G.nodes[r["decision_id"]].get("verdict"): probs.append("verdict differs from the stored Decision verdict")
+        for ref in r.get("supporting_evidence") or []:
+            if not (G.has_node(ref.get("evidence_id")) and G.nodes[ref["evidence_id"]].get("type") == "Evidence"): probs.append(f"supporting evidence {ref.get('evidence_id')} not in graph")
+        for ru in r.get("policy_rules") or []:
+            if not (G.has_node(ru.get("rule_id")) and G.nodes[ru["rule_id"]].get("type") == "PolicyRule"): probs.append(f"policy rule {ru.get('rule_id')} not in graph")
+    for k in UNC_INDICATORS:
+        ind = r.get(k) or {}
+        if isinstance(ind.get("value"), (int, float)) and not isinstance(ind.get("value"), bool): probs.append(f"{k}.value must not be numeric")
+        if ind.get("status") not in ("MEASURED", NOT_MEASURED): probs.append(f"{k}: unknown status {ind.get('status')}")
+        if (ind.get("value") is None) != (ind.get("status") == NOT_MEASURED): probs.append(f"{k}: value None exactly when status is NOT_MEASURED")
+    if (r.get("decision_confidence") or {}).get("value") is not None: probs.append("decision_confidence.value must stay None (NOT_MEASURED)")
+    if r.get("found"):  # state / escalation must agree with the reused 7B / 7C statuses and the stored risk
+        st, vs_, pa_ = r.get("uncertainty_status"), r.get("verification_status"), r.get("policy_applicability_status")
+        asserting_ = (r.get("decision") or {}).get("verdict") in SV_ASSERTING_VERDICTS
+        if vs_ == "FAILED" and (st != "INSUFFICIENT_EVIDENCE" or "CRITICAL_EVIDENCE_MISSING" not in codes): probs.append("7B FAILED requires INSUFFICIENT_EVIDENCE with CRITICAL_EVIDENCE_MISSING")
+        if vs_ == "FAILED" and "POLICY_APPLICABILITY_UNESTABLISHED" in codes: probs.append("7B FAILED must not carry a policy applicability reason")
+        if asserting_ and vs_ != "FAILED" and pa_ != "VERIFIED" and (st not in ("CONDITIONAL", "INSUFFICIENT_EVIDENCE") or "POLICY_APPLICABILITY_UNESTABLISHED" not in codes): probs.append("unverified policy applicability requires a non-final state with POLICY_APPLICABILITY_UNESTABLISHED")
+        if st in ("COMPLIANT", "NON_COMPLIANT") and (vs_ == "FAILED" or (asserting_ and pa_ != "VERIFIED")): probs.append(f"{st} requires verified self-verification and policy applicability")
+        if (r.get("risk_level") or {}).get("value") not in (None, "LOW", "MEDIUM", "HIGH", "CRITICAL"): probs.append("risk_level.value is not a recognised stored severity")
+        fl = (r.get("decision_confidence") or {}).get("low_confidence_floor")
+        if fl is not None and (isinstance(fl, bool) or not isinstance(fl, (int, float)) or not math.isfinite(fl)): probs.append("low_confidence_floor must be a finite number or None")
+    if r.get("escalation_required") != bool(r.get("escalation_reasons")): probs.append("escalation_required must be True exactly when escalation_reasons is non-empty")
+    probs += [f"unknown escalation reason {c}" for c in codes if c not in UNC_ESCALATION_CODES]
+    if len(codes) != len(set(codes)): probs.append("duplicate escalation reasons")
+    if "HIGH_RISK" in codes and (r.get("risk_level") or {}).get("value") not in UNC_HIGH_RISK: probs.append("HIGH_RISK without a stored HIGH / CRITICAL risk")
+    if "LOW_CONFIDENCE" in codes and not (r.get("decision_confidence") or {}).get("low_components"): probs.append("LOW_CONFIDENCE without a low compiler confidence component")
+    if "UNRESOLVED_CONTRADICTION" in codes and (r.get("contradiction_severity") or {}).get("value") in (None, "NONE"): probs.append("UNRESOLVED_CONTRADICTION without a recorded contradiction")
+    return probs
+
+
+# --- UNCERTAINTY EVALUATION BENCHMARK (Phase 9C; READ-ONLY / ADDITIVE: only CALLS the 9A/9B layer, the 7B/7C verification and the rule engine; changes none of them) ---
+# Deterministic, offline (no LLM / network / randomness). Every case builds its OWN private graph. Expected labels are HAND-WRITTEN literals in `ground_truth` (state, escalation, reasons); they are never read from, or computed by, any system output
+# (validate_uncertainty_benchmark rejects anything else). Three variants are scored against the same labels:
+#   binary_verdict            VIOLATION -> NON_COMPLIANT, every other verdict -> COMPLIANT; never escalates                          (naive baseline: compliance by absence of violation)
+#   verdict_with_verification verdict -> state (SATISFIED C, VIOLATION NC, INCONCLUSIVE / NOT_APPLICABLE INSUFFICIENT, UNEVALUATED CONDITIONAL); escalates iff 7C verification_status is FAILED / ESCALATE   (stronger baseline)
+#   uncertainty_aware         the existing 9A / 9B assessment, unchanged
+# Metric definitions (UNCB_DEFINITIONS) are explicit; CONDITIONAL / INSUFFICIENT_EVIDENCE are never silently folded into COMPLIANT / NON_COMPLIANT. Every metric is {status, value, numerator, denominator, ...}: MEASURED (value may be a genuine 0.0),
+# NOT_MEASURED with reason_code EMPTY_DENOMINATOR (nothing to divide by) or NO_NUMERIC_CONFIDENCE (calibration inputs absent). ECE / Brier / calibration use ONLY a genuine finite numeric decision_confidence in [0, 1]; the existing layer returns
+# NOT_MEASURED confidence, so on this benchmark they are NOT_MEASURED by design (no probability is invented, no categorical value is converted). The arithmetic is exercised on records that carry a genuine number.
+UNCB_ID, UNCB_VERSION = "omni-uncertainty-bench", "1.0"
+UNCB_VARIANTS = ("binary_verdict", "verdict_with_verification", "uncertainty_aware")
+UNCB_FINAL_STATES = ("COMPLIANT", "NON_COMPLIANT")
+UNCB_CATEGORIES = ("compliant", "non_compliant", "conditional", "insufficient_evidence", "missing_critical_evidence", "unresolved_contradiction", "resolved_contradiction", "policy_mismatch", "low_confidence", "high_risk", "unsupported_ambiguous", "not_applicable")
+UNCB_CASE_KEYS = {"case_id", "category", "documents", "rulebook", "target_rule", "fault", "setup", "ground_truth", "note"}
+UNCB_GT_KEYS = {"state", "escalation", "reasons"}
+UNCB_BINS = 10
+UNCB_DEFINITIONS = {
+    "state_accuracy": "predicted uncertainty state == labelled state, over all cases",
+    "false_positive_rate": "predicted NON_COMPLIANT among cases labelled COMPLIANT (a violation flagged where the case is compliant); denominator = cases labelled COMPLIANT",
+    "false_negative_rate": "predicted COMPLIANT among cases labelled NON_COMPLIANT (a violation missed); denominator = cases labelled NON_COMPLIANT",
+    "unsafe_finalization_rate": "predicted COMPLIANT / NON_COMPLIANT among cases labelled CONDITIONAL / INSUFFICIENT_EVIDENCE (an unresolved case closed as final); denominator = those cases",
+    "escalation_rate": "escalated cases / all cases (predicted); expected_escalation_rate is the same quantity from the labels only",
+    "escalation_false_positive_rate": "escalated among cases labelled no-escalation; denominator = cases labelled no-escalation",
+    "escalation_false_negative_rate": "not escalated among cases labelled escalation; denominator = cases labelled escalation",
+    "escalation_agreement": "predicted escalation == labelled escalation, over all cases",
+    "automation_coverage": "cases eligible for automated final handling / all cases; eligible = predicted state in {COMPLIANT, NON_COMPLIANT} AND not escalated",
+    "automated_decision_accuracy": "among automation-eligible cases, predicted state == labelled state; NOT_MEASURED (EMPTY_DENOMINATOR) when none is eligible",
+    "calibration / ece / brier": "confidence = genuine finite numeric decision_confidence in [0, 1]; outcome = predicted state == labelled state; 10 equal-width bins; ECE = sum(n_b / N * |accuracy_b - mean_confidence_b|); Brier = mean((confidence - outcome)^2); NOT_MEASURED (NO_NUMERIC_CONFIDENCE) when no case carries one"}
+UNCB_LIMITATIONS = ("The existing uncertainty layer returns decision_confidence NOT_MEASURED (no calibrated decision-level probability exists), so calibration, ECE and Brier are NOT_MEASURED on this benchmark; no confidence model was added and nothing is estimated.",
+                    "Labels are small hand-written fixtures (single-rule cases); rates over small denominators are descriptive, not statistically powered; no expert / human ground-truth evaluation is included.")
+UNCB_PROTOCOL = {"seed": None, "randomness": "none", "llm_used": False, "network_used": False, "variants": list(UNCB_VARIANTS), "definitions": UNCB_DEFINITIONS, "limitations": list(UNCB_LIMITATIONS),
+                 "isolation": "every case builds a private graph; setups / faults touch only that graph; a graph snapshot taken before scoring must equal the one after, else the run aborts"}
+_UNCB_FLOOR = 0.6
+
+def _uncb_set_low(G: nx.MultiDiGraph, d: str) -> None: G.nodes[d]["compiled_rules"] = [{"rule_id": "bench_component", "confidence": 0.2}]
+def _uncb_set_high(G: nx.MultiDiGraph, d: str) -> None: G.nodes[d]["compiled_rules"] = [{"rule_id": "bench_component", "confidence": 0.9}]
+def _uncb_inconclusive(G: nx.MultiDiGraph, d: str) -> None: G.nodes[d]["verdict"] = "INCONCLUSIVE"
+def _uncb_resolve_major(G: nx.MultiDiGraph, d: str) -> None:
+    for f in G.graph.get("contradiction_findings") or []:
+        if f["category"] == "MAJOR_CONTRADICTION": f["resolution"] = "RESOLVED"
+def _uncb_minor(G: nx.MultiDiGraph, d: str) -> None:
+    for f in G.graph.get("contradiction_findings") or []:
+        if f["category"] == "MAJOR_CONTRADICTION": f["category"], f["severity"] = "MINOR_CONTRADICTION", "minor"
+UNCB_SETUPS = {"verdict_inconclusive": (_uncb_inconclusive, None), "resolve_major": (_uncb_resolve_major, None), "minor_contradiction": (_uncb_minor, None),
+               "low_confidence_component": (_uncb_set_low, _UNCB_FLOOR), "confidence_component_above_floor": (_uncb_set_high, _UNCB_FLOOR)}  # name -> (private-graph fixture, compiler floor in force while scoring)
+UNCB_FAULTS = ("evidence_text_5000_to_500", "remove_support", "rule_condition_9000", "basis_amount_none", "wrong_scope", "weak_location")
+
+def _uncb_case(cid, category, docs, rulebook, state, escalation, reasons=(), target="TRANSACTION", fault=None, setup=None, note=""):
+    return {"case_id": cid, "category": category, "documents": docs, "rulebook": rulebook, "target_rule": target, "fault": fault, "setup": setup, "note": note,
+            "ground_truth": {"state": state, "escalation": escalation, "reasons": sorted(reasons)}}
+
+_UB_INV5, _UB_INV8 = "Invoice No: INV-1\nBilled amount INR 5,000\n", "Invoice No: INV-2\nBilled amount INR 800\n"
+_UB_R, _UB_KW = "FORBID TRANSACTION > INR 1000\n", 'REQUIRE KEYWORD "manager approval"\n'
+_UB_POC = {"inv_c.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 800\n", "po_c.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}
+_UB_REF = {"inv_r.txt": "Invoice No: INV-7\nPO Number: PO-777\nVendor: Boreal\nBilled amount INR {amt}\n"}
+# Labels follow the POLICY reading of each fixture, written before any output was inspected: a final state needs grounded evidence, established rule applicability and no open major contradiction; escalation needs one of the five reasons.
+UNCERTAINTY_BENCHMARK: List[Dict[str, Any]] = [
+    _uncb_case("ub_compliant_amount", "compliant", {"i.txt": _UB_INV8}, _UB_R, "COMPLIANT", False, note="grounded amount under the limit"),
+    _uncb_case("ub_compliant_keyword", "compliant", {"m.txt": "manager approval granted\n"}, _UB_KW, "COMPLIANT", False, target="KEYWORD"),
+    _uncb_case("ub_noncompliant_amount", "non_compliant", {"i.txt": _UB_INV5}, _UB_R, "NON_COMPLIANT", False, note="default MEDIUM risk alone does not escalate"),
+    _uncb_case("ub_noncompliant_absence", "non_compliant", {"m.txt": "notes\n"}, _UB_KW, "NON_COMPLIANT", False, target="KEYWORD", note="required text absent within a complete extraction scope"),
+    _uncb_case("ub_noncompliant_low_risk", "non_compliant", {"i.txt": _UB_INV5}, "FORBID TRANSACTION > INR 1000 [severity=low]\n", "NON_COMPLIANT", False),
+    _uncb_case("ub_high_risk", "high_risk", {"i.txt": _UB_INV5}, "FORBID TRANSACTION > INR 1000 [severity=high]\n", "NON_COMPLIANT", True, ["HIGH_RISK"]),
+    _uncb_case("ub_critical_risk", "high_risk", {"i.txt": _UB_INV5}, "FORBID TRANSACTION > INR 1000 [severity=critical]\n", "NON_COMPLIANT", True, ["HIGH_RISK"]),
+    _uncb_case("ub_high_risk_and_missing_ref", "high_risk", {k: v.format(amt="5,000") for k, v in _UB_REF.items()}, "FORBID TRANSACTION > INR 1000 [severity=high]\n", "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING", "HIGH_RISK"], note="violation present but a referenced document was never supplied"),
+    _uncb_case("ub_inconclusive", "insufficient_evidence", {"i.txt": _UB_INV8}, _UB_R, "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING"], setup="verdict_inconclusive"),
+    _uncb_case("ub_missing_referenced_document", "missing_critical_evidence", {k: v.format(amt="800") for k, v in _UB_REF.items()}, _UB_R, "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING"], note="satisfied on its face, but the referenced PO is missing"),
+    _uncb_case("ub_text_no_longer_supports_claim", "missing_critical_evidence", {"i.txt": _UB_INV5}, _UB_R, "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING"], fault="evidence_text_5000_to_500"),
+    _uncb_case("ub_weak_source_location", "missing_critical_evidence", {"i.txt": _UB_INV5}, _UB_R, "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING"], fault="weak_location"),
+    _uncb_case("ub_unsupported_violation", "unsupported_ambiguous", {"i.txt": _UB_INV5}, _UB_R, "INSUFFICIENT_EVIDENCE", True, ["CRITICAL_EVIDENCE_MISSING"], fault="remove_support", note="violation with no qualifying supporting evidence"),
+    _uncb_case("ub_rule_free_text", "unsupported_ambiguous", {"i.txt": _UB_INV5}, "Vendors should behave in spirit.\n", "CONDITIONAL", True, ["POLICY_APPLICABILITY_UNESTABLISHED"], target="Vendors", note="rule text cannot be interpreted"),
+    _uncb_case("ub_rule_unknown_currency", "conditional", {"i.txt": _UB_INV5}, "FORBID TRANSACTION > JPY 1000\n", "CONDITIONAL", True, ["POLICY_APPLICABILITY_UNESTABLISHED"], note="unit outside the supported set: compliance not checked"),
+    _uncb_case("ub_wrong_policy_scope", "policy_mismatch", {"i.txt": _UB_INV5}, _UB_R, "CONDITIONAL", True, ["POLICY_APPLICABILITY_UNESTABLISHED"], fault="wrong_scope"),
+    _uncb_case("ub_rule_text_changed", "policy_mismatch", {"i.txt": _UB_INV5}, _UB_R, "CONDITIONAL", True, ["POLICY_APPLICABILITY_UNESTABLISHED"], fault="rule_condition_9000"),
+    _uncb_case("ub_basis_amount_unknown", "policy_mismatch", {"i.txt": _UB_INV5}, _UB_R, "CONDITIONAL", True, ["POLICY_APPLICABILITY_UNESTABLISHED"], fault="basis_amount_none", note="required fact missing: applicability not established"),
+    _uncb_case("ub_major_contradiction_vendor", "unresolved_contradiction", _UB_POC, _UB_R, "CONDITIONAL", True, ["UNRESOLVED_CONTRADICTION"]),
+    _uncb_case("ub_major_contradiction_amount", "unresolved_contradiction", {"inv.txt": "Invoice No: INV-9\nPO Number: PO-9\nVendor: Boreal\nBilled amount INR 900\n", "po.txt": "Purchase Order No: PO-9\nVendor: Boreal\nOrder value INR 700\n"}, _UB_R, "CONDITIONAL", True, ["UNRESOLVED_CONTRADICTION"]),
+    _uncb_case("ub_minor_contradiction_unresolved", "unresolved_contradiction", _UB_POC, _UB_R, "COMPLIANT", True, ["UNRESOLVED_CONTRADICTION"], setup="minor_contradiction", note="unresolved but minor: escalates, does not block the state"),
+    _uncb_case("ub_major_contradiction_resolved", "resolved_contradiction", _UB_POC, _UB_R, "COMPLIANT", False, setup="resolve_major", note="the major finding is recorded RESOLVED: neither state nor escalation"),
+    _uncb_case("ub_not_applicable", "not_applicable", {"memo.txt": "Meeting notes\nNothing to report\n"}, _UB_R, "INSUFFICIENT_EVIDENCE", False, note="absence of facts is not compliance; nothing evidential is missing"),
+    _uncb_case("ub_low_confidence_component", "low_confidence", {"i.txt": _UB_INV8}, _UB_R, "COMPLIANT", True, ["LOW_CONFIDENCE"], setup="low_confidence_component", note="compiler-reported component 0.2 below the compiler floor 0.6"),
+    _uncb_case("ub_confidence_above_floor", "low_confidence", {"i.txt": _UB_INV8}, _UB_R, "COMPLIANT", False, setup="confidence_component_above_floor", note="component 0.9 above the floor: automation proceeds")]
+
+def validate_uncertainty_benchmark(cases: Optional[List[Dict[str, Any]]] = None, require_coverage: bool = True) -> List[str]:
+    """Label consistency and independence: labels are literal data of fixed shape inside the case (never callables / outputs / extra keys), escalation == bool(reasons), every referenced fault / setup exists."""
+    cases = UNCERTAINTY_BENCHMARK if cases is None else cases
+    probs: List[str] = []
+    ids = [c.get("case_id") for c in cases]
+    if len(ids) != len(set(ids)): probs.append("duplicate case_id")
+    for c in cases:
+        cid = c.get("case_id")
+        if set(c) != UNCB_CASE_KEYS: probs.append(f"{cid}: case keys {sorted(set(c) ^ UNCB_CASE_KEYS)} differ from the allowed schema (no prediction / output fields may be attached to a case)")
+        if c.get("category") not in UNCB_CATEGORIES: probs.append(f"{cid}: unknown category {c.get('category')}")
+        if c.get("fault") is not None and c["fault"] not in UNCB_FAULTS: probs.append(f"{cid}: unknown fault {c['fault']}")
+        if c.get("setup") is not None and c["setup"] not in UNCB_SETUPS: probs.append(f"{cid}: unknown setup {c['setup']}")
+        gt = c.get("ground_truth")
+        if not isinstance(gt, dict) or set(gt) != UNCB_GT_KEYS: probs.append(f"{cid}: ground_truth must have exactly {sorted(UNCB_GT_KEYS)}"); continue
+        if gt["state"] not in UNC_STATES: probs.append(f"{cid}: label state {gt['state']} not one of {UNC_STATES}")
+        if not isinstance(gt["escalation"], bool): probs.append(f"{cid}: label escalation must be a bool literal")
+        if not (isinstance(gt["reasons"], list) and all(isinstance(x, str) and x in UNC_ESCALATION_CODES for x in gt["reasons"]) and gt["reasons"] == sorted(set(gt["reasons"]))): probs.append(f"{cid}: label reasons must be a sorted unique list of known escalation codes")
+        elif gt["escalation"] != bool(gt["reasons"]): probs.append(f"{cid}: label escalation must be True exactly when label reasons is non-empty")
+        if gt["state"] in ("COMPLIANT", "NON_COMPLIANT") and not gt["escalation"] and c.get("category") in ("missing_critical_evidence", "unresolved_contradiction", "policy_mismatch", "insufficient_evidence"): probs.append(f"{cid}: category {c['category']} cannot be a non-escalated final state")
+        try: json.dumps(c)
+        except (TypeError, ValueError): probs.append(f"{cid}: case is not plain JSON data (labels must be literals)")
+    if require_coverage:
+        got = {c["category"] for c in cases if "category" in c}
+        probs += [f"category {x} not covered" for x in UNCB_CATEGORIES if x not in got]
+        gts = [c["ground_truth"] for c in cases if isinstance(c.get("ground_truth"), dict) and "state" in c["ground_truth"]]
+        probs += [f"state {s} not covered" for s in UNC_STATES if s not in {g["state"] for g in gts}]
+        probs += [f"escalation={b} not covered" for b in (True, False) if b not in {g["escalation"] for g in gts}]
+        probs += [f"reason {x} not covered" for x in UNC_ESCALATION_CODES if x not in {y for g in gts for y in g["reasons"]}]
+    return probs
+
+def _uncb_floor(floor: Optional[float], fn):
+    """Runs fn with the compiler confidence floor a case declares (restored afterwards); None leaves the module untouched."""
+    if floor is None: return fn()
+    had, old = "_COMPILER_MIN_CONFIDENCE" in globals(), globals().get("_COMPILER_MIN_CONFIDENCE")
+    globals()["_COMPILER_MIN_CONFIDENCE"] = floor
+    try: return fn()
+    finally:
+        if had: globals()["_COMPILER_MIN_CONFIDENCE"] = old
+        else: globals().pop("_COMPILER_MIN_CONFIDENCE", None)
+
+_UNCB_VERDICT_STATE = {"SATISFIED": "COMPLIANT", "VIOLATION": "NON_COMPLIANT", "INCONCLUSIVE": "INSUFFICIENT_EVIDENCE", "UNEVALUATED": "CONDITIONAL", "NOT_APPLICABLE": "INSUFFICIENT_EVIDENCE"}
+
+def uncertainty_variant_predictions(G: nx.MultiDiGraph, decision_id: str) -> Dict[str, Dict[str, Any]]:
+    """The three compared variants for one Decision, from EXISTING outputs only (read-only)."""
+    a = build_uncertainty_assessment(G, decision_id); vr = verify_policy_applicability(G, decision_id); verdict = G.nodes[decision_id].get("verdict")
+    return {"binary_verdict": {"state": "NON_COMPLIANT" if verdict == "VIOLATION" else "COMPLIANT", "escalated": False},
+            "verdict_with_verification": {"state": _UNCB_VERDICT_STATE.get(verdict, "INSUFFICIENT_EVIDENCE"), "escalated": vr.get("verification_status") in ("FAILED", "ESCALATE")},
+            "uncertainty_aware": {"state": a["uncertainty_status"], "escalated": a["escalation_required"], "reasons": sorted(e["reason"] for e in a["escalation_reasons"])}}
+
+def _uncb_numeric_confidence(a: Dict[str, Any]) -> Optional[float]:
+    v = (a.get("decision_confidence") or {}).get("value")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0.0 <= v <= 1.0 else None
+
+def _uncb_run_case(case: Dict[str, Any], workdir: str) -> Dict[str, Any]:
+    G = _cfb_build(case["documents"], case["rulebook"], workdir)
+    d = _sv7d_target_decision(G, case["target_rule"])
+    if d is None: raise ValueError(f"{case['case_id']}: target rule {case['target_rule']!r} does not select exactly one Decision")
+    _sv7d_apply_fault(G, d, case["fault"])
+    fix, floor = UNCB_SETUPS[case["setup"]] if case["setup"] else (None, None)
+    if fix: fix(G, d)
+    before = _sv7d_snapshot(G)
+    def score():
+        a1, a2 = build_uncertainty_assessment(G, d), build_uncertainty_assessment(G, d)
+        return a1, a2, uncertainty_variant_predictions(G, d)
+    a, a2, preds = _uncb_floor(floor, score)
+    if _sv7d_snapshot(G) != before: raise RuntimeError("uncertainty benchmark mutated the graph")
+    refs = a["supporting_evidence"]
+    gt = case["ground_truth"]
+    return {"case_id": case["case_id"], "category": case["category"], "setup": case["setup"], "fault": case["fault"], "verdict": G.nodes[d].get("verdict"),
+            "expected_state": gt["state"], "expected_escalation": gt["escalation"], "expected_reasons": list(gt["reasons"]), "predictions": preds, "predicted_confidence": _uncb_numeric_confidence(a),
+            "deterministic": json.dumps(_sv_json(a), sort_keys=True) == json.dumps(_sv_json(a2), sort_keys=True), "graph_unchanged": True,
+            "id_integrity": {"evidence_ids_in_graph": all(G.has_node(r["evidence_id"]) and G.nodes[r["evidence_id"]].get("type") == "Evidence" for r in refs),
+                             "provenance_matches_graph": all(r.get("provenance") == _sv_json(G.nodes[r["evidence_id"]].get("provenance")) for r in refs if G.has_node(r["evidence_id"])),
+                             "rule_ids_in_graph": all(G.has_node(x["rule_id"]) and G.nodes[x["rule_id"]].get("type") == "PolicyRule" for x in a["policy_rules"]),
+                             "verdict_preserved": (a["decision"] or {}).get("verdict") == G.nodes[d].get("verdict"), "contract_problems": validate_uncertainty_assessment(G, a)}}
+
+def _uncb_metric(num: int, den: int, reason: str) -> Dict[str, Any]:
+    if den == 0: return {"status": NOT_MEASURED, "value": NOT_MEASURED, "numerator": None, "denominator": 0, "reason_code": "EMPTY_DENOMINATOR", "reason": reason}
+    return {"status": "MEASURED", "value": round(num / den, 4), "numerator": num, "denominator": den}  # a genuine 0.0 stays MEASURED
+
+def uncertainty_calibration_metrics(pairs: List[Tuple[Any, bool]], total: int) -> Dict[str, Any]:
+    """pairs = (confidence, outcome). Only genuine finite numbers in [0, 1] are used; everything else is excluded and counted. NOT_MEASURED (NO_NUMERIC_CONFIDENCE) when none remains. Never estimates a confidence."""
+    ok = [(float(c), bool(y)) for c, y in pairs if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c) and 0.0 <= c <= 1.0]
+    base = {"n_cases": total, "n_valid_confidence": len(ok)}
+    if not ok:
+        nm = {"status": NOT_MEASURED, "value": NOT_MEASURED, "reason_code": "NO_NUMERIC_CONFIDENCE", "reason": "no case carries a genuine numeric decision confidence; none is estimated or derived from categorical status"}
+        return {"calibration": {**nm, "bins": [], **base}, "ece": {**nm, **base}, "brier": {**nm, **base}}
+    bins: List[Dict[str, Any]] = []
+    for b in range(UNCB_BINS):
+        m = [(c, y) for c, y in ok if min(int(c * UNCB_BINS), UNCB_BINS - 1) == b]
+        if m: bins.append({"bin": b, "range": [b / UNCB_BINS, (b + 1) / UNCB_BINS], "count": len(m), "mean_confidence": round(sum(c for c, _ in m) / len(m), 4), "accuracy": round(sum(y for _, y in m) / len(m), 4)})
+    ece = sum(x["count"] / len(ok) * abs(x["accuracy"] - x["mean_confidence"]) for x in bins)
+    brier = sum((c - (1.0 if y else 0.0)) ** 2 for c, y in ok) / len(ok)
+    return {"calibration": {"status": "MEASURED", "bins": bins, **base}, "ece": {"status": "MEASURED", "value": round(ece, 4), **base}, "brier": {"status": "MEASURED", "value": round(brier, 4), **base}}
+
+def _uncb_variant_metrics(recs: List[Dict[str, Any]], v: str) -> Dict[str, Any]:
+    P = [(r, r["predictions"][v]) for r in recs]
+    lab = lambda s: [(r, p) for r, p in P if r["expected_state"] == s]
+    esc_pos, esc_neg = [(r, p) for r, p in P if r["expected_escalation"]], [(r, p) for r, p in P if not r["expected_escalation"]]
+    auto = [(r, p) for r, p in P if p["state"] in UNCB_FINAL_STATES and not p["escalated"]]
+    open_ = [(r, p) for r, p in P if r["expected_state"] in ("CONDITIONAL", "INSUFFICIENT_EVIDENCE")]
+    m = {"state_accuracy": _uncb_metric(sum(p["state"] == r["expected_state"] for r, p in P), len(P), "no cases"),
+         "false_positive_rate": _uncb_metric(sum(p["state"] == "NON_COMPLIANT" for _, p in lab("COMPLIANT")), len(lab("COMPLIANT")), "no case labelled COMPLIANT"),
+         "false_negative_rate": _uncb_metric(sum(p["state"] == "COMPLIANT" for _, p in lab("NON_COMPLIANT")), len(lab("NON_COMPLIANT")), "no case labelled NON_COMPLIANT"),
+         "unsafe_finalization_rate": _uncb_metric(sum(p["state"] in UNCB_FINAL_STATES for _, p in open_), len(open_), "no case labelled CONDITIONAL / INSUFFICIENT_EVIDENCE"),
+         "escalation_rate": _uncb_metric(sum(p["escalated"] for _, p in P), len(P), "no cases"),
+         "escalation_agreement": _uncb_metric(sum(p["escalated"] == r["expected_escalation"] for r, p in P), len(P), "no cases"),
+         "escalation_false_positive_rate": _uncb_metric(sum(p["escalated"] for _, p in esc_neg), len(esc_neg), "no case labelled no-escalation"),
+         "escalation_false_negative_rate": _uncb_metric(sum(not p["escalated"] for _, p in esc_pos), len(esc_pos), "no case labelled escalation"),
+         "automation_coverage": _uncb_metric(len(auto), len(P), "no cases"),
+         "automated_decision_accuracy": _uncb_metric(sum(p["state"] == r["expected_state"] for r, p in auto), len(auto), "no case is eligible for automated final handling")}
+    if v == "uncertainty_aware": m.update(uncertainty_calibration_metrics([(r["predicted_confidence"], p["state"] == r["expected_state"]) for r, p in P], len(P)))
+    else: m.update({k: {"status": NOT_MEASURED, "value": NOT_MEASURED, "reason_code": "NO_NUMERIC_CONFIDENCE", "reason": "variant produces no confidence"} for k in ("calibration", "ece", "brier")})
+    return m
+
+def aggregate_uncertainty_results(records: List[Dict[str, Any]], cases: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Derived from the raw per-case records only. Expected-escalation / expected-automation figures come from the labels alone."""
+    cases = UNCERTAINTY_BENCHMARK if cases is None else cases
+    variants = {v: {"metrics": _uncb_variant_metrics(records, v)} for v in UNCB_VARIANTS}
+    names = ("state_accuracy", "false_positive_rate", "false_negative_rate", "unsafe_finalization_rate", "escalation_rate", "escalation_agreement", "escalation_false_positive_rate", "escalation_false_negative_rate", "automation_coverage", "automated_decision_accuracy", "ece", "brier")
+    label_auto = [r for r in records if r["expected_state"] in UNCB_FINAL_STATES and not r["expected_escalation"]]
+    return {"benchmark": {"id": UNCB_ID, "version": UNCB_VERSION, "size": len(cases), "category_counts": dict(Counter(c["category"] for c in cases)), "expected_state_counts": dict(Counter(c["ground_truth"]["state"] for c in cases)), "seed": None, "llm_used": False},
+            "labels_only": {"expected_escalation_rate": _uncb_metric(sum(r["expected_escalation"] for r in records), len(records), "no cases"), "expected_automation_coverage": _uncb_metric(len(label_auto), len(records), "no cases")},
+            "variants": variants, "comparison": {n: {v: variants[v]["metrics"][n]["value"] for v in UNCB_VARIANTS} for n in names},
+            "integrity": {"all_deterministic": all(r["deterministic"] for r in records), "all_graphs_unchanged": all(r["graph_unchanged"] for r in records),
+                          "all_ids_and_provenance_intact": all(r["id_integrity"]["evidence_ids_in_graph"] and r["id_integrity"]["provenance_matches_graph"] and r["id_integrity"]["rule_ids_in_graph"] and r["id_integrity"]["verdict_preserved"] and not r["id_integrity"]["contract_problems"] for r in records)},
+            "protocol": UNCB_PROTOCOL, "limitations": list(UNCB_LIMITATIONS)}
+
+def run_uncertainty_benchmark(cases: Optional[List[Dict[str, Any]]] = None, output_path: Optional[str] = None) -> Dict[str, Any]:
+    """Offline and deterministic. Every case builds its own private graph; returns {"records", "aggregate"}; writes JSON only if output_path is given."""
+    cases = UNCERTAINTY_BENCHMARK if cases is None else cases
+    probs = validate_uncertainty_benchmark(cases, require_coverage=cases is UNCERTAINTY_BENCHMARK)
+    if probs: raise ValueError("uncertainty benchmark labels inconsistent: " + "; ".join(probs[:5]))
+    records: List[Dict[str, Any]] = []
+    for c in cases:
+        with tempfile.TemporaryDirectory() as td: records.append(_uncb_run_case(c, td))
+    result = _json_safe({"benchmark_id": UNCB_ID, "version": UNCB_VERSION, "records": records, "aggregate": aggregate_uncertainty_results(records, cases)})
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh: json.dump(result, fh, indent=2, ensure_ascii=False)
+    return result
+
+
 def run_v1_v2_experiment(case: Dict[str, Any], runs: int = 1, run_llm: bool = False, config: Optional[Dict[str, Any]] = None, criteria: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Runs the V1/V2 comparison for ONE labelled case and returns {"records": [...], "summary": {...}}.
     case = {"case_id", "files": [paths], "rulebook": path|None, "objective", "ground_truth": {...see build_experiment_record...}}.
@@ -6914,3 +7819,124 @@ def process_document_batch_task(self, file_paths: list, url_list: list, rulebook
             except Exception: pass
         if master_temp_dir and not os.getenv("DEBUG_KEEP_FILES"):
             shutil.rmtree(master_temp_dir, ignore_errors=True)
+
+# --- OMNI-BENCH FOUNDATION (schema + leakage validation only; no cases populated, no runner, no scoring; offline/deterministic, no LLM/network) ---
+OMNI_BENCH_CATEGORIES: Tuple[Tuple[str, str, str], ...] = (
+    ("simple_compliance", "Simple compliance", "Single document, single clear rule, unambiguous outcome."),
+    ("multi_document_compliance", "Multi-document compliance", "Outcome requires combining evidence across several documents."),
+    ("contradictory_evidence", "Contradictory evidence", "Documents disagree on a fact relevant to the rule."),
+    ("missing_evidence", "Missing evidence", "Evidence required by the rule is absent from the document set."),
+    ("policy_exceptions", "Policy exceptions", "A stated exception overrides the general rule."),
+    ("temporal_violations", "Temporal violations", "Dates, deadlines or validity windows decide the outcome."),
+    ("entity_mismatch", "Entity mismatch", "Evidence refers to a different entity than the one under review."),
+    ("distractor_documents", "Distractor documents", "Irrelevant documents are mixed in with the relevant ones."),
+    ("ocr_noise", "OCR noise", "Document text contains OCR-style corruption."),
+    ("policy_paraphrasing", "Policy paraphrasing", "The same policy is expressed in different wording."),
+    ("ambiguous_policies", "Ambiguous policies", "Policy wording admits more than one reasonable reading."),
+    ("adversarial_document_content", "Adversarial document content", "Documents contain misleading or manipulative claims."),
+    ("prompt_injection_inside_documents", "Prompt injection inside documents", "Documents embed instructions aimed at the system."),
+    ("conflicting_policies", "Conflicting policies", "Two applicable policies give incompatible requirements."),
+    ("evidence_removal", "Evidence removal", "Decisive evidence has been removed relative to a base case."),
+)
+OMNI_BENCH_CATEGORY_IDS = tuple(c[0] for c in OMNI_BENCH_CATEGORIES)
+OMNI_BENCH_SPLITS: Dict[str, str] = {
+    "TRAIN": "Cases usable for development of methods and prompts.",
+    "DEV": "Cases usable for tuning and model selection; not for final reporting.",
+    "TEST": "Held-out cases for final reporting only; never used for tuning.",
+}
+OMNI_BENCH_DECISIONS = ("COMPLIANT", "NON_COMPLIANT", "INSUFFICIENT_EVIDENCE")
+OMNI_BENCH_REQUIRED_FIELDS = ("case_id", "family_id", "split", "document_set", "policy", "expected_decision", "applicable_policy_rule",
+                              "supporting_evidence", "contradicting_evidence", "missing_evidence", "expected_escalation",
+                              "counterfactual_correction", "difficulty_category")
+OMNI_BENCH_LABEL_SOURCES = ("human_annotation", "rule_derived", "synthetic_construction")
+OMNI_BENCH_FORBIDDEN_KEYS = ("prediction", "predictions", "predicted_decision", "system_output", "model_output", "system_prediction", "model_prediction")
+OMNI_BENCH_METADATA: Dict[str, Any] = {
+    "benchmark_name": "OMNI-Bench", "benchmark_version": "0.1.0", "schema_version": "1.0",
+    "split_definitions": dict(OMNI_BENCH_SPLITS),
+    "category_definitions": {c[0]: {"name": c[1], "definition": c[2]} for c in OMNI_BENCH_CATEGORIES},
+    "leakage_policy": ("Cases sharing a family_id (related or near-duplicate variants) must all be in one split; case_id is globally unique; "
+                       "no identical document_set+policy content may appear in two splits; ground truth is never derived from system predictions."),
+    "reproducibility_policy": "Offline, deterministic, no LLM or network calls; identical inputs and seed produce identical cases and validation results.",
+    "generation_methodology": "UNSPECIFIED: to be defined before the benchmark is populated.",
+    "seed_policy": "Any randomized generation must use an explicit integer seed recorded with the benchmark; no unseeded randomness or wall-clock input.",
+}
+OMNI_BENCH_CASES: List[Dict[str, Any]] = []  # intentionally empty: the benchmark is not populated yet
+
+
+def _omni_bench_has_forbidden_key(o: Any) -> bool:
+    if isinstance(o, dict):
+        return any(str(k).lower() in OMNI_BENCH_FORBIDDEN_KEYS or str(k).lower().startswith("predicted_") or _omni_bench_has_forbidden_key(v) for k, v in o.items())
+    if isinstance(o, (list, tuple)):
+        return any(_omni_bench_has_forbidden_key(v) for v in o)
+    return False
+
+
+def validate_omni_bench_metadata(meta: Optional[Dict[str, Any]] = None) -> List[str]:
+    meta = OMNI_BENCH_METADATA if meta is None else meta
+    probs = [f"metadata: missing/empty '{k}'" for k in ("benchmark_name", "benchmark_version", "schema_version", "split_definitions", "category_definitions",
+                                                         "leakage_policy", "reproducibility_policy", "generation_methodology", "seed_policy") if not meta.get(k)]
+    if set(meta.get("split_definitions") or {}) != set(OMNI_BENCH_SPLITS): probs.append("metadata: split_definitions must be exactly TRAIN/DEV/TEST")
+    if list(meta.get("category_definitions") or {}) != list(OMNI_BENCH_CATEGORY_IDS): probs.append("metadata: category_definitions must be the 15 defined categories in order")
+    return probs
+
+
+def validate_omni_bench_cases(cases: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """Return a sorted list of problems (empty == valid). Pure and deterministic."""
+    cases = OMNI_BENCH_CASES if cases is None else cases
+    probs: List[str] = []
+    seen_ids: set = set()
+    fam_split: Dict[str, str] = {}
+    content_split: Dict[str, Tuple[str, str]] = {}
+    for i, c in enumerate(cases):
+        if not isinstance(c, dict):
+            probs.append(f"case[{i}]: not an object"); continue
+        cid = c.get("case_id")
+        tag = cid if isinstance(cid, str) and cid else f"case[{i}]"
+        missing = [f for f in OMNI_BENCH_REQUIRED_FIELDS if f not in c or c[f] is None or c[f] == "" or (f in ("document_set", "policy", "applicable_policy_rule") and not c[f])]
+        for f in missing: probs.append(f"{tag}: missing required field '{f}'")
+        if isinstance(cid, str) and cid:
+            if cid in seen_ids: probs.append(f"{tag}: duplicate case_id")
+            seen_ids.add(cid)
+        if _omni_bench_has_forbidden_key(c): probs.append(f"{tag}: prediction-derived ground truth (forbidden prediction field)")
+        if "label_source" in c and c["label_source"] not in OMNI_BENCH_LABEL_SOURCES: probs.append(f"{tag}: label_source must be one of {OMNI_BENCH_LABEL_SOURCES}")
+        if "difficulty_category" not in missing and c["difficulty_category"] not in OMNI_BENCH_CATEGORY_IDS: probs.append(f"{tag}: invalid difficulty_category")
+        split = c.get("split")
+        if "split" not in missing and split not in OMNI_BENCH_SPLITS: probs.append(f"{tag}: invalid split assignment")
+        fam = c.get("family_id")
+        if "family_id" not in missing:
+            if not isinstance(fam, str): probs.append(f"{tag}: family_id must be a string")
+            elif split in OMNI_BENCH_SPLITS:
+                if fam_split.setdefault(fam, split) != split: probs.append(f"{tag}: family_id '{fam}' appears in multiple splits")
+        # ground-truth shape
+        if "expected_decision" not in missing and c["expected_decision"] not in OMNI_BENCH_DECISIONS: probs.append(f"{tag}: malformed expected_decision")
+        if "expected_escalation" not in missing and not isinstance(c["expected_escalation"], bool): probs.append(f"{tag}: malformed expected_escalation (bool required)")
+        for f in ("policy", "applicable_policy_rule", "counterfactual_correction"):
+            if f not in missing and not isinstance(c[f], str): probs.append(f"{tag}: malformed {f} (string required)")
+        doc_ids: set = set()
+        if "document_set" not in missing:
+            ds = c["document_set"]
+            if not isinstance(ds, list) or not all(isinstance(d, dict) and isinstance(d.get("doc_id"), str) and d["doc_id"] and isinstance(d.get("text"), str) for d in ds):
+                probs.append(f"{tag}: malformed document_set (list of {{doc_id, text}})")
+            else:
+                doc_ids = {d["doc_id"] for d in ds}
+                if len(doc_ids) != len(ds): probs.append(f"{tag}: duplicate doc_id in document_set")
+        for f in ("supporting_evidence", "contradicting_evidence", "missing_evidence"):
+            if f in missing: continue
+            v = c[f]
+            if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v): probs.append(f"{tag}: malformed {f} (list of strings)"); continue
+            if f != "missing_evidence" and doc_ids and not set(v) <= doc_ids: probs.append(f"{tag}: {f} references doc_id not in document_set")
+        if c.get("expected_decision") == "INSUFFICIENT_EVIDENCE" and isinstance(c.get("missing_evidence"), list) and not c["missing_evidence"]:
+            probs.append(f"{tag}: INSUFFICIENT_EVIDENCE requires non-empty missing_evidence")
+        # near-duplicate content leakage across splits
+        if not missing and split in OMNI_BENCH_SPLITS:
+            try: h = hashlib.sha256(json.dumps([c["document_set"], c["policy"]], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            except (TypeError, ValueError): continue
+            if content_split.setdefault(h, (split, tag))[0] != split: probs.append(f"{tag}: identical document_set+policy content also in split '{content_split[h][0]}' (case {content_split[h][1]})")
+    return sorted(probs)
+
+
+# --- OMNI-BENCH POPULATION (case data lives in omni_bench_cases.py beside this file; deterministic, offline; no labels come from running this system) ---
+from .omni_bench_cases import (OMNI_BENCH_DOCUMENT_CONTENT_POLICY, OMNI_BENCH_GENERATION_METHODOLOGY, OMNI_BENCH_SEED_POLICY, build_omni_bench_cases)
+OMNI_BENCH_METADATA.update({"generation_methodology": OMNI_BENCH_GENERATION_METHODOLOGY, "seed_policy": OMNI_BENCH_SEED_POLICY,
+                            "document_content_policy": OMNI_BENCH_DOCUMENT_CONTENT_POLICY})
+OMNI_BENCH_CASES.extend(build_omni_bench_cases())

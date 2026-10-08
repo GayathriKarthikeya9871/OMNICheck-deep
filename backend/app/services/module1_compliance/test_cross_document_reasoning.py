@@ -1206,3 +1206,1442 @@ def test_sv7d_records_carry_no_random_graph_ids(sv7d):
     assert not _re.search(r"\b[a-z]+_[0-9a-f]{16}\b", blob)
     pa = _sv7d_rec(sv7d, "sv7d_policy_wrong_scope", SVPA)
     assert "<rule>" in pa["escalation_reason"] and "applicability mismatch" in pa["escalation_reason"]
+
+
+# 19 ---- counterfactual compliance (Phase 8): derived from the cited rule + existing evidence, read-only, benchmarked against hand-written labels
+_CF_NM = T.NOT_MEASURED
+_CF_METRICS = ("counterfactual_validity", "policy_consistency", "evidence_grounding", "minimum_change_accuracy", "status_accuracy", "change_type_accuracy", "invented_counterfactual_rate", "contract_validity")
+
+
+def _cf_g(docs, rulebook):
+    return _graph(docs, rulebook=rulebook)
+
+
+def _cf_for(G, rule_part):
+    d = next(n for n, x in sorted(G.nodes(data=True)) if x.get("type") == "Decision" and rule_part.lower() in G.nodes[x["rule_id"]]["condition"].lower())
+    return d, T.build_counterfactual(G, d)
+
+
+@pytest.fixture(scope="module")
+def cfb():
+    return T.run_counterfactual_benchmark()
+
+
+def _cfb_rec(res, cid):
+    return next(r for r in res["records"] if r["case_id"] == cid)
+
+
+def _cfb_case_by_id(cid):
+    import copy
+    return copy.deepcopy(next(c for c in T.COUNTERFACTUAL_BENCHMARK if c["case_id"] == cid))
+
+
+def test_cf_contract_scope_and_status_for_every_decision_and_finding():
+    G = _cf_g({"invoice_a.txt": "Invoice No: INV-1\nBilled amount INR 5,000\n", "memo_a.txt": "notes\n"}, 'FORBID TRANSACTION > INR 1000\nREQUIRE KEYWORD "manager approval"\nFORBID TRANSACTION > INR 90000\nVendors should behave in spirit.\n')
+    cfs = T.build_counterfactuals(G)
+    verdicts = {n: x["verdict"] for n, x in G.nodes(data=True) if x.get("type") == "Decision"}
+    assert {c["decision_id"] for c in cfs} == {n for n, v in verdicts.items() if v in ("VIOLATION", "INCONCLUSIVE", "UNEVALUATED")}
+    for c in cfs:
+        assert all(k in c for k in T.CF_FIELDS) and T.validate_counterfactual(G, c) == [] and c["status"] in ("ESTABLISHED", "UNRESOLVED")
+        assert c["violated_rule"]["rule_id"] == G.nodes[c["decision_id"]]["rule_id"] and c["current_decision"]["verdict"] == verdicts[c["decision_id"]]  # rule + decision references preserved
+    ok = next(n for n, v in verdicts.items() if v == "SATISFIED")
+    r = T.build_counterfactual(G, ok)
+    assert r["status"] == "NOT_REQUIRED" and not r["in_scope"] and all(k in r for k in T.CF_FIELDS) and r["recommended_corrective_condition"] == _CF_NM
+    assert T.build_counterfactual(G, "no_such_node")["found"] is False
+
+
+def test_cf_condition_is_derived_from_the_cited_rule_not_hard_coded():
+    seen = set()
+    for rb, region, tgt in (("FORBID TRANSACTION > INR 1000\n", "<=", 1000.0), ("FORBID TRANSACTION > INR 2500\n", "<=", 2500.0), ("FORBID TRANSACTION >= INR 2500\n", "<", 2500.0), ("REQUIRE TRANSACTION >= INR 9000\n", ">=", 9000.0)):
+        G = _cf_g({"invoice_a.txt": "Invoice No: INV-1\nBilled amount INR 5,000\n"}, rb)
+        _, c = _cf_for(G, "TRANSACTION")
+        assert c["status"] == "ESTABLISHED" and c["required_condition"]["relation"] == region and c["required_condition"]["value"] == tgt
+        m = c["minimum_changes"][0]
+        assert m["minimum_delta"] == abs(5000.0 - tgt) and m["direction"] == ("decrease" if region in ("<", "<=") else "increase") and (m["target_value"] is None) == (region == "<")
+        seen.add(c["recommended_corrective_condition"])
+    assert len(seen) == 4
+    for phrase in ("manager approval", "receipt attached"):
+        _, c = _cf_for(_cf_g({"memo.txt": "notes\n"}, f'REQUIRE KEYWORD "{phrase}"\n'), "KEYWORD")
+        assert c["required_condition"]["value"] == phrase and phrase in c["missing_requirement"] and phrase in c["recommended_corrective_condition"]
+
+
+def test_cf_distinguishes_corrective_action_from_supplying_evidence():
+    _, amt = _cf_for(_cf_g({"i.txt": "Invoice No: INV-1\nBilled amount INR 5,000\n"}, "FORBID TRANSACTION > INR 1000\n"), "TRANSACTION")
+    _, miss = _cf_for(_cf_g({"m.txt": "notes\n"}, 'REQUIRE KEYWORD "manager approval"\n'), "KEYWORD")
+    _, forb = _cf_for(_cf_g({"m.txt": "paid by cash payment\n"}, 'FORBID KEYWORD "cash payment"\n'), "KEYWORD")
+    assert (amt["change_type"], miss["change_type"], forb["change_type"]) == ("CORRECTIVE_ACTION", "SUPPLY_EVIDENCE", "CORRECTIVE_ACTION")
+    assert amt["expected_resulting_state"]["state"] == "COMPLIANT_WITH_RULE" and miss["expected_resulting_state"]["state"] == "RE_EVALUATION_REQUIRED"
+    assert "does not establish" in miss["recommended_corrective_condition"]  # text presence is not proof the action happened
+    G = _cf_g({"inv_j.txt": "Invoice No: INV-1101\nPO Number: PO-1101\nVendor: Boreal Metals\nBilled amount INR 20,000\n", "po_j.txt": "Purchase Order No: PO-1101\nVendor: Boreal Metals\nOrder value INR 12,000\n"}, "Transaction amounts must match.\n")
+    _, cond = _cf_for(G, "amounts must match")
+    assert G.nodes[cond["decision_id"]]["verdict"] == "INCONCLUSIVE" and cond["scope_class"] == "CONDITIONAL" and cond["change_type"] == "SUPPLY_EVIDENCE"
+    assert cond["minimum_changes"][0]["kind"] == "link_evidence" and "amount_change" not in str(cond["minimum_changes"])  # no amount is changed: only linking evidence is missing
+    assert cond["expected_resulting_state"]["expected_verdict"] == _CF_NM  # the outcome depends on the supplied evidence: not promised
+
+
+def test_cf_unresolved_never_invents_a_counterfactual():
+    G = _cf_g({"inv_p.txt": "Invoice No: INV-1\nBilled amount INR 5,000\n"}, "Vendors should behave reasonably in spirit.\n")
+    _, c = _cf_for(G, "Vendors should")
+    assert c["status"] == "UNRESOLVED" and c["scope_class"] == "CONDITIONAL" and c["unresolved_reason"] and c["minimum_changes"] == [] and c["change_type"] is None
+    assert [c[k] for k in ("missing_requirement", "recommended_corrective_condition", "expected_resulting_state")] == [_CF_NM] * 3 and c["violated_rule"]["rule_id"] and T.validate_counterfactual(G, c) == []
+    G = _cf_g({"inv_n.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 800\n", "po_n.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}, "FORBID TRANSACTION > INR 100000\n")
+    fs = T.build_finding_counterfactuals(G)
+    v = next(f for f in fs if f["current_decision"]["field"] == "vendor")
+    assert v["status"] == "UNRESOLVED" and "vendor" in v["unresolved_reason"] and v["violated_rule"] == _CF_NM and v["evidence_causing_violation"] and T.validate_counterfactual(G, v) == []
+    bad = dict(c, status="UNRESOLVED", unresolved_reason=None)
+    assert any("unresolved_reason" in p for p in T.validate_counterfactual(G, bad))
+    assert any("PolicyRule" in p for p in T.validate_counterfactual(G, dict(c, status="ESTABLISHED", change_type="SUPPLY_EVIDENCE", violated_rule={"rule_id": "nope"})))
+
+
+def test_cf_contradiction_context_and_amount_finding_use_the_amounts_rule():
+    docs = {"inv_l.txt": CON_INV, "po_l.txt": CON_PO}
+    G = _cf_g(docs, "FORBID TRANSACTION > INR 15000\n")
+    _, c = _cf_for(G, "FORBID TRANSACTION")
+    ctx = [x for x in c["contradiction_context"] if x["field"] == "amount"]
+    assert c["status"] == "ESTABLISHED" and ctx and ctx[0]["category"] == "MAJOR_CONTRADICTION" and ctx[0]["other_side_amounts"] == [12000.0] and ctx[0]["other_side_satisfies_rule"] is True
+    assert c["minimum_changes"][0]["target_value"] == 15000.0  # the minimum change is still the rule boundary, not the other document's value
+    G = _cf_g(docs, "Transaction amounts must match.\n")
+    f = next(x for x in T.build_finding_counterfactuals(G) if x["current_decision"]["field"] == "amount")
+    rule = G.nodes[f["violated_rule"]["rule_id"]]
+    assert f["status"] == "ESTABLISHED" and f["change_type"] == "CORRECTIVE_ACTION" and "amounts must match" in rule["condition"] and f["minimum_changes"][0]["minimum_delta"] == 8000.0 and f["minimum_changes"][0]["authoritative_record"] == _CF_NM
+    assert f["current_decision"]["finding_id"] == next(x["finding_id"] for x in G.graph["contradiction_findings"] if x["field"] == "amount" and x["category"] == "MAJOR_CONTRADICTION") and T.validate_counterfactual(G, f) == []
+    G = _cf_g(docs, "FORBID TRANSACTION > INR 99999\n")  # same contradiction, but no rule governs amount agreement
+    assert next(x for x in T.build_finding_counterfactuals(G) if x["current_decision"]["field"] == "amount")["status"] == "UNRESOLVED"
+
+
+def test_cf_preserves_evidence_document_rule_ids_and_provenance():
+    G = _cf_g({"invoice_cf.txt": "Invoice No: INV-1\nBilled amount INR 5,000\n"}, "FORBID TRANSACTION > INR 1000\n")
+    d, c = _cf_for(G, "TRANSACTION")
+    doc = _doc(G, "invoice_cf.txt")
+    assert [r["evidence_id"] for r in c["evidence_causing_violation"]] == list(G.nodes[d]["evidence_used"])  # exactly the evidence the Decision used
+    for r in c["evidence_causing_violation"]:
+        assert G.nodes[r["evidence_id"]]["type"] == "Evidence" and r["document_id"] == doc and r["filename"] == "invoice_cf.txt" and r["location"]
+        assert r["provenance"] == json.loads(json.dumps(G.nodes[r["evidence_id"]]["provenance"], default=str))
+    assert c["minimum_changes"][0]["evidence_ids"] == list(G.nodes[d]["evidence_used"]) and c["violated_rule"]["rule_id"] == G.nodes[d]["rule_id"] and c["decision_id"] == d
+    assert c["violated_rule"]["source_location"] == G.nodes[G.nodes[d]["rule_id"]].get("source_location")
+    G = _cf_g({"empty_k.txt": "", "memo_k.txt": "Meeting notes\n"}, 'REQUIRE KEYWORD "approval"\n')
+    _, g = _cf_for(G, "KEYWORD")
+    assert g["status"] == "ESTABLISHED" and [(r["evidence_id"], r["document_id"], r["filename"]) for r in g["evidence_causing_violation"]] == [(None, _doc(G, "empty_k.txt"), "empty_k.txt")]
+    assert T.validate_counterfactual(G, g) == []
+
+
+def test_cf_is_read_only_deterministic_and_idempotent():
+    G = _cf_g({"inv_l.txt": CON_INV, "po_l.txt": CON_PO, "memo.txt": "notes\n"}, 'FORBID TRANSACTION > INR 15000\nREQUIRE KEYWORD "manager approval"\nTransaction amounts must match.\n')
+    snap = lambda: (T._sv7d_snapshot(G), {n: (x["verdict"], x.get("rationale")) for n, x in G.nodes(data=True) if x.get("type") == "Decision"}, json.dumps(T.verify_policy_applicability_results(G), sort_keys=True, default=str))
+    before = snap()
+    a = json.dumps([T.build_counterfactuals(G), T.build_finding_counterfactuals(G)], sort_keys=True, default=str)
+    b = json.dumps([T.build_counterfactuals(G), T.build_finding_counterfactuals(G)], sort_keys=True, default=str)
+    assert a == b and snap() == before
+    T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_pos_amount_over_limit")])
+    assert snap() == before
+
+
+def test_cfb_labels_are_valid_cover_required_categories_and_validator_catches_inconsistency():
+    assert T.validate_counterfactual_benchmark() == []
+    cases = T.COUNTERFACTUAL_BENCHMARK
+    assert len({c["case_id"] for c in cases}) == len(cases) and set(T.CFB_CATEGORIES) <= {c["category"] for c in cases}
+    assert {"ESTABLISHED", "UNRESOLVED", "NOT_REQUIRED"} == {c["expected_status"] for c in cases} and {"CORRECTIVE_ACTION", "SUPPLY_EVIDENCE"} <= {c["expected_change_type"] for c in cases}
+    assert {c["expected_decision"] for c in cases} >= {"VIOLATION", "INCONCLUSIVE", "UNEVALUATED", "SATISFIED", "NOT_APPLICABLE"} and {c["target_kind"] for c in cases} == {"decision", "finding"}
+    a = _cfb_case_by_id("cfb_pos_amount_over_limit"); a["expected_change_type"] = None
+    assert T.validate_counterfactual_benchmark([a], require_coverage=False)
+    b = _cfb_case_by_id("cfb_pos_amount_over_limit"); b["expected_after_verdict"] = None
+    assert any("replay" in p for p in T.validate_counterfactual_benchmark([b], require_coverage=False))
+    c = _cfb_case_by_id("cfb_neg_satisfied"); c["expected_minimum_changes"] = [{"kind": "x"}]
+    assert T.validate_counterfactual_benchmark([c], require_coverage=False)
+    assert any("duplicate" in p for p in T.validate_counterfactual_benchmark([_cfb_case_by_id("cfb_pos_amount_over_limit")] * 2, require_coverage=False))
+    u = _cfb_case_by_id("cfb_pos_amount_over_limit"); u["fault"] = "nope"
+    assert T.validate_counterfactual_benchmark([u], require_coverage=False)
+    assert any("not covered" in p for p in T.validate_counterfactual_benchmark([a for a in cases if a["category"] == "positive"]))
+
+
+def test_cfb_is_deterministic_and_aggregate_derives_from_records(cfb):
+    again = T.run_counterfactual_benchmark()
+    assert json.dumps(again, sort_keys=True) == json.dumps(cfb, sort_keys=True)
+    a = cfb["aggregate"]
+    assert a["benchmark"]["seed"] is None and a["benchmark"]["llm_used"] is False and a["protocol"]["llm_used"] is False and a["protocol"]["network_used"] is False and a["protocol"]["randomness"] == "none"
+    assert a == T.aggregate_counterfactual_results(cfb["records"]) and len(cfb["records"]) == len(T.COUNTERFACTUAL_BENCHMARK)
+    assert all(m in a["metrics"] for m in _CF_METRICS)
+
+
+def test_cfb_scores_every_required_dimension_against_independent_labels(cfb):
+    m = cfb["aggregate"]["metrics"]
+    for k in ("counterfactual_validity", "policy_consistency", "evidence_grounding", "minimum_change_accuracy", "status_accuracy", "change_type_accuracy", "contract_validity"):
+        assert m[k]["value"] == 1.0 and m[k]["denominator"] > 0 and m[k]["numerator"] == m[k]["denominator"], k
+    assert m["invented_counterfactual_rate"]["value"] == 0.0 and m["invented_counterfactual_rate"]["denominator"] > 0  # a MEASURED 0.0
+    for r in cfb["records"]:  # labels are read from the case, predictions from the system: a wrong label must show up as a miss
+        assert r["expected_status"] == next(c["expected_status"] for c in T.COUNTERFACTUAL_BENCHMARK if c["case_id"] == r["case_id"]) and r["graph_unchanged"] and r["deterministic"] and r["counterfactual_id_stable"]
+        assert r["id_integrity"]["evidence_ids_in_graph"] and r["id_integrity"]["provenance_matches_graph"] and r["id_integrity"]["contract_problems"] == []
+    wrong = _cfb_case_by_id("cfb_pos_amount_over_limit"); wrong["expected_minimum_changes"] = [{"kind": "amount_change", "direction": "decrease", "boundary": 999.0, "boundary_inclusive": True, "minimum_delta": 4001.0, "target_value": 999.0}]
+    wrong["expected_required_condition"] = {"subject": "TRANSACTION", "relation": "<=", "value": 999.0, "currency": "INR"}; wrong["expected_evidence_files"] = ["other.txt"]
+    mm = T.run_counterfactual_benchmark([wrong])["aggregate"]["metrics"]
+    assert mm["minimum_change_accuracy"]["value"] == 0.0 and mm["policy_consistency"]["value"] == 0.0 and mm["evidence_grounding"]["value"] == 0.0 and mm["counterfactual_validity"]["value"] == 1.0
+    cs = _cfb_case_by_id("cfb_pos_amount_over_limit"); cs["expected_status"], cs["expected_change_type"] = "UNRESOLVED", None
+    for k in ("expected_required_condition", "expected_minimum_changes", "replay", "expected_after_verdict"): cs[k] = None
+    assert T.run_counterfactual_benchmark([cs])["aggregate"]["metrics"]["invented_counterfactual_rate"]["value"] == 1.0  # an invented counterfactual is caught
+
+
+def test_cfb_replay_validity_is_checked_by_re_evaluating_the_applied_counterfactual(cfb):
+    for cid in ("cfb_pos_amount_over_limit", "cfb_pos_exclusive_boundary", "cfb_pos_two_amounts", "cfb_pos_missing_manager_approval", "cfb_pos_forbidden_phrase", "cfb_pos_linked_amount_mismatch", "cfb_contradiction_decision"):
+        r = _cfb_rec(cfb, cid)
+        assert r["replay_expected_verdict"] == "SATISFIED" and r["replay_verdict"] == "SATISFIED", cid
+    ex = _cfb_rec(cfb, "cfb_pos_exclusive_boundary")  # the boundary itself is non-compliant: no exact minimum value, only a strict bound
+    assert ex["predicted_minimum_changes"][0]["target_value"] is None and ex["predicted_minimum_changes"][0]["delta_is_strict_lower_bound"] is True
+    case = _cfb_case_by_id("cfb_pos_amount_over_limit")  # a counterfactual that does NOT restore compliance is detected as invalid
+    pred = {"minimum_changes": [{"boundary": 1000.0, "boundary_inclusive": True}]}
+    docs = T._cfb_replay_docs(case, pred); docs["inv_a.txt"] = case["documents"]["inv_a.txt"].replace("5,000", "2,000")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        G = T._cfb_build(docs, case["rulebook"], td)
+    assert next(x["verdict"] for n, x in G.nodes(data=True) if x.get("type") == "Decision") == "VIOLATION"
+
+
+def test_cfb_not_measured_is_distinct_from_measured_zero(cfb):
+    only_est = T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_pos_amount_over_limit")])["aggregate"]["metrics"]
+    assert only_est["invented_counterfactual_rate"]["value"] == _CF_NM and only_est["invented_counterfactual_rate"]["denominator"] == 0 and only_est["invented_counterfactual_rate"]["numerator"] is None
+    only_neg = T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_neg_satisfied")])["aggregate"]["metrics"]
+    assert all(only_neg[k]["value"] == _CF_NM for k in ("counterfactual_validity", "policy_consistency", "minimum_change_accuracy", "change_type_accuracy", "contract_validity"))
+    assert only_neg["status_accuracy"]["value"] == 1.0 and only_neg["invented_counterfactual_rate"]["value"] == 0.0
+    noreplay = T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_cond_unlinked_records")])["aggregate"]["metrics"]
+    assert noreplay["counterfactual_validity"]["value"] == _CF_NM and noreplay["minimum_change_accuracy"]["value"] == 1.0
+    assert _cfb_rec(cfb, "cfb_cond_unlinked_records")["replay_verdict"] == _CF_NM
+
+
+def test_cfb_no_valid_counterfactual_cases_are_unresolved_with_reasons(cfb):
+    for cid, why in (("cfb_contradiction_vendor_no_policy", "vendor"), ("cfb_contradiction_date_no_policy", "date"), ("cfb_ambiguous_free_text_rule", "never evaluated"), ("cfb_ambiguous_govid_unconfigured", "never evaluated"),
+                     ("cfb_unsupported_violation", "FAILED"), ("cfb_inapplicable_rule", "MISMATCH")):
+        r = _cfb_rec(cfb, cid)
+        assert r["predicted_status"] == "UNRESOLVED" and r["predicted_change_type"] is None and r["predicted_minimum_changes"] == [] and why in r["unresolved_reason"], cid
+    assert _cfb_rec(cfb, "cfb_neg_satisfied")["predicted_status"] == "NOT_REQUIRED" and _cfb_rec(cfb, "cfb_neg_not_applicable")["predicted_status"] == "NOT_REQUIRED"
+    assert _cfb_rec(cfb, "cfb_contradiction_amount_finding")["target_kind"] == "finding"
+
+
+def test_cfb_preserves_stable_evidence_and_rule_references_and_provenance(cfb):
+    import re as _re
+    blob = json.dumps(cfb["records"])
+    assert not _re.search(r"\b[a-z]+_[0-9a-f]{16}\b", blob)
+    r = _cfb_rec(cfb, "cfb_pos_amount_over_limit")
+    assert r["evidence_refs"] and all(x["evidence_alias"].startswith("E") and x["filename"] == "inv_a.txt" and x["location"] and x["provenance"]["source_text_sha256"] and x["provenance"]["file"] == "inv_a.txt" and "source_document_id" not in x["provenance"] for x in r["evidence_refs"])
+    assert r["rule_condition"] == "FORBID TRANSACTION > INR 1000" and r["rule_source_location"] and r["rule_referenced"] and r["rule_is_target"]
+    ctx = _cfb_rec(cfb, "cfb_contradiction_decision")["contradiction_context"]
+    assert ctx and ctx[0]["category"] == "MAJOR_CONTRADICTION" and ctx[0]["other_side_satisfies_rule"] is True
+
+
+def test_cfb_writes_json_only_when_asked_and_never_mutates_a_caller_graph(tmp_path):
+    p = tmp_path / "cfb.json"
+    T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_pos_amount_over_limit")])
+    assert not p.exists()
+    out = T.run_counterfactual_benchmark([_cfb_case_by_id("cfb_pos_amount_over_limit")], output_path=str(p))
+    assert json.loads(p.read_text(encoding="utf-8")) == json.loads(json.dumps(out))
+    G = _cf_g({"invoice_k.txt": CON_INV, "po_k.txt": CON_PO}, "FORBID TRANSACTION > INR 15000\n")
+    before = T._sv7d_snapshot(G)
+    T.run_counterfactual_benchmark()
+    assert T._sv7d_snapshot(G) == before
+    case = _cfb_case_by_id("cfb_pos_amount_over_limit")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        Gp = T._cfb_build(case["documents"], case["rulebook"], td)
+    b2 = T._sv7d_snapshot(Gp); T._cfb_record(case, Gp, "unused")
+    assert T._sv7d_snapshot(Gp) == b2
+
+
+# 20 ---- counterfactual hardening (Phase 8B): edge cases of the existing layer; nothing here changes a decision, verification result, finding or the graph
+_CF_INV5 = "Invoice No: INV-1\nBilled amount INR 5,000\n"
+_CF_UNLINKED = {"i_u.txt": "Invoice No: INV-1\nVendor: A\nBilled amount INR 100\n", "r_u.txt": "Receipt\nVendor: B\nPaid amount INR 100\n"}
+
+
+def _cf_only(G):
+    return next(c for c in T.build_counterfactuals(G))
+
+
+def _cf_fault(fault, rulebook="FORBID TRANSACTION > INR 1000\n"):
+    G = _cf_g({"i_f.txt": _CF_INV5}, rulebook)
+    d = next(n for n, x in G.nodes(data=True) if x.get("type") == "Decision")
+    T._sv7d_apply_fault(G, d, fault)
+    return G, T.build_counterfactual(G, d)
+
+
+def _cf_is_unresolved(G, c):
+    assert c["status"] == "UNRESOLVED" and c["change_type"] is None and c["unresolved_reason"] and c["minimum_changes"] == [] and c["requires_reevaluation"] is False
+    assert [c[k] for k in ("missing_requirement", "recommended_corrective_condition", "expected_resulting_state")] == [_CF_NM] * 3 and T.validate_counterfactual(G, c) == []
+
+
+def test_cf8b_missing_evidence_supplies_evidence_and_never_asserts_satisfaction():
+    G = _cf_g({"m_e.txt": "notes\n"}, 'REQUIRE KEYWORD "manager approval"\n')
+    c = _cf_only(G)
+    assert c["status"] == "ESTABLISHED" and c["change_type"] == "SUPPLY_EVIDENCE" and c["satisfaction_asserted"] is False and c["requires_reevaluation"] is True
+    assert c["expected_resulting_state"]["state"] == "RE_EVALUATION_REQUIRED" and c["violated_rule"]["rule_id"] == G.nodes[c["decision_id"]]["rule_id"] and T.validate_counterfactual(G, c) == []
+    assert [r["evidence_id"] for r in c["evidence_causing_violation"]] == list(G.nodes[c["decision_id"]]["absence_scope_evidence_ids"])
+    G = _cf_g({"empty_e.txt": "", "memo_e.txt": "notes\n"}, 'REQUIRE KEYWORD "approval"\n')  # extraction gap: INCONCLUSIVE, the document (not an invented fact) is what is missing
+    c = _cf_only(G)
+    assert c["scope_class"] == "CONDITIONAL" and c["change_type"] == "SUPPLY_EVIDENCE" and c["expected_resulting_state"]["expected_verdict"] == _CF_NM and c["satisfaction_asserted"] is False
+    bad = dict(c, expected_resulting_state={"state": "COMPLIANT_WITH_RULE"})  # a forged "supplying evidence proves compliance" result is rejected
+    assert any("not proof" in p for p in T.validate_counterfactual(G, bad))
+    assert any("satisfaction" in p for p in T.validate_counterfactual(G, dict(c, satisfaction_asserted=True)))
+
+
+def test_cf8b_contradicting_evidence_is_reported_without_changing_the_counterfactual():
+    G = _cf_g({"inv_c.txt": CON_INV, "po_c.txt": CON_PO}, "FORBID TRANSACTION > INR 15000\n")
+    c = _cf_only(G)
+    fid = next(x["finding_id"] for x in G.graph["contradiction_findings"] if x["field"] == "amount" and x["category"] == "MAJOR_CONTRADICTION")
+    ec = c["evidence_conflict"]
+    assert c["status"] == "ESTABLISHED" and c["change_type"] == "CORRECTIVE_ACTION" and c["minimum_changes"][0]["target_value"] == 15000.0  # proposed change itself is unchanged
+    assert ec["status"] == "UNRESOLVED_CONTRADICTION" and fid in ec["finding_ids"] and ec["note"]
+    assert all(G.nodes[e]["type"] == "Evidence" for e in ec["evidence_ids"]) and [r["evidence_id"] for r in ec["evidence"]] == ec["evidence_ids"]
+    assert all(r["provenance"] == json.loads(json.dumps(G.nodes[r["evidence_id"]]["provenance"], default=str)) for r in ec["evidence"])
+    assert _cf_only(_cf_g({"i_n.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n"))["evidence_conflict"]["status"] == "NONE"
+    f = next(x for x in T.build_finding_counterfactuals(_cf_g({"inv_c.txt": CON_INV, "po_c.txt": CON_PO}, "Transaction amounts must match.\n")) if x["current_decision"]["field"] == "amount")
+    assert f["evidence_conflict"]["status"] == "SUBJECT_OF_COUNTERFACTUAL" and f["requires_reevaluation"] is True and f["satisfaction_asserted"] is False
+
+
+def test_cf8b_failed_self_verification_is_unresolved_but_escalation_alone_is_not():
+    for fault in ("evidence_text_5000_to_500", "remove_support", "heuristic_support"):
+        G, c = _cf_fault(fault)
+        assert c["verification"]["verification_status"] == "FAILED" and "self-verification FAILED" in c["unresolved_reason"]
+        _cf_is_unresolved(G, c)
+    G, c = _cf_fault("weak_location")  # ESCALATE (weak grounding) is not FAILED: the grounded violation still yields a counterfactual, evidence IDs intact
+    assert c["verification"]["verification_status"] == "ESCALATE" and c["status"] == "ESTABLISHED" and all(r["evidence_id"] for r in c["evidence_causing_violation"])
+
+
+def test_cf8b_failed_policy_applicability_is_unresolved_for_mismatch_unestablished_and_inconclusive():
+    for fault in ("rule_condition_9000", "wrong_scope"):
+        G, c = _cf_fault(fault)
+        assert c["verification"]["policy_applicability"] == "MISMATCH"; _cf_is_unresolved(G, c)
+    G, c = _cf_fault("basis_amount_none")
+    assert c["verification"]["policy_applicability"] == "UNESTABLISHED"; _cf_is_unresolved(G, c)
+    G = _cf_g({"i_s.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n")  # Decision with no recorded policy scope: applicability cannot be established
+    d = next(n for n, x in G.nodes(data=True) if x.get("type") == "Decision")
+    for u, v, k, e in list(G.out_edges(d, keys=True, data=True)):
+        if e.get("relation") == "BELONGS_TO": G.remove_edge(u, v, k)
+    c = T.build_counterfactual(G, d)
+    assert c["verification"]["policy_applicability"] == "UNESTABLISHED"; _cf_is_unresolved(G, c)
+    G = _cf_g(_CF_UNLINKED, "Transaction amounts must match.\n")  # INCONCLUSIVE is not covered by applicability verification: the rule text itself must still match the stored spec
+    c = _cf_only(G)
+    assert c["current_decision"]["verdict"] == "INCONCLUSIVE" and c["status"] == "ESTABLISHED" and c["change_type"] == "SUPPLY_EVIDENCE"
+    G.nodes[c["violated_rule"]["rule_id"]]["condition"] = "Vendors should behave in spirit."
+    c = T.build_counterfactual(G, c["decision_id"])
+    assert "no longer parses" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+
+
+def test_cf8b_unsupported_free_text_rule_is_unresolved_and_cannot_be_forged_as_established():
+    G = _cf_g({"i_t.txt": _CF_INV5}, "Vendors should behave reasonably in spirit.\n")
+    c = _cf_only(G)
+    assert c["current_decision"]["verdict"] == "UNEVALUATED" and c["violated_rule"]["rule_id"]; _cf_is_unresolved(G, c)
+    G = _cf_g({"i_t.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n")
+    est = _cf_only(G)
+    G.nodes[est["violated_rule"]["rule_id"]]["condition"] = "Vendors should behave reasonably in spirit."
+    assert any("supported rule form" in p for p in T.validate_counterfactual(G, est))
+
+
+def test_cf8b_amount_boundaries_follow_the_rule_operator_exactly():
+    for rb, amt, status, region, strict in (("FORBID TRANSACTION > INR 5000\n", "5,000", "NOT_REQUIRED", None, None), ("FORBID TRANSACTION >= INR 5000\n", "5,000", "ESTABLISHED", "<", True),
+                                            ("REQUIRE TRANSACTION > INR 5000\n", "5,000", "ESTABLISHED", ">", True), ("REQUIRE TRANSACTION >= INR 5000\n", "4,999", "ESTABLISHED", ">=", False),
+                                            ("FORBID TRANSACTION < INR 5000\n", "4,999", "ESTABLISHED", ">=", False)):
+        G = _cf_g({"i_b.txt": f"Invoice No: INV-1\nBilled amount INR {amt}\n"}, rb)
+        d = next(n for n, x in G.nodes(data=True) if x.get("type") == "Decision")
+        c = T.build_counterfactual(G, d)
+        assert c["status"] == status, rb
+        if region is None: assert c["in_scope"] is False and c["current_decision"]["verdict"] == "SATISFIED"; continue  # the boundary value itself is compliant: nothing to correct
+        m = c["minimum_changes"][0]
+        assert c["required_condition"]["relation"] == region and m["delta_is_strict_lower_bound"] is strict and (m["target_value"] is None) == strict and m["boundary"] == 5000.0 and c["satisfaction_asserted"] is False
+        assert T.validate_counterfactual(G, c) == []
+
+
+def test_cf8b_change_types_are_not_interchangeable():
+    amt = _cf_only(_cf_g({"i_k.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n"))
+    miss = _cf_only(_cf_g({"m_k.txt": "notes\n"}, 'REQUIRE KEYWORD "manager approval"\n'))
+    forb = _cf_only(_cf_g({"m_k.txt": "paid by cash payment\n"}, 'FORBID KEYWORD "cash payment"\n'))
+    link = _cf_only(_cf_g(_CF_UNLINKED, "Transaction amounts must match.\n"))
+    assert [c["change_type"] for c in (amt, forb, miss, link)] == ["CORRECTIVE_ACTION", "CORRECTIVE_ACTION", "SUPPLY_EVIDENCE", "SUPPLY_EVIDENCE"]
+    assert all(m["kind"] not in ("amount_change", "phrase_removal") for c in (miss, link) for m in c["minimum_changes"]) and all(m["kind"] in ("amount_change", "phrase_removal") for c in (amt, forb) for m in c["minimum_changes"])
+
+
+def test_cf8b_no_policy_supported_minimum_change_stays_unresolved(monkeypatch):
+    G = _cf_g({"g_u.txt": "Aadhaar 2345 6789 0124\n"}, "FORBID GOVID VALID\n")
+    for c in T.build_counterfactuals(G): _cf_is_unresolved(G, c)
+    G = _cf_g({"i_m.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n")
+    monkeypatch.setattr(T, "_cf_transaction", lambda *a, **k: {"change_type": "CORRECTIVE_ACTION", "required_condition": {"subject": "TRANSACTION", "relation": "<=", "value": 1000.0, "currency": None}, "minimum_changes": [], "missing_requirement": "x", "recommended": "x", "resulting": {"state": "COMPLIANT_WITH_RULE"}})
+    c = _cf_only(G)
+    assert "no policy-supported minimum change" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+    assert any("minimum change" in p for p in T.validate_counterfactual(G, dict(c, status="ESTABLISHED", change_type="CORRECTIVE_ACTION", missing_requirement="x", recommended_corrective_condition="x", expected_resulting_state={"state": "x"}, evidence_causing_violation=[{"evidence_id": None, "document_id": None}])))
+
+
+def test_cf8b_scenarios_are_read_only_and_idempotent():
+    for docs, rb in (({"inv_c.txt": CON_INV, "po_c.txt": CON_PO, "m.txt": "notes\n"}, 'FORBID TRANSACTION > INR 15000\nREQUIRE KEYWORD "manager approval"\nTransaction amounts must match.\nVendors should behave in spirit.\n'), (_CF_UNLINKED, "Transaction amounts must match.\n")):
+        G = _cf_g(docs, rb)
+        snap = lambda: (T._sv7d_snapshot(G), json.dumps(T.build_self_verification_results(G), sort_keys=True, default=str), json.dumps(G.graph.get("contradiction_findings"), sort_keys=True, default=str))
+        before = snap()
+        run = lambda: json.dumps([T.build_counterfactuals(G), T.build_finding_counterfactuals(G)], sort_keys=True, default=str)
+        assert run() == run() and snap() == before
+
+
+# 21 ---- compiled-path counterfactual (Phase 8C): ONE compiled semantic is re-derived from the STORED compiled rule (single leaf `amount <|<=|>|>= number` on a transaction entity, REQUIRE / PROHIBIT);
+# everything else stays UNRESOLVED. Offline: only the LLM compiler and the external rule_engine call are stubbed (same technique as _fake_compiled); the graph, Decisions, verification layers and counterfactual layer are the real ones.
+_CC_CMP = {">": lambda a, b: a > b, ">=": lambda a, b: a >= b, "<": lambda a, b: a < b, "<=": lambda a, b: a <= b}
+_CC_NEG = {">": "<=", ">=": "<", "<": ">=", "<=": ">"}
+_CC_ORIG_EVAL = T.evaluate_policy_rules  # captured before any test patches it
+_CC_AMT = 5000.0  # the single transaction in _CF_INV5 (INR 5,000); the rulebook limits below are policy amounts, not transactions
+# (rule_type, operator, limit, free-text rule line). The legacy DSL cannot parse these lines (UNEVALUATED): the compiled rule is the only evaluator, so parsed_spec is None on the Decision.
+_CC_CASES = (("REQUIRE", "<", 1000.0, "Each transaction must be below INR 1000."), ("REQUIRE", "<=", 1000.0, "Each transaction must be at most INR 1000."),
+             ("REQUIRE", ">", 9000.0, "Each transaction must be above INR 9000."), ("REQUIRE", ">=", 9000.0, "Each transaction must be at least INR 9000."),
+             ("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited."), ("PROHIBIT", ">=", 1000.0, "Transactions of INR 1000 or more are prohibited."),
+             ("PROHIBIT", "<", 9000.0, "Transactions below INR 9000 are prohibited."), ("PROHIBIT", "<=", 9000.0, "Transactions of INR 9000 or less are prohibited."))
+
+
+def _cc_dict(rule_type, op, value, line, unit="INR", **over):
+    """Stored shape of a compiled rule: only the keys that apply_compiled_policy, rule_engine and _cf_compiled read. test_cc_real_schema_* checks the same shape against the real CompiledRule."""
+    d = {"rule_id": "CR1", "policy_id": "P1", "status": "VALID", "rule_type": rule_type, "severity": "high", "confidence": 0.95, "entity": "transaction", "source_text": line, "ambiguities": [], "issues": [],
+         "condition": {"entity": "transaction", "field": "amount", "operator": op, "value": value, "unit": unit, "children": []}, "temporal": None, "required_evidence": [], "exception": [], "action": "review_transaction",
+         "expression": f"transaction.amount {op} {value:g}"}
+    d.update(over)
+    return d
+
+
+def _cc_stub_engine(d, verdict=None, indeterminate=None):
+    """Deterministic stand-in for rule_engine.evaluate_policy (called positionally by apply_compiled_policy): per record, REQUIRE -> COMPLIANT iff cmp holds, PROHIBIT -> VIOLATION iff cmp holds.
+    `verdict` forces one verdict for every record; `indeterminate` maps record_index -> missing facts (INDETERMINATE record)."""
+    c = d["condition"]
+    def run(rules, facts, evidence, date, inc, fx, strict):
+        out = []
+        for i, rec in enumerate(facts.get(d["entity"]) or []):
+            a = rec["amount"]["value"] if isinstance(rec["amount"], dict) else rec["amount"]
+            if verdict: v = verdict
+            else:
+                holds = _CC_CMP[c["operator"]](a, c["value"])
+                v = ("VIOLATION" if holds else "COMPLIANT") if d["rule_type"] == "PROHIBIT" else ("COMPLIANT" if holds else "VIOLATION")
+            miss = (indeterminate or {}).get(i)
+            out.append({"rule_id": d["rule_id"], "verdict": "INDETERMINATE" if miss is not None else v, "record_index": i, "severity": "high", "missing_facts": list(miss or []), "reasons": ["stub engine result"]})
+        return {"rule_results": out, "evaluation_date": None}
+    return run
+
+
+def _cc_graph(monkeypatch, d, docs=None, verdict=None, indeterminate=None):
+    cr = types.SimpleNamespace(rule_id=d["rule_id"], policy_id=d["policy_id"], status=d["status"], rule_type=_V(d["rule_type"]), severity=_V(d["severity"]), confidence=d["confidence"], expression=d["expression"],
+                               source_text=d["source_text"], ambiguities=[], issues=[], model_dump=lambda mode=None: copy.deepcopy(d))
+    res = types.SimpleNamespace(rules=[cr], status="COMPILED", policy_id=d["policy_id"], stats={}, ambiguous_policy=False, ambiguity_reasons=[], rejected=[], unparsed_statements=[])
+    monkeypatch.setattr(T, "HAS_POLICY_COMPILER", True, raising=False)
+    monkeypatch.setattr(T, "_compile_policy", lambda text, ctx, conf: res, raising=False)
+    monkeypatch.setattr(T, "_evaluate_compiled_rules", _cc_stub_engine(d, verdict, indeterminate), raising=False)
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", 0.5, raising=False)
+    orig = _CC_ORIG_EVAL  # the offline graph build skips the compile stage the Celery task runs just before evaluate_policy_rules: run it here, unchanged
+    line = d["source_text"]
+    monkeypatch.setattr(T, "evaluate_policy_rules", lambda G: (T.apply_compiled_policy(G, line + "\n"), orig(G))[1])
+    G = _graph(docs or {"inv_cc.txt": _CF_INV5}, rulebook=line + "\n")
+    dec = next(n for n, x in G.nodes(data=True) if x.get("type") == "Decision")
+    return G, dec
+
+
+def _cc_established(G, dec, op, region, limit):
+    dd, c = G.nodes[dec], T.build_counterfactual(G, dec)
+    assert dd["result_source"] == "compiled_policy_engine" and dd["parsed_spec"] is None and dd["verdict"] == "VIOLATION"  # compiled is the only evaluator: nothing legacy to lean on
+    assert c["status"] == "ESTABLISHED" and c["change_type"] == "CORRECTIVE_ACTION" and c["scope_class"] == "NON_COMPLIANT" and all(k in c for k in T.CF_FIELDS)
+    assert c["required_condition"] == {"subject": "TRANSACTION", "relation": region, "value": limit, "currency": "INR"}
+    strict = region in ("<", ">")
+    m = c["minimum_changes"][0]
+    assert len(c["minimum_changes"]) == 1 and m["kind"] == "amount_change" and m["current_value"] == _CC_AMT and m["boundary"] == limit and m["minimum_delta"] == abs(_CC_AMT - limit)
+    assert m["direction"] == ("decrease" if region in ("<", "<=") else "increase") and m["delta_is_strict_lower_bound"] is strict and m["boundary_inclusive"] is (not strict) and (m["target_value"] is None) is strict
+    assert c["satisfaction_asserted"] is False and c["requires_reevaluation"] is True and c["expected_resulting_state"]["rule_id"] == dd["rule_id"] and T.validate_counterfactual(G, c) == []
+    return c
+
+
+# 1 + 2 ---- supported semantic: REQUIRE and PROHIBIT, all four ordering operators; the compliant region and boundary inclusivity follow the stored operator exactly
+def test_cc_require_and_prohibit_amount_bounds_are_established(monkeypatch):
+    seen = set()
+    for rt, op, limit, line in _CC_CASES:
+        G, dec = _cc_graph(monkeypatch, _cc_dict(rt, op, limit, line))
+        c = _cc_established(G, dec, op, op if rt == "REQUIRE" else _CC_NEG[op], limit)  # REQUIRE: the compliant region is the condition itself; PROHIBIT: its negation
+        assert c["violated_rule"]["result_source"] == "compiled_policy_engine" and c["violated_rule"]["condition"] == line
+        seen.add((rt, op))
+    assert len(seen) == 8
+
+
+# 3 ---- boundary values: the boundary itself is compliant for an inclusive region (nothing to correct) and non-compliant for an exclusive one (strict lower bound, no target)
+def test_cc_boundary_value_is_compliant_or_non_compliant_exactly_as_the_operator_says(monkeypatch):
+    for rt, op, line in (("PROHIBIT", ">", "Transactions above INR 5000 are prohibited."), ("PROHIBIT", "<", "Transactions below INR 5000 are prohibited."),
+                         ("REQUIRE", ">=", "Each transaction must be at least INR 5000."), ("REQUIRE", "<=", "Each transaction must be at most INR 5000.")):
+        G, dec = _cc_graph(monkeypatch, _cc_dict(rt, op, 5000.0, line))  # amount == limit: rule satisfied
+        c = T.build_counterfactual(G, dec)
+        assert G.nodes[dec]["verdict"] == "SATISFIED" and G.nodes[dec]["result_source"] == "compiled_policy_engine"
+        assert c["status"] == "NOT_REQUIRED" and c["in_scope"] is False and c["change_type"] is None and c["minimum_changes"] == [] and c["required_condition"] is None
+    for rt, op, line, region in (("PROHIBIT", ">=", "Transactions of INR 5000 or more are prohibited.", "<"), ("PROHIBIT", "<=", "Transactions of INR 5000 or less are prohibited.", ">"),
+                                 ("REQUIRE", ">", "Each transaction must be above INR 5000.", ">"), ("REQUIRE", "<", "Each transaction must be below INR 5000.", "<")):
+        G, dec = _cc_graph(monkeypatch, _cc_dict(rt, op, 5000.0, line))  # amount == limit: rule violated, and the exclusive boundary is not a valid target
+        c = _cc_established(G, dec, op, region, 5000.0)
+        assert c["minimum_changes"][0]["minimum_delta"] == 0.0 and c["minimum_changes"][0]["target_value"] is None and "more than the listed minimum_delta" in c["recommended_corrective_condition"]
+
+
+# 4 ---- anything beyond the one supported semantic stays UNRESOLVED (with the unchanged compiled-rule reason)
+_CC_UNSUPPORTED = (
+    ("trigger", dict(rule_type="TRIGGER"), "ACTION_REQUIRED"),
+    ("exception", dict(exception=[{"description": "board approved", "condition": {"entity": "transaction", "field": "approved", "operator": "==", "value": True, "unit": None}}]), None),
+    ("required_evidence", dict(required_evidence=[{"type": "receipt", "mandatory": True, "min_count": 1}]), None),
+    ("temporal", dict(temporal={"kind": "within", "entity": "transaction", "field": "date", "reference": "now", "amount": 30, "unit": "days", "direction": "before"}), None),
+    ("equality", dict(condition={"entity": "transaction", "field": "amount", "operator": "==", "value": 1000.0, "unit": "INR", "children": []}), None),
+    ("membership", dict(condition={"entity": "transaction", "field": "amount", "operator": "in", "value": [1000.0, 2000.0], "unit": "INR", "children": []}), None),
+    ("other_field", dict(condition={"entity": "transaction", "field": "vendor", "operator": ">", "value": 1000.0, "unit": "INR", "children": []}), None),
+    ("group", dict(condition={"logic": "AND", "children": [{"entity": "transaction", "field": "amount", "operator": ">", "value": 1000.0, "unit": "INR", "children": []},
+                                                           {"entity": "transaction", "field": "amount", "operator": "<", "value": 9000.0, "unit": "INR", "children": []}]}), None),
+    ("other_unit", dict(condition={"entity": "transaction", "field": "amount", "operator": ">", "value": 1000.0, "unit": "USD", "children": []}), None),
+    ("non_currency_unit", dict(condition={"entity": "transaction", "field": "amount", "operator": ">", "value": 1000.0, "unit": "days", "children": []}), None),
+    ("non_numeric_value", dict(condition={"entity": "transaction", "field": "amount", "operator": ">", "value": "1000", "unit": "INR", "children": []}), None))
+
+
+def test_cc_unsupported_compiled_semantics_stay_unresolved(monkeypatch):
+    for name, over, verdict in _CC_UNSUPPORTED:
+        over = dict(over); rt = over.pop("rule_type", "PROHIBIT")
+        d = _cc_dict(rt, ">", 1000.0, "Transactions above INR 1000 are prohibited.", **over)
+        G, dec = _cc_graph(monkeypatch, d, verdict=verdict or "VIOLATION")
+        c = T.build_counterfactual(G, dec)
+        assert G.nodes[dec]["result_source"] == "compiled_policy_engine", name
+        assert c["in_scope"] is True and "compiled-rule Decision: its expression semantics are not re-derived" in c["unresolved_reason"], name
+        _cf_is_unresolved(G, c)
+    d = _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.", status="NEEDS_REVIEW", ambiguities=["vague"])  # NEEDS_REVIEW is never executed: the rule line stays UNEVALUATED
+    G, dec = _cc_graph(monkeypatch, d)
+    c = T.build_counterfactual(G, dec)
+    assert G.nodes[dec]["verdict"] == "UNEVALUATED" and "never evaluated" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+
+
+# 5 ---- missing compiled facts / evidence / stored rule: nothing is guessed
+def test_cc_missing_compiled_facts_or_evidence_are_unresolved(monkeypatch):
+    two = {"inv_cc1.txt": _CF_INV5, "inv_cc2.txt": "Invoice No: INV-2\nBilled amount INR 7,000\n"}
+    d = _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.")
+    G, dec = _cc_graph(monkeypatch, d, docs=two, indeterminate={1: ["transaction.amount.unit"]})  # one record is violating, another could not be evaluated: facts missing
+    dd, c = G.nodes[dec], T.build_counterfactual(G, dec)
+    assert dd["verdict"] == "VIOLATION" and dd["compiled_missing_facts"] == ["transaction.amount.unit"] and c["verification"]["policy_applicability"] == "UNESTABLISHED"
+    assert "UNESTABLISHED" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.", required_evidence=[{"type": "receipt", "mandatory": True, "min_count": 1}]),
+                       indeterminate={0: []})  # the rule needs evidence and the pipeline supplies none: the engine answers INDETERMINATE, which is no premise
+    c = T.build_counterfactual(G, dec)
+    assert G.nodes[dec]["verdict"] == "UNEVALUATED" and c["status"] == "UNRESOLVED"; _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, d)
+    del G.nodes[G.nodes[dec]["rule_id"]]["compiled_rules"]  # the stored compiled rule is gone: it is not re-derived from rule text
+    c = T.build_counterfactual(G, dec)
+    assert c["status"] == "UNRESOLVED" and "compiled-rule Decision" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, d)
+    G.nodes[G.nodes[dec]["rule_id"]]["compiled_rules"].append(copy.deepcopy(G.nodes[G.nodes[dec]["rule_id"]]["compiled_rules"][0]))  # two compiled rules on one rule line: the Decision cannot be attributed to one
+    c = T.build_counterfactual(G, dec)
+    assert c["status"] == "UNRESOLVED"; _cf_is_unresolved(G, c)
+
+
+# 6 + 7 + 8 ---- every existing 8A-8B gate still applies to the compiled path
+def test_cc_policy_applicability_mismatch_is_unresolved(monkeypatch):
+    d = _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.")
+    G, dec = _cc_graph(monkeypatch, d)
+    assert T.build_counterfactual(G, dec)["status"] == "ESTABLISHED"  # baseline: same graph, no fault
+    G.nodes[dec]["compiled_rules"][0]["source_text"] = "Employees must wear badges."  # the compiled clause no longer maps to the cited rule text
+    c = T.build_counterfactual(G, dec)
+    assert c["verification"]["policy_applicability"] == "MISMATCH" and "policy applicability MISMATCH" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, d)
+    G.nodes[G.nodes[dec]["rule_id"]]["source_location"] = "rulebook.txt:line 99"  # Decision and rule node disagree on where the rule comes from
+    c = T.build_counterfactual(G, dec)
+    assert c["verification"]["policy_applicability"] == "MISMATCH" and "policy applicability MISMATCH" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+
+
+def test_cc_policy_applicability_unestablished_is_unresolved(monkeypatch):
+    d = _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.")
+    G, dec = _cc_graph(monkeypatch, d)
+    for u, v, k, e in list(G.out_edges(dec, keys=True, data=True)):
+        if e.get("relation") == "BELONGS_TO": G.remove_edge(u, v, k)  # no recorded policy scope: applicability cannot be established
+    c = T.build_counterfactual(G, dec)
+    assert c["verification"]["policy_applicability"] == "UNESTABLISHED" and "policy applicability UNESTABLISHED" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, d)
+    G.nodes[dec]["compiled_missing_facts"] = ["transaction.amount.unit"]  # the compiled evaluation recorded a missing fact
+    c = T.build_counterfactual(G, dec)
+    assert c["verification"]["policy_applicability"] == "UNESTABLISHED" and "policy applicability UNESTABLISHED" in c["unresolved_reason"]; _cf_is_unresolved(G, c)
+
+
+def test_cc_failed_self_verification_is_unresolved_but_escalation_alone_is_not(monkeypatch):
+    d = _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited.")
+    for fault in ("evidence_text_5000_to_500", "remove_support", "heuristic_support"):
+        G, dec = _cc_graph(monkeypatch, d)
+        T._sv7d_apply_fault(G, dec, fault)
+        c = T.build_counterfactual(G, dec)
+        assert c["verification"]["verification_status"] == "FAILED" and "self-verification FAILED" in c["unresolved_reason"], fault
+        _cf_is_unresolved(G, c)
+    G, dec = _cc_graph(monkeypatch, d)
+    T._sv7d_apply_fault(G, dec, "weak_location")  # ESCALATE (weak grounding) is not FAILED: the grounded violation still yields a counterfactual
+    c = T.build_counterfactual(G, dec)
+    assert c["verification"]["verification_status"] == "ESCALATE" and c["status"] == "ESTABLISHED" and c["change_type"] == "CORRECTIVE_ACTION"
+
+
+# 9 ---- rule / evidence IDs and provenance come straight from the stored Decision, rule node and Evidence nodes
+def test_cc_preserves_rule_evidence_ids_and_provenance(monkeypatch):
+    G, dec = _cc_graph(monkeypatch, _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited."))
+    dd, c = G.nodes[dec], T.build_counterfactual(G, dec)
+    rid = dd["rule_id"]; rn = G.nodes[rid]
+    j = lambda x: json.loads(json.dumps(x, default=str))
+    vr = c["violated_rule"]
+    assert c["decision_id"] == dec and c["counterfactual_id"] == f"cf::{dec}" and vr["rule_id"] == rid and vr["condition"] == rn["condition"] and vr["source_file"] == rn.get("source_file") and vr["source_location"] == rn.get("source_location")
+    assert vr["result_source"] == "compiled_policy_engine" and vr["rulebook_provenance"] == j(dd["rulebook_provenance"]) and vr["rulebook_provenance"]["compiled_source_spans"] == [e["source_span"] for e in rn["compiled_rules"]]
+    assert vr["policy_ids"] == sorted(v for _, v, e in G.out_edges(rid, data=True) if e.get("relation") == "BELONGS_TO") and vr["policy_ids"]
+    refs = c["evidence_causing_violation"]
+    assert refs and [r["evidence_id"] for r in refs] == list(dd["evidence_used"]) and all(G.nodes[r["evidence_id"]]["type"] == "Evidence" for r in refs)
+    for r in refs:
+        assert r["provenance"] == j(G.nodes[r["evidence_id"]]["provenance"]) and r["document_id"] in {x["document_id"] for x in T._evidence_source_docs(G, r["evidence_id"])} and r["filename"] == "inv_cc.txt"
+    ch = c["minimum_changes"][0]
+    assert ch["transaction_id"] in dd["basis_node_ids"] and ch["evidence_ids"] == list(dd["evidence_used"]) and c["current_decision"]["rule_id"] == rid and c["current_decision"]["result_source"] == "compiled_policy_engine"
+    assert T.validate_counterfactual(G, c) == []
+    ghost = dict(c, evidence_causing_violation=[dict(refs[0], evidence_id="ev_does_not_exist")])  # an invented evidence ID is still rejected for a compiled-rule counterfactual
+    assert any("not in graph" in p for p in T.validate_counterfactual(G, ghost))
+    assert any("existing PolicyRule" in p for p in T.validate_counterfactual(G, dict(c, violated_rule=dict(vr, rule_id="rule_does_not_exist"))))
+
+
+# 10 ---- read-only, deterministic, idempotent
+def test_cc_is_read_only_deterministic_and_idempotent(monkeypatch):
+    two = {"inv_cc1.txt": _CF_INV5, "inv_cc2.txt": "Invoice No: INV-2\nBilled amount INR 7,000\n"}
+    G, dec = _cc_graph(monkeypatch, _cc_dict("PROHIBIT", ">", 1000.0, "Transactions above INR 1000 are prohibited."), docs=two)
+    snap = lambda: (T._sv7d_snapshot(G), _pa_snap(G), json.dumps(G.graph.get("contradiction_findings"), sort_keys=True, default=str))
+    run = lambda: json.dumps([T.build_counterfactual(G, dec), T.build_counterfactuals(G), T.build_finding_counterfactuals(G)], sort_keys=True, default=str)
+    before = snap(); a = run(); mid = snap(); b = run()
+    assert a == b and before == mid == snap()
+    cfs = T.build_counterfactuals(G)
+    assert cfs and cfs[0]["status"] == "ESTABLISHED" and len(cfs[0]["minimum_changes"]) == 2 and [x["decision_id"] for x in cfs] == sorted(x["decision_id"] for x in cfs)
+
+
+# 11 ---- legacy (non-compiled) behaviour is unchanged
+def test_cc_legacy_counterfactuals_are_unchanged(monkeypatch):
+    def boom(*a, **k): raise AssertionError("_cf_compiled must not be consulted for a legacy Decision")
+    monkeypatch.setattr(T, "_cf_compiled", boom, raising=False)
+    G = _cf_g({"i_l.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n")
+    d, c = _cf_for(G, "TRANSACTION")
+    dd = G.nodes[d]
+    assert dd["result_source"] == "deterministic_policy_engine" and dd["parsed_spec"] and c["status"] == "ESTABLISHED" and c["change_type"] == "CORRECTIVE_ACTION"
+    assert c["required_condition"] == {"subject": "TRANSACTION", "relation": "<=", "value": 1000.0, "currency": "INR"} and c["minimum_changes"][0]["minimum_delta"] == 4000.0 and c["minimum_changes"][0]["target_value"] == 1000.0
+    assert c["violated_rule"]["result_source"] == "deterministic_policy_engine" and c["violated_rule"]["parsed_spec"]["subject"] == "TRANSACTION"
+    assert T.validate_counterfactual(G, c) == []
+    _, miss = _cf_for(_cf_g({"m_l.txt": "notes\n"}, 'REQUIRE KEYWORD "manager approval"\n'), "KEYWORD")
+    assert miss["status"] == "ESTABLISHED" and miss["change_type"] == "SUPPLY_EVIDENCE" and miss["satisfaction_asserted"] is False
+    G2 = _cf_g({"i_l.txt": _CF_INV5}, "Vendors should behave reasonably in spirit.\n")  # free text, no compiled rule: still UNEVALUATED -> UNRESOLVED
+    c2 = _cf_only(G2)
+    assert c2["current_decision"]["verdict"] == "UNEVALUATED" and "never evaluated" in c2["unresolved_reason"]; _cf_is_unresolved(G2, c2)
+
+
+# Contract check against the REAL schema + REAL rule engine (skipped when policy_schema is not importable). The compiler is NOT called: a real CompiledRule is built from the
+# same keys the compiler validates (validate_raw_rule), so no LLM / network is involved. This is what pins the stored model_dump shape that _cf_compiled reads.
+def _cc_real_rule(PS, rt, op, limit, line):
+    data = {"policy_id": "P1", "rule_id": "P1-R001", "rule_type": rt, "entity": "transaction", "condition": {"entity": "transaction", "field": "amount", "operator": op, "value": limit, "unit": "INR"},
+            "temporal": None, "required_evidence": [], "exception": [], "severity": "high", "action": "review_transaction", "confidence": 0.95, "source_text": line, "ambiguities": []}
+    r = PS.CompiledRule.model_validate(data)
+    r.status = "VALID"  # the compiler's own stage-2 assignment (validate_raw_rule); no ambiguity was raised for these clauses
+    return r
+
+
+def test_cc_real_schema_dump_shape_and_engine_agree_with_the_counterfactual(monkeypatch):
+    try:
+        PS = importlib.import_module("omni_pkg_under_test.policy_schema")
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"policy_schema not importable: {e}")
+    for rt, op, limit, line in _CC_CASES:
+        r = _cc_real_rule(PS, rt, op, limit, line)
+        dump = r.model_dump(mode="json"); cond = dump["condition"]
+        assert dump["rule_type"] == rt and dump["entity"] == "transaction" and dump["status"] == "VALID" and dump["source_text"] == line  # the exact keys / values _cf_compiled and apply_compiled_policy read
+        assert (cond["entity"], cond["field"], cond["operator"], cond["unit"]) == ("transaction", "amount", op, "INR") and cond["value"] == limit and not cond.get("children")
+        assert not dump["temporal"] and not dump["exception"] and not dump["required_evidence"]
+        rec = [{"amount": {"value": _CC_AMT, "unit": "INR"}, "currency": "INR"}]
+        er = T._evaluate_compiled_rules([r], {"transaction": rec}, None, None, False, None, True)["rule_results"][0]
+        assert er["verdict"] == "VIOLATION"  # real engine: INR 5,000 breaks every rule in _CC_CASES, which is what the counterfactual derivation presumes
+        res = types.SimpleNamespace(rules=[r], status="COMPILED", policy_id="P1", stats={}, ambiguous_policy=False, ambiguity_reasons=[], rejected=[], unparsed_statements=[])
+        monkeypatch.setattr(T, "HAS_POLICY_COMPILER", True, raising=False)
+        monkeypatch.setattr(T, "_compile_policy", lambda text, ctx, conf, res=res: res, raising=False)  # real engine, real schema; only the LLM step is replaced
+        monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", 0.5, raising=False)
+        monkeypatch.setattr(T, "evaluate_policy_rules", lambda G, line=line: (T.apply_compiled_policy(G, line + "\n"), _CC_ORIG_EVAL(G))[1])
+        G = _graph({"inv_cc.txt": _CF_INV5}, rulebook=line + "\n")
+        dec = next(n for n, x in G.nodes(data=True) if x.get("type") == "Decision")
+        _cc_established(G, dec, op, op if rt == "REQUIRE" else _CC_NEG[op], limit)
+
+
+# 20 ---- uncertainty layer (Phase 9): read-only mapping of existing decision state -> COMPLIANT | NON_COMPLIANT | CONDITIONAL | INSUFFICIENT_EVIDENCE + deterministic indicators + escalation
+_UNC_INV = "Invoice No: INV-1\nBilled amount INR 5,000\n"
+_UNC_RULE = "FORBID TRANSACTION > INR 1000\n"
+
+
+def _unc_g(docs=None, rulebook=_UNC_RULE):
+    return _graph(docs or {"i_u.txt": _UNC_INV}, rulebook=rulebook)
+
+
+def _unc_dec(G):
+    return next(n for n, x in sorted(G.nodes(data=True)) if x.get("type") == "Decision")
+
+
+def _unc_one(G):
+    return T.build_uncertainty_assessment(G, _unc_dec(G))
+
+
+def _unc_reasons(r):
+    return [e["reason"] for e in r["escalation_reasons"]]
+
+
+def _unc_valid(G, r):
+    assert T.validate_uncertainty_assessment(G, r) == []
+    assert r["escalation_required"] is bool(r["escalation_reasons"])
+    assert r["uncertainty_status"] in T.UNC_STATES
+
+
+def test_unc_clearly_compliant_maps_to_compliant_without_escalation():
+    G = _unc_g({"i_ok.txt": "Invoice No: INV-2\nBilled amount INR 800\n"})
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "SATISFIED" and r["uncertainty_status"] == "COMPLIANT"
+    assert [r[k]["value"] for k in ("evidence_completeness", "contradiction_severity", "policy_alignment", "risk_level")] == ["COMPLETE", "NONE", "ALIGNED", None]
+    assert r["risk_level"]["status"] == _CF_NM and r["escalation_required"] is False and r["escalation_reasons"] == []
+    kw = _unc_one(_unc_g({"m_ok.txt": "manager approval granted\n"}, 'REQUIRE KEYWORD "manager approval"\n'))
+    assert kw["decision"]["verdict"] == "SATISFIED" and kw["uncertainty_status"] == "COMPLIANT" and kw["escalation_required"] is False
+
+
+def test_unc_clearly_non_compliant_maps_to_non_compliant_with_stored_risk():
+    G = _unc_g(); r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "VIOLATION" and r["uncertainty_status"] == "NON_COMPLIANT"
+    assert r["evidence_completeness"]["value"] == "COMPLETE" and r["policy_alignment"]["value"] == "ALIGNED" and r["contradiction_severity"]["value"] == "NONE"
+    assert r["risk_level"]["value"] == "MEDIUM" and r["risk_level"]["severity_source"] == "default_when_unspecified"  # an existing deterministic default, reported with its source
+    assert r["escalation_required"] is False  # MEDIUM is not high risk
+    absent = _unc_one(_unc_g({"m_ab.txt": "notes\n"}, 'REQUIRE KEYWORD "manager approval"\n'))  # absence within a complete extraction scope is a grounded violation
+    assert absent["decision"]["violation_status"] == "ABSENCE_OF_REQUIRED_TEXT_WITHIN_EXTRACTED_SCOPE" and absent["uncertainty_status"] == "NON_COMPLIANT" and absent["escalation_required"] is False
+
+
+def test_unc_insufficient_evidence_for_ungrounded_weak_and_inconclusive():
+    for fault, weak in (("remove_support", False), ("evidence_text_5000_to_500", False), ("weak_location", True)):
+        G = _unc_g(); T._sv7d_apply_fault(G, _unc_dec(G), fault); r = _unc_one(G); _unc_valid(G, r)
+        assert r["decision"]["verdict"] == "VIOLATION" and r["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and r["evidence_completeness"]["value"] == "INCOMPLETE", fault  # NOT NON_COMPLIANT: the verdict is kept, the support is not adequate
+        assert r["escalation_required"] and "CRITICAL_EVIDENCE_MISSING" in _unc_reasons(r), fault
+    G = _unc_g({"i_in.txt": "Invoice No: INV-2\nBilled amount INR 800\n"}); G.nodes[_unc_dec(G)]["verdict"] = "INCONCLUSIVE"  # private graph: the INCONCLUSIVE state itself
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and r["evidence_completeness"]["value"] == "INCOMPLETE" and r["policy_alignment"]["value"] is None and "CRITICAL_EVIDENCE_MISSING" in _unc_reasons(r)
+
+
+def test_unc_conditional_for_unresolved_or_unestablished_policy_applicability():
+    for fault, align in (("wrong_scope", "MISALIGNED"), ("rule_condition_9000", "MISALIGNED"), ("basis_amount_none", "UNESTABLISHED")):
+        G = _unc_g(); T._sv7d_apply_fault(G, _unc_dec(G), fault); r = _unc_one(G); _unc_valid(G, r)
+        assert r["uncertainty_status"] == "CONDITIONAL" and r["policy_alignment"]["value"] == align and "POLICY_APPLICABILITY_UNESTABLISHED" in _unc_reasons(r), fault
+        assert r["decision"]["verdict"] == "VIOLATION" and r["uncertainty_status"] != "INSUFFICIENT_EVIDENCE"  # distinct from missing evidence: the evidence is complete, the rule's applicability is not
+    for rb in ("Vendors should behave in spirit.\n", "FORBID TRANSACTION > JPY 1000\n"):  # rule not interpretable / unknown unit: UNEVALUATED
+        G = _unc_g(rulebook=rb); r = _unc_one(G); _unc_valid(G, r)
+        assert r["decision"]["verdict"] == "UNEVALUATED" and r["uncertainty_status"] == "CONDITIONAL" and r["policy_alignment"]["value"] == "UNESTABLISHED" and r["evidence_completeness"]["value"] is None and "POLICY_APPLICABILITY_UNESTABLISHED" in _unc_reasons(r)
+
+
+def test_unc_not_applicable_is_never_mapped_to_compliant():
+    G = _unc_g({"memo_na.txt": "Meeting notes\nNothing to report\n"}); r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "NOT_APPLICABLE" and r["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and r["policy_alignment"]["value"] == "NOT_APPLICABLE" and r["escalation_required"] is False
+
+
+def test_unc_missing_critical_evidence_downgrades_a_satisfied_decision_and_escalates():
+    G = _unc_g({"inv_m.txt": "Invoice No: INV-7\nPO Number: PO-777\nVendor: Boreal\nBilled amount INR 800\n"}); r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "SATISFIED" and r["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and r["evidence_completeness"]["value"] == "INCOMPLETE"
+    assert "CRITICAL_EVIDENCE_MISSING" in _unc_reasons(r) and r["escalation_required"] is True
+    stored = {f["finding_id"] for f in G.graph["contradiction_findings"] if f["category"] == "MISSING_EVIDENCE"}
+    assert stored and {m["finding_id"] for m in r["missing_evidence"] if m.get("finding_id")} == stored  # reuses the existing finding ids
+    G2 = _unc_g({"i_cm.txt": "Invoice No: INV-2\nBilled amount INR 800\n"}); d2 = _unc_dec(G2); G2.nodes[d2]["compiled_missing_facts"] = ["currency unit"]
+    r2 = T.build_uncertainty_assessment(G2, d2)
+    assert r2["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and any(m["kind"] == "compiled_rule_missing_fact" for m in r2["missing_evidence"])
+
+
+def test_unc_unresolved_contradiction_maps_to_conditional_and_escalates():
+    docs = {"inv_c.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 800\n", "po_c.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}
+    G = _unc_g(docs); r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "SATISFIED" and r["contradiction_severity"]["value"] == "MAJOR" and r["uncertainty_status"] == "CONDITIONAL"  # not COMPLIANT: the verdict stays, the state records the open contradiction
+    assert "UNRESOLVED_CONTRADICTION" in _unc_reasons(r) and r["escalation_required"] is True and r["policy_alignment"]["value"] == "ALIGNED" and r["evidence_completeness"]["value"] == "COMPLETE"
+    stored = {f["finding_id"] for f in G.graph["contradiction_findings"] if f["category"] == "MAJOR_CONTRADICTION"}
+    assert stored and {c["finding_id"] for c in r["contradicting_evidence"] if c.get("finding_id")} == stored
+
+
+def test_unc_confidence_is_never_invented_and_low_confidence_needs_an_existing_signal(monkeypatch):
+    G = _unc_g(); d = _unc_dec(G); r = T.build_uncertainty_assessment(G, d)
+    assert r["decision_confidence"]["value"] is None and r["decision_confidence"]["status"] == _CF_NM and "LOW_CONFIDENCE" not in _unc_reasons(r)  # NOT_MEASURED alone is not low confidence
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", 0.6, raising=False)
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_hi", "confidence": 0.9}]
+    assert "LOW_CONFIDENCE" not in _unc_reasons(T.build_uncertainty_assessment(G, d))
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_lo", "confidence": 0.2}]
+    lo = T.build_uncertainty_assessment(G, d); _unc_valid(G, lo)
+    assert "LOW_CONFIDENCE" in _unc_reasons(lo) and lo["escalation_required"] is True and lo["decision_confidence"]["value"] is None and lo["decision_confidence"]["status"] == _CF_NM  # the stored component is listed, never aggregated
+    assert [c["rule_id"] for c in lo["decision_confidence"]["low_components"]] == ["c_lo"] and lo["uncertainty_status"] == "NON_COMPLIANT"
+    monkeypatch.delattr(T, "_COMPILER_MIN_CONFIDENCE", raising=False)  # no floor exists -> nothing can be called low
+    nf = T.build_uncertainty_assessment(G, d)
+    assert "LOW_CONFIDENCE" not in _unc_reasons(nf) and nf["decision_confidence"]["low_confidence_floor"] is None
+
+
+def test_unc_indicators_are_not_measured_when_they_cannot_be_derived():
+    G = _unc_g({"i_nm.txt": "Invoice No: INV-2\nBilled amount INR 800\n"}); G.graph.pop("contradiction_findings")  # the classifier never ran on this graph
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["contradiction_severity"]["value"] is None and r["contradiction_severity"]["status"] == _CF_NM and r["risk_level"]["status"] == _CF_NM and r["decision_confidence"]["status"] == _CF_NM
+    G2 = _unc_g(); T._sv7d_apply_fault(G2, _unc_dec(G2), "remove_support"); r2 = _unc_one(G2)  # applicability not assessed once 7B FAILED
+    assert r2["verification_status"] == "FAILED" and r2["policy_alignment"]["value"] is None and r2["policy_alignment"]["status"] == _CF_NM
+    miss = T.build_uncertainty_assessment(G, "no_such_decision")
+    assert miss["found"] is False and miss["uncertainty_status"] == _CF_NM and miss["escalation_required"] is False and all(miss[k]["status"] == _CF_NM for k in T.UNC_INDICATORS) and set(T.UNC_FIELDS) <= set(miss)
+
+
+def test_unc_high_risk_escalates_only_from_a_stored_risk_signal():
+    for sev in ("high", "critical"):
+        G = _unc_g(rulebook=f"FORBID TRANSACTION > INR 1000 [severity={sev}]\n"); r = _unc_one(G); _unc_valid(G, r)
+        assert r["risk_level"]["value"] == sev.upper() and r["risk_level"]["severity_source"] == "rule_configured" and r["uncertainty_status"] == "NON_COMPLIANT"  # the state is not changed by risk
+        assert _unc_reasons(r) == ["HIGH_RISK"] and r["escalation_required"] is True
+        assert r["risk_level"]["risk_ids"] and all(G.nodes[x]["type"] == "Risk" and G.nodes[x]["severity"] == sev.upper() for x in r["risk_level"]["risk_ids"])
+    low = _unc_one(_unc_g(rulebook="FORBID TRANSACTION > INR 1000 [severity=low]\n"))
+    assert low["risk_level"]["value"] == "LOW" and low["escalation_required"] is False
+    sat = _unc_one(_unc_g({"i_rs.txt": "Invoice No: INV-2\nBilled amount INR 800\n"}, "FORBID TRANSACTION > INR 1000 [severity=high]\n"))
+    assert sat["risk_level"]["value"] is None and sat["escalation_required"] is False  # no Risk node -> no risk classification is invented
+
+
+def test_unc_no_numeric_indicator_is_ever_produced():
+    graphs = [_unc_g(), _unc_g(rulebook="FORBID TRANSACTION > INR 1000 [severity=high]\n"), _unc_g({"i_n.txt": "Invoice No: INV-2\nBilled amount INR 800\n"}), _unc_g(rulebook="Vendors should behave in spirit.\n"),
+              _unc_g({"m_n.txt": "Meeting notes\n"}), _unc_g(_CF_UNLINKED, "FORBID TRANSACTION > INR 1000\n")]
+    for G in graphs:
+        for r in T.build_uncertainty_assessments(G):
+            _unc_valid(G, r)
+            for k in T.UNC_INDICATORS:
+                v = r[k]["value"]
+                assert v is None or isinstance(v, str), (k, v)
+                assert (v is None) == (r[k]["status"] == _CF_NM)
+            assert r["decision_confidence"]["value"] is None
+    bad = _unc_one(graphs[0]); bad["policy_alignment"]["value"] = 0.93  # the contract validator rejects an invented numeric indicator
+    assert any("must not be numeric" in p for p in T.validate_uncertainty_assessment(graphs[0], bad))
+    bad2 = _unc_one(graphs[0]); bad2["escalation_required"] = True
+    assert T.validate_uncertainty_assessment(graphs[0], bad2)
+
+
+def test_unc_is_read_only_deterministic_and_idempotent():
+    docs = {"inv_i.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 5,000\n", "po_i.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}
+    G = _unc_g(docs, "FORBID TRANSACTION > INR 1000 [severity=high]\nREQUIRE KEYWORD \"manager approval\"\nVendors should behave in spirit.\n")
+    before = T._sv7d_snapshot(G)
+    a, b = T.build_uncertainty_assessments(G), T.build_uncertainty_assessments(G)
+    assert T._sv7d_snapshot(G) == before and json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+    assert len(a) == len(T._nodes_of_type(G, "Decision")) == 3 and [r["decision_id"] for r in a] == sorted(r["decision_id"] for r in a)
+    a[0]["supporting_evidence"].append("tamper"); a[0]["escalation_reasons"].append("tamper")  # returned copies never alias graph state
+    assert json.dumps(T.build_uncertainty_assessments(G), sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str) and T._sv7d_snapshot(G) == before
+
+
+def test_unc_preserves_verdicts_evidence_rule_ids_findings_verification_and_provenance():
+    docs = {"inv_p.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 5,000\n", "po_p.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}
+    G = _unc_g(docs, "FORBID TRANSACTION > INR 1000\nREQUIRE KEYWORD \"manager approval\"\n")
+    verdicts = {n: d["verdict"] for n, d in T._nodes_of_type(G, "Decision")}; findings = json.dumps(G.graph["contradiction_findings"], sort_keys=True, default=str)
+    for r in T.build_uncertainty_assessments(G):
+        d = r["decision_id"]; vr = T.verify_policy_applicability(G, d); lin = T.query_decision_lineage(G, d)
+        assert r["decision"]["verdict"] == verdicts[d] == G.nodes[d]["verdict"] and r["decision"]["rule_id"] == G.nodes[d]["rule_id"]
+        assert r["verification_status"] == vr["verification_status"] and r["policy_applicability_status"] == vr["policy_applicability"]["status"]
+        assert sorted({x["evidence_id"] for x in r["supporting_evidence"]}) == sorted(e["evidence_id"] for e in lin["evidence"])
+        assert [x["rule_id"] for x in r["policy_rules"]] == [G.nodes[d]["rule_id"]]
+        for ref in r["supporting_evidence"]: assert ref["provenance"] == T._sv_json(G.nodes[ref["evidence_id"]]["provenance"]) and ref["document_id"]
+    assert {n: d["verdict"] for n, d in T._nodes_of_type(G, "Decision")} == verdicts and json.dumps(G.graph["contradiction_findings"], sort_keys=True, default=str) == findings
+
+
+def test_unc_legacy_prompt_8_counterfactuals_and_prior_layers_are_unchanged(monkeypatch):
+    docs = {"inv_l.txt": _UNC_INV, "m_l.txt": "notes\n"}; rb = 'FORBID TRANSACTION > INR 1000\nREQUIRE KEYWORD "manager approval"\nVendors should behave in spirit.\n'
+    G = _unc_g(docs, rb)
+    cf0, sv0, pa0 = (json.dumps(f(G), sort_keys=True, default=str) for f in (T.build_counterfactuals, T.verify_self_verification_results, T.verify_policy_applicability_results))
+    T.build_uncertainty_assessments(G)
+    assert json.dumps(T.build_counterfactuals(G), sort_keys=True, default=str) == cf0 and json.dumps(T.verify_self_verification_results(G), sort_keys=True, default=str) == sv0
+    assert json.dumps(T.verify_policy_applicability_results(G), sort_keys=True, default=str) == pa0
+    def boom(*a, **k): raise AssertionError("Phase 8 / 7x must not depend on the uncertainty layer")
+    monkeypatch.setattr(T, "build_uncertainty_assessment", boom); monkeypatch.setattr(T, "build_uncertainty_assessments", boom)
+    assert json.dumps(T.build_counterfactuals(G), sort_keys=True, default=str) == cf0
+    d, c = _cf_for(_cf_g({"i_l.txt": _CF_INV5}, "FORBID TRANSACTION > INR 1000\n"), "TRANSACTION")
+    assert c["status"] == "ESTABLISHED" and c["change_type"] == "CORRECTIVE_ACTION" and all(k in c for k in T.CF_FIELDS)
+    b1 = json.dumps(T.run_counterfactual_benchmark(), sort_keys=True, default=str)  # whole Phase 8 benchmark runs with the uncertainty layer disabled (boom) and is deterministic
+    monkeypatch.undo()
+    T.build_uncertainty_assessments(G)
+    assert b1 == json.dumps(T.run_counterfactual_benchmark(), sort_keys=True, default=str)
+
+
+# 20b ---- uncertainty layer edge-case hardening
+def _unc_patched_vr(monkeypatch, **over):
+    orig = T.verify_policy_applicability
+    def f(G, d):
+        r = orig(G, d)
+        for k, v in over.items():
+            if k == "pa_status": r["policy_applicability"]["status"] = v
+            else: r[k] = v
+        return r
+    monkeypatch.setattr(T, "verify_policy_applicability", f)
+
+
+def test_unc_failed_verification_without_a_listed_claim_still_escalates(monkeypatch):
+    G = _unc_g(); _unc_patched_vr(monkeypatch, verification_status="FAILED", material_claims=[])
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["uncertainty_status"] == "INSUFFICIENT_EVIDENCE" and r["verification_status"] == "FAILED" and _unc_reasons(r) == ["CRITICAL_EVIDENCE_MISSING"] and "FAILED" in r["escalation_reasons"][0]["detail"]
+
+
+def test_unc_unverified_applicability_is_conditional_with_a_reason_and_never_a_verdict_state(monkeypatch):
+    G = _unc_g(); _unc_patched_vr(monkeypatch, pa_status="NOT_CHECKED")
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["decision"]["verdict"] == "VIOLATION" and r["uncertainty_status"] == "CONDITIONAL" and _unc_reasons(r) == ["POLICY_APPLICABILITY_UNESTABLISHED"]
+    for fault in ("wrong_scope", "basis_amount_none"):  # genuine MISMATCH / UNESTABLISHED: one reason, never duplicated
+        G2 = _unc_g(); T._sv7d_apply_fault(G2, _unc_dec(G2), fault); r2 = _unc_one(G2)
+        assert r2["uncertainty_status"] == "CONDITIONAL" and _unc_reasons(r2) == ["POLICY_APPLICABILITY_UNESTABLISHED"]
+
+
+def test_unc_unevaluated_rule_is_a_policy_problem_not_missing_evidence():
+    r = _unc_one(_unc_g(rulebook="Vendors should behave in spirit.\n"))
+    assert r["decision"]["verdict"] == "UNEVALUATED" and r["missing_evidence"] == [] and r["evidence_completeness"]["value"] is None and _unc_reasons(r) == ["POLICY_APPLICABILITY_UNESTABLISHED"]
+
+
+_UNC_CONTRA = {"inv_c2.txt": "Invoice No: INV-5\nPO Number: PO-5\nVendor: Boreal Metals\nBilled amount INR 800\n", "po_c2.txt": "Purchase Order No: PO-5\nVendor: Zenith Traders\nOrder value INR 800\n"}
+
+
+def test_unc_contradiction_severity_distinctions_are_preserved():
+    G = _unc_g(_UNC_CONTRA); fs = [f for f in G.graph["contradiction_findings"] if f["category"] == "MAJOR_CONTRADICTION"]; assert fs
+    for f in fs: f["category"], f["severity"] = "MINOR_CONTRADICTION", "minor"  # private graph: the same finding classified MINOR
+    r = _unc_one(G); _unc_valid(G, r)
+    assert r["contradiction_severity"]["value"] == "MINOR" and r["uncertainty_status"] == "COMPLIANT" and _unc_reasons(r) == ["UNRESOLVED_CONTRADICTION"]  # unresolved minor escalates but is not promoted to MAJOR / CONDITIONAL
+    G2 = _unc_g(_UNC_CONTRA)
+    for f in G2.graph["contradiction_findings"]:
+        if f["category"] == "MAJOR_CONTRADICTION": f["resolution"] = "RESOLVED"
+    r2 = _unc_one(G2); _unc_valid(G2, r2)
+    assert r2["contradiction_severity"]["value"] == "MAJOR" and r2["uncertainty_status"] == "COMPLIANT" and r2["escalation_reasons"] == []  # a resolved major is still reported as MAJOR but no longer drives state / escalation
+
+
+def test_unc_heuristic_contradiction_signal_never_becomes_a_policy_violation():
+    G = _unc_g({"i_h.txt": "Invoice No: INV-2\nBilled amount INR 800\n", "o_h.txt": "Note\nBilled amount INR 900\n"}); d = _unc_dec(G)
+    basis = G.nodes[d]["basis_node_ids"][0]; other = next(e for e, _ in T._investigation_evidence(G) if e not in T._supporting_evidence_ids(G, basis))
+    G.add_edge(other, basis, relation="CONTRADICTS", heuristic=True, match_strength="weak", method="test")
+    before = (G.nodes[d]["verdict"], json.dumps(G.graph["contradiction_findings"], sort_keys=True, default=str))
+    r = T.build_uncertainty_assessment(G, d); _unc_valid(G, r)
+    assert r["contradiction_severity"]["value"] == "UNCLASSIFIED" and "UNRESOLVED_CONTRADICTION" in _unc_reasons(r)
+    assert r["decision"]["verdict"] == "SATISFIED" and r["uncertainty_status"] != "NON_COMPLIANT" and (G.nodes[d]["verdict"], json.dumps(G.graph["contradiction_findings"], sort_keys=True, default=str)) == before
+
+
+def test_unc_confidence_and_risk_accept_only_genuine_stored_values(monkeypatch):
+    G = _unc_g(); d = _unc_dec(G)
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", 0.6, raising=False)
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_b", "confidence": True}, {"rule_id": "c_s", "confidence": "0.1"}, {"rule_id": "c_n", "confidence": float("nan")}]
+    r = T.build_uncertainty_assessment(G, d); _unc_valid(G, r)
+    assert r["decision_confidence"]["low_components"] == [] and "LOW_CONFIDENCE" not in _unc_reasons(r) and r["decision_confidence"]["value"] is None
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", True, raising=False)  # a bool is not a floor
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_lo", "confidence": 0.0}]
+    r2 = T.build_uncertainty_assessment(G, d)
+    assert r2["decision_confidence"]["low_confidence_floor"] is None and "LOW_CONFIDENCE" not in _unc_reasons(r2)
+    risk = next(x for x in G.successors(d) if G.nodes[x].get("type") == "Risk"); G.nodes[risk]["severity"] = "BANANA"
+    r3 = T.build_uncertainty_assessment(G, d); _unc_valid(G, r3)
+    assert r3["risk_level"]["value"] is None and r3["risk_level"]["status"] == _CF_NM and "HIGH_RISK" not in _unc_reasons(r3)
+    G.nodes[risk]["severity"] = "medium"; assert not _unc_one(G)["escalation_required"]  # stored MEDIUM alone never escalates
+
+
+def test_unc_validator_rejects_inconsistent_indicators_and_unbacked_or_duplicate_reasons():
+    G = _unc_g(); base = _unc_one(G); import copy
+    def probs(**kw):
+        r = copy.deepcopy(base); r.update(kw); return T.validate_uncertainty_assessment(G, r)
+    assert probs() == []
+    assert any("unknown status" in p for p in probs(policy_alignment={"value": "ALIGNED", "status": "MAYBE", "basis": "x"}))
+    assert any("NOT_MEASURED" in p for p in probs(risk_level={"value": "HIGH", "status": _CF_NM, "basis": "x"}))
+    dup = [{"reason": "HIGH_RISK", "detail": "x"}] * 2
+    assert any("duplicate" in p for p in probs(escalation_reasons=dup, escalation_required=True))
+    assert any("HIGH_RISK without" in p for p in probs(escalation_reasons=dup[:1], escalation_required=True))
+    assert any("LOW_CONFIDENCE without" in p for p in probs(escalation_reasons=[{"reason": "LOW_CONFIDENCE", "detail": "x"}], escalation_required=True))
+    assert any("UNRESOLVED_CONTRADICTION without" in p for p in probs(escalation_reasons=[{"reason": "UNRESOLVED_CONTRADICTION", "detail": "x"}], escalation_required=True))
+
+
+def test_unc_every_generated_reason_is_unique_and_backed_across_scenarios():
+    gs = [_unc_g(), _unc_g(_UNC_CONTRA), _unc_g({"inv_m2.txt": "Invoice No: INV-7\nPO Number: PO-777\nVendor: Boreal\nBilled amount INR 5,000\n"}, "FORBID TRANSACTION > INR 1000 [severity=critical]\nREQUIRE KEYWORD \"manager approval\"\nVendors should behave in spirit.\n")]
+    for G in gs:
+        for r in T.build_uncertainty_assessments(G):
+            codes = _unc_reasons(r); assert len(codes) == len(set(codes)) and r["escalation_required"] is bool(codes); _unc_valid(G, r)
+
+
+def test_unc_9b_infinite_and_non_numeric_confidence_values_are_ignored(monkeypatch):
+    G = _unc_g(); d = _unc_dec(G); inf = float("inf")
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", 0.6, raising=False)
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_ninf", "confidence": -inf}, {"rule_id": "c_none", "confidence": None}, {"rule_id": "c_l", "confidence": [0.1]}]
+    r = T.build_uncertainty_assessment(G, d); _unc_valid(G, r)
+    assert r["decision_confidence"]["low_components"] == [] and "LOW_CONFIDENCE" not in _unc_reasons(r)
+    monkeypatch.setattr(T, "_COMPILER_MIN_CONFIDENCE", inf, raising=False)
+    G.nodes[d]["compiled_rules"] = [{"rule_id": "c_lo", "confidence": 0.0}]
+    r2 = T.build_uncertainty_assessment(G, d)
+    assert r2["decision_confidence"]["low_confidence_floor"] is None and "LOW_CONFIDENCE" not in _unc_reasons(r2) and r2["decision_confidence"]["value"] is None
+
+
+def test_unc_9b_validator_rejects_state_that_contradicts_verification_or_risk_backing():
+    import copy
+    G = _unc_g(); base = _unc_one(G)
+    def probs(**kw):
+        r = copy.deepcopy(base); r.update(kw); return T.validate_uncertainty_assessment(G, r)
+    assert probs() == []
+    assert any("7B FAILED requires" in p for p in probs(verification_status="FAILED"))
+    fr = {"uncertainty_status": "INSUFFICIENT_EVIDENCE", "verification_status": "FAILED", "escalation_required": True}
+    assert probs(**fr, escalation_reasons=[{"reason": "CRITICAL_EVIDENCE_MISSING", "detail": "x"}]) == []
+    assert any("must not carry" in p for p in probs(**fr, escalation_reasons=[{"reason": "CRITICAL_EVIDENCE_MISSING", "detail": "x"}, {"reason": "POLICY_APPLICABILITY_UNESTABLISHED", "detail": "x"}]))
+    assert any("unverified policy applicability requires" in p for p in probs(policy_applicability_status="NOT_CHECKED"))
+    assert any("requires verified" in p for p in probs(policy_applicability_status="MISMATCH"))
+    assert probs(uncertainty_status="CONDITIONAL", policy_applicability_status="MISMATCH", escalation_required=True, escalation_reasons=[{"reason": "POLICY_APPLICABILITY_UNESTABLISHED", "detail": "x"}]) == []
+    assert any("recognised stored severity" in p for p in probs(risk_level={"value": "BANANA", "status": "MEASURED", "basis": "x"}))
+    bad_conf = copy.deepcopy(base["decision_confidence"]); bad_conf["low_confidence_floor"] = float("inf")
+    assert any("finite number" in p for p in probs(decision_confidence=bad_conf))
+
+
+def test_unc_9b_generated_assessments_always_pass_the_strengthened_validator():
+    for G in (_unc_g(), _unc_g(_UNC_CONTRA), _unc_g(rulebook="Vendors should behave in spirit.\n"), _unc_g({"m_v.txt": "Meeting notes\n"}), _unc_g({"inv_v.txt": "Invoice No: INV-7\nPO Number: PO-777\nVendor: Boreal\nBilled amount INR 800\n"})):
+        for r in T.build_uncertainty_assessments(G): _unc_valid(G, r)
+    for fault in ("remove_support", "evidence_text_5000_to_500", "weak_location", "wrong_scope", "rule_condition_9000", "basis_amount_none"):
+        G = _unc_g(); T._sv7d_apply_fault(G, _unc_dec(G), fault); _unc_valid(G, _unc_one(G))
+
+
+# 21 ---- uncertainty evaluation benchmark (Phase 9C): hand-labelled, deterministic, read-only; calibration metrics only from genuine numeric confidence
+@pytest.fixture(scope="module")
+def uncb():
+    return T.run_uncertainty_benchmark()
+
+
+def _ub_rec(case_id, exp, preds, conf=None, exp_esc=None):
+    """Hand-built record for arithmetic tests. preds: {variant: (state, escalated)}."""
+    return {"case_id": case_id, "category": "compliant", "expected_state": exp, "expected_escalation": bool(exp_esc), "expected_reasons": [], "predicted_confidence": conf,
+            "predictions": {v: {"state": s, "escalated": e} for v, (s, e) in preds.items()}, "deterministic": True, "graph_unchanged": True,
+            "id_integrity": {"evidence_ids_in_graph": True, "provenance_matches_graph": True, "rule_ids_in_graph": True, "verdict_preserved": True, "contract_problems": []}}
+
+
+def _ub_all(s, e=False): return {v: (s, e) for v in T.UNCB_VARIANTS}
+
+
+def _ub_m(recs, v="uncertainty_aware"): return T.aggregate_uncertainty_results(recs, [])["variants"][v]["metrics"]
+
+
+def test_uncb_labels_validate_and_cover_every_required_category_state_and_escalation_class():
+    assert T.validate_uncertainty_benchmark() == []
+    cats = {c["category"] for c in T.UNCERTAINTY_BENCHMARK}
+    assert set(T.UNCB_CATEGORIES) <= cats and {"compliant", "non_compliant", "conditional", "insufficient_evidence", "missing_critical_evidence", "unresolved_contradiction", "resolved_contradiction", "policy_mismatch", "low_confidence", "high_risk", "unsupported_ambiguous"} <= cats
+    gts = [c["ground_truth"] for c in T.UNCERTAINTY_BENCHMARK]
+    assert {g["state"] for g in gts} == set(T.UNC_STATES) and {g["escalation"] for g in gts} == {True, False} and {x for g in gts for x in g["reasons"]} == set(T.UNC_ESCALATION_CODES)
+
+
+def test_uncb_is_deterministic_and_idempotent(uncb):
+    again = T.run_uncertainty_benchmark()
+    assert json.dumps(uncb, sort_keys=True) == json.dumps(again, sort_keys=True)
+    assert uncb["aggregate"]["integrity"] == {"all_deterministic": True, "all_graphs_unchanged": True, "all_ids_and_provenance_intact": True}
+    assert uncb["aggregate"]["benchmark"]["seed"] is None and uncb["aggregate"]["benchmark"]["llm_used"] is False and len(uncb["records"]) == len(T.UNCERTAINTY_BENCHMARK)
+
+
+def test_uncb_ground_truth_is_independent_of_system_output(monkeypatch):
+    import copy
+    before = copy.deepcopy(T.UNCERTAINTY_BENCHMARK); clean = T.run_uncertainty_benchmark()
+    assert T.UNCERTAINTY_BENCHMARK == before  # running never edits the labels
+    junk = {"uncertainty_status": "COMPLIANT", "escalation_required": False, "escalation_reasons": [], "decision_confidence": {"value": None}, "supporting_evidence": [], "policy_rules": [], "decision": {"verdict": None}}
+    monkeypatch.setattr(T, "build_uncertainty_assessment", lambda G, d: dict(junk))  # a system that answers garbage must not move a single label
+    monkeypatch.setattr(T, "validate_uncertainty_assessment", lambda G, r: [])
+    bad = T.run_uncertainty_benchmark()
+    keys = ("case_id", "expected_state", "expected_escalation", "expected_reasons")
+    assert [{k: r[k] for k in keys} for r in bad["records"]] == [{k: r[k] for k in keys} for r in clean["records"]]
+    for r, c in zip(bad["records"], T.UNCERTAINTY_BENCHMARK): assert (r["expected_state"], r["expected_escalation"], r["expected_reasons"]) == (c["ground_truth"]["state"], c["ground_truth"]["escalation"], c["ground_truth"]["reasons"])
+    assert bad["aggregate"]["variants"]["uncertainty_aware"]["metrics"]["state_accuracy"]["value"] < clean["aggregate"]["variants"]["uncertainty_aware"]["metrics"]["state_accuracy"]["value"]
+
+
+def test_uncb_validator_rejects_inconsistent_or_prediction_dependent_labels():
+    import copy
+    base = copy.deepcopy(T.UNCERTAINTY_BENCHMARK[0]); other = lambda **kw: [{**copy.deepcopy(base), **kw}]
+    assert T.validate_uncertainty_benchmark(other(), require_coverage=False) == []
+    assert any("case keys" in p for p in T.validate_uncertainty_benchmark(other(predicted_state="COMPLIANT"), require_coverage=False))  # no output field may ride along on a case
+    gt = lambda **kw: {**base["ground_truth"], **kw}
+    assert any("exactly" in p for p in T.validate_uncertainty_benchmark(other(ground_truth={"state": "COMPLIANT"}), require_coverage=False))
+    assert any("not one of" in p for p in T.validate_uncertainty_benchmark(other(ground_truth=gt(state="MAYBE")), require_coverage=False))
+    assert any("exactly when" in p for p in T.validate_uncertainty_benchmark(other(ground_truth=gt(escalation=True)), require_coverage=False))
+    assert any("exactly when" in p for p in T.validate_uncertainty_benchmark(other(ground_truth=gt(escalation=False, reasons=["HIGH_RISK"])), require_coverage=False))
+    assert any("known escalation codes" in p for p in T.validate_uncertainty_benchmark(other(ground_truth=gt(reasons=["MADE_UP"], escalation=True)), require_coverage=False))
+    assert any("bool literal" in p for p in T.validate_uncertainty_benchmark(other(ground_truth=gt(escalation=lambda: True)), require_coverage=False))
+    assert any("unknown fault" in p for p in T.validate_uncertainty_benchmark(other(fault="nope"), require_coverage=False)) and any("unknown setup" in p for p in T.validate_uncertainty_benchmark(other(setup="nope"), require_coverage=False))
+    assert any("duplicate" in p for p in T.validate_uncertainty_benchmark(other() + other(), require_coverage=False))
+    assert any("not covered" in p for p in T.validate_uncertainty_benchmark(other()))  # coverage is enforced for the shipped set
+    assert any("non-escalated final state" in p for p in T.validate_uncertainty_benchmark(other(category="policy_mismatch"), require_coverage=False))
+    with pytest.raises(ValueError): T.run_uncertainty_benchmark(other(ground_truth=gt(state="MAYBE")))
+
+
+def test_uncb_metric_arithmetic_from_hand_built_records():
+    A = "uncertainty_aware"
+    recs = [_ub_rec("a", "COMPLIANT", {**_ub_all("COMPLIANT"), A: ("COMPLIANT", False)}),
+            _ub_rec("b", "COMPLIANT", {**_ub_all("COMPLIANT"), A: ("NON_COMPLIANT", False)}),                      # false positive
+            _ub_rec("c", "NON_COMPLIANT", {**_ub_all("NON_COMPLIANT"), A: ("COMPLIANT", False)}),                  # false negative
+            _ub_rec("d", "NON_COMPLIANT", {**_ub_all("NON_COMPLIANT"), A: ("NON_COMPLIANT", True)}, exp_esc=True),  # right state, escalated
+            _ub_rec("e", "CONDITIONAL", {**_ub_all("CONDITIONAL"), A: ("NON_COMPLIANT", False)}, exp_esc=True),   # unsafe finalization, missed escalation
+            _ub_rec("f", "INSUFFICIENT_EVIDENCE", {**_ub_all("INSUFFICIENT_EVIDENCE", True), A: ("INSUFFICIENT_EVIDENCE", True)}, exp_esc=True),
+            _ub_rec("g", "CONDITIONAL", {**_ub_all("CONDITIONAL"), A: ("CONDITIONAL", False)}),                   # fully correct, open state not escalated as labelled
+            _ub_rec("h", "COMPLIANT", {**_ub_all("COMPLIANT"), A: ("COMPLIANT", True)})]                           # needless escalation
+    m = _ub_m(recs)
+    got = {k: (v["numerator"], v["denominator"], v["value"]) for k, v in m.items() if "numerator" in v}
+    assert got["state_accuracy"] == (5, 8, 0.625)                  # a, d, f, g, h
+    assert got["false_positive_rate"] == (1, 3, 0.3333)            # b among a, b, h (labelled COMPLIANT); CONDITIONAL / INSUFFICIENT not in the denominator
+    assert got["false_negative_rate"] == (1, 2, 0.5)               # c among c, d
+    assert got["unsafe_finalization_rate"] == (1, 3, 0.3333)       # e among e, f, g; f and g stay open
+    assert got["escalation_rate"] == (3, 8, 0.375)                 # d, f, h
+    assert got["escalation_false_positive_rate"] == (1, 5, 0.2)    # h among a, b, c, g, h
+    assert got["escalation_false_negative_rate"] == (1, 3, 0.3333) # e among d, e, f
+    assert got["escalation_agreement"] == (6, 8, 0.75)             # wrong on e and h
+    assert got["automation_coverage"] == (4, 8, 0.5)               # a, b, c, e: final and not escalated
+    assert got["automated_decision_accuracy"] == (1, 4, 0.25)      # only a is right among a, b, c, e
+    lo = T.aggregate_uncertainty_results(recs, [])["labels_only"]
+    assert lo["expected_escalation_rate"]["value"] == 0.375 and lo["expected_automation_coverage"]["value"] == 0.5  # labels only: d, e, f expect escalation; a, b, c, h are final without it
+
+
+def test_uncb_measured_zero_is_distinct_from_not_measured_and_from_unavailable_confidence():
+    recs = [_ub_rec("a", "COMPLIANT", _ub_all("COMPLIANT"))]
+    m = _ub_m(recs)
+    assert m["false_positive_rate"]["status"] == "MEASURED" and m["false_positive_rate"]["value"] == 0.0 and m["false_positive_rate"]["denominator"] == 1  # a genuine zero
+    assert m["false_negative_rate"]["status"] == T.NOT_MEASURED and m["false_negative_rate"]["value"] == T.NOT_MEASURED and m["false_negative_rate"]["reason_code"] == "EMPTY_DENOMINATOR" and m["false_negative_rate"]["denominator"] == 0
+    assert m["unsafe_finalization_rate"]["reason_code"] == "EMPTY_DENOMINATOR" and m["escalation_false_negative_rate"]["reason_code"] == "EMPTY_DENOMINATOR"
+    assert m["ece"]["status"] == T.NOT_MEASURED and m["ece"]["reason_code"] == "NO_NUMERIC_CONFIDENCE" and m["brier"]["reason_code"] == "NO_NUMERIC_CONFIDENCE" and m["calibration"]["reason_code"] == "NO_NUMERIC_CONFIDENCE"
+    allesc = _ub_m([_ub_rec("e", "COMPLIANT", _ub_all("COMPLIANT", True))])  # nothing eligible: coverage is a measured 0.0, accuracy over automation has no denominator
+    assert allesc["automation_coverage"]["value"] == 0.0 and allesc["automation_coverage"]["status"] == "MEASURED" and allesc["automated_decision_accuracy"]["reason_code"] == "EMPTY_DENOMINATOR"
+    empty = T.aggregate_uncertainty_results([], [])["variants"]["uncertainty_aware"]["metrics"]
+    assert empty["state_accuracy"]["status"] == T.NOT_MEASURED and empty["escalation_rate"]["reason_code"] == "EMPTY_DENOMINATOR"
+
+
+def test_uncb_calibration_ece_brier_use_only_genuine_numeric_confidence(uncb):
+    ua = uncb["aggregate"]["variants"]["uncertainty_aware"]["metrics"]
+    assert all(r["predicted_confidence"] is None for r in uncb["records"])  # the existing layer never provides one
+    for k in ("calibration", "ece", "brier"): assert ua[k]["status"] == T.NOT_MEASURED and ua[k]["reason_code"] == "NO_NUMERIC_CONFIDENCE" and ua[k]["n_valid_confidence"] == 0 and ua[k]["n_cases"] == len(T.UNCERTAINTY_BENCHMARK)
+    assert ua["calibration"]["bins"] == [] and any("NOT_MEASURED" in x for x in uncb["aggregate"]["limitations"])
+    pairs = [(0.9, True), (0.9, True), (0.8, False), (0.2, False), (0.1, True)]  # genuine numbers
+    c = T.uncertainty_calibration_metrics(pairs, 9 )
+    assert c["calibration"]["status"] == "MEASURED" and c["calibration"]["n_valid_confidence"] == 5 and c["calibration"]["n_cases"] == 9
+    bins = {b["bin"]: b for b in c["calibration"]["bins"]}
+    assert bins[9] == {"bin": 9, "range": [0.9, 1.0], "count": 2, "mean_confidence": 0.9, "accuracy": 1.0} and bins[8]["count"] == 1 and bins[8]["accuracy"] == 0.0 and bins[1]["accuracy"] == 1.0 and bins[2]["accuracy"] == 0.0
+    assert c["ece"]["value"] == pytest.approx(0.42, abs=1e-4)  # 2/5*0.1 + 1/5*0.8 + 1/5*0.2 + 1/5*0.9
+    assert c["brier"]["value"] == pytest.approx((0.01 + 0.01 + 0.64 + 0.04 + 0.81) / 5, abs=1e-4)
+    perfect = T.uncertainty_calibration_metrics([(1.0, True), (0.0, False)], 2)  # a measured 0.0, not NOT_MEASURED
+    assert perfect["ece"]["value"] == 0.0 and perfect["ece"]["status"] == "MEASURED" and perfect["brier"]["value"] == 0.0
+    junk = T.uncertainty_calibration_metrics([(True, True), (float("nan"), True), (float("inf"), False), (1.5, True), (-0.1, False), ("0.9", True), (None, True), ("HIGH", True)], 8)
+    assert junk["ece"]["reason_code"] == "NO_NUMERIC_CONFIDENCE" and junk["calibration"]["n_valid_confidence"] == 0  # booleans, strings, NaN, inf, out-of-range and categorical labels are never probabilities
+    recs = [_ub_rec("a", "COMPLIANT", _ub_all("COMPLIANT"), conf=0.9), _ub_rec("b", "COMPLIANT", {**_ub_all("COMPLIANT"), "uncertainty_aware": ("NON_COMPLIANT", False)}, conf=0.7)]
+    m = _ub_m(recs)  # aggregate wires only the uncertainty-aware variant's genuine confidences; baselines produce none
+    assert m["brier"]["value"] == pytest.approx((0.01 + 0.49) / 2, abs=1e-4) and _ub_m(recs, "binary_verdict")["ece"]["status"] == T.NOT_MEASURED
+    assert T._uncb_numeric_confidence({"decision_confidence": {"value": None, "status": "NOT_MEASURED", "components": {"compiled_rules": [{"value": 0.9}]}}}) is None  # components are never promoted to a decision confidence
+
+
+def test_uncb_false_positive_and_false_negative_do_not_fold_open_states_into_final_ones():
+    r = _ub_rec("x", "CONDITIONAL", {**_ub_all("CONDITIONAL"), "uncertainty_aware": ("NON_COMPLIANT", False)})
+    m = _ub_m([r, _ub_rec("y", "INSUFFICIENT_EVIDENCE", {**_ub_all("INSUFFICIENT_EVIDENCE"), "uncertainty_aware": ("COMPLIANT", False)})])
+    assert m["false_positive_rate"]["denominator"] == 0 and m["false_negative_rate"]["denominator"] == 0  # open-state labels are in neither denominator
+    assert m["unsafe_finalization_rate"]["value"] == 1.0 and m["unsafe_finalization_rate"]["denominator"] == 2
+
+
+def test_uncb_escalation_and_automation_on_the_benchmark(uncb):
+    agg = uncb["aggregate"]; ua = agg["variants"]["uncertainty_aware"]["metrics"]; recs = uncb["records"]
+    esc = sum(r["predictions"]["uncertainty_aware"]["escalated"] for r in recs)
+    assert ua["escalation_rate"]["numerator"] == esc and ua["escalation_rate"]["denominator"] == len(recs) and 0 < esc < len(recs)  # escalation and non-escalation both occur
+    assert agg["labels_only"]["expected_escalation_rate"]["numerator"] == sum(r["expected_escalation"] for r in recs)  # expected escalation is available separately from the labels
+    auto = [r for r in recs if r["predictions"]["uncertainty_aware"]["state"] in T.UNCB_FINAL_STATES and not r["predictions"]["uncertainty_aware"]["escalated"]]
+    assert ua["automation_coverage"]["numerator"] == len(auto) > 0 and ua["automation_coverage"]["value"] == round(len(auto) / len(recs), 4)
+    assert all(r["expected_state"] in T.UNCB_FINAL_STATES and not r["expected_escalation"] for r in auto)  # every automated case is labelled final and safe
+    for r in recs:  # per-case: reasons the system gives match the hand label where it escalates
+        p = r["predictions"]["uncertainty_aware"]; assert p["escalated"] == r["expected_escalation"] and p["reasons"] == r["expected_reasons"], r["case_id"]
+
+
+def test_uncb_all_four_states_are_exercised_and_scored(uncb):
+    recs = uncb["records"]
+    assert {r["expected_state"] for r in recs} == set(T.UNC_STATES) == {r["predictions"]["uncertainty_aware"]["state"] for r in recs}
+    assert uncb["aggregate"]["benchmark"]["expected_state_counts"].keys() == set(T.UNC_STATES)
+    assert uncb["aggregate"]["variants"]["uncertainty_aware"]["metrics"]["state_accuracy"]["value"] == 1.0
+
+
+def test_uncb_uncertainty_aware_is_compared_against_both_baselines(uncb):
+    cmpx = uncb["aggregate"]["comparison"]; assert set(cmpx["state_accuracy"]) == set(T.UNCB_VARIANTS)
+    assert cmpx["state_accuracy"]["uncertainty_aware"] > cmpx["state_accuracy"]["verdict_with_verification"] > cmpx["state_accuracy"]["binary_verdict"]
+    assert cmpx["unsafe_finalization_rate"]["uncertainty_aware"] < cmpx["unsafe_finalization_rate"]["verdict_with_verification"] < cmpx["unsafe_finalization_rate"]["binary_verdict"]
+    assert cmpx["escalation_false_negative_rate"]["binary_verdict"] == 1.0 and cmpx["escalation_rate"]["binary_verdict"] == 0.0 and cmpx["automation_coverage"]["binary_verdict"] == 1.0
+    assert cmpx["automated_decision_accuracy"]["uncertainty_aware"] > cmpx["automated_decision_accuracy"]["binary_verdict"]
+    r = next(r for r in uncb["records"] if r["case_id"] == "ub_missing_referenced_document")  # a baseline can look right on the verdict and still be unsafe
+    assert r["verdict"] == "SATISFIED" and r["predictions"]["binary_verdict"]["state"] == "COMPLIANT" and r["predictions"]["uncertainty_aware"]["state"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_uncb_never_mutates_a_caller_graph_or_module_state_and_preserves_provenance(tmp_path):
+    G = _unc_g({"i_ib.txt": _UNC_INV}); d = _unc_dec(G); before = T._sv7d_snapshot(G); verdict = G.nodes[d]["verdict"]
+    had, old = hasattr(T, "_COMPILER_MIN_CONFIDENCE"), getattr(T, "_COMPILER_MIN_CONFIDENCE", None)
+    T.uncertainty_variant_predictions(G, d); T._uncb_floor(0.6, lambda: T.uncertainty_variant_predictions(G, d))
+    assert T._sv7d_snapshot(G) == before and G.nodes[d]["verdict"] == verdict
+    res = T.run_uncertainty_benchmark()
+    assert hasattr(T, "_COMPILER_MIN_CONFIDENCE") == had and getattr(T, "_COMPILER_MIN_CONFIDENCE", None) == old  # the declared floor is restored
+    assert all(r["graph_unchanged"] and r["id_integrity"]["evidence_ids_in_graph"] and r["id_integrity"]["provenance_matches_graph"] and r["id_integrity"]["rule_ids_in_graph"] and r["id_integrity"]["verdict_preserved"] and r["id_integrity"]["contract_problems"] == [] for r in res["records"])
+    assert not any(k.endswith("_id") or k == "evidence_ids" for r in res["records"] for k in r if k != "case_id")  # no random graph ids leak into records
+    out = tmp_path / "uncb.json"; assert not out.exists()
+    T.run_uncertainty_benchmark(output_path=str(out)); assert json.loads(out.read_text(encoding="utf-8"))["benchmark_id"] == T.UNCB_ID
+
+
+def test_uncb_unresolved_vs_resolved_contradiction_and_confidence_floor_cases_behave_as_labelled(uncb):
+    by = {r["case_id"]: r["predictions"]["uncertainty_aware"] for r in uncb["records"]}
+    assert (by["ub_major_contradiction_vendor"]["state"], by["ub_major_contradiction_vendor"]["escalated"]) == ("CONDITIONAL", True)
+    assert (by["ub_major_contradiction_resolved"]["state"], by["ub_major_contradiction_resolved"]["escalated"]) == ("COMPLIANT", False)
+    assert (by["ub_minor_contradiction_unresolved"]["state"], by["ub_minor_contradiction_unresolved"]["reasons"]) == ("COMPLIANT", ["UNRESOLVED_CONTRADICTION"])
+    assert by["ub_low_confidence_component"]["reasons"] == ["LOW_CONFIDENCE"] and by["ub_confidence_above_floor"]["escalated"] is False
+    assert by["ub_noncompliant_amount"]["escalated"] is False and by["ub_high_risk"]["reasons"] == ["HIGH_RISK"] and by["ub_not_applicable"]["state"] == "INSUFFICIENT_EVIDENCE" and by["ub_not_applicable"]["escalated"] is False
+
+# --- OMNI-Bench foundation: schema + leakage validation ---
+def _ob_case(**o):
+    c = {"case_id": "c1", "family_id": "f1", "split": "TRAIN", "document_set": [{"doc_id": "d1", "text": "Invoice paid 2024-01-01"}],
+         "policy": "Invoices must be paid within 30 days.", "expected_decision": "COMPLIANT", "applicable_policy_rule": "R1",
+         "supporting_evidence": ["d1"], "contradicting_evidence": [], "missing_evidence": [], "expected_escalation": False,
+         "counterfactual_correction": "Remove d1 -> INSUFFICIENT_EVIDENCE", "difficulty_category": "simple_compliance"}
+    c.update(o)
+    return c
+
+
+def _ob_other(cid, fam, split, text="other"):
+    return _ob_case(case_id=cid, family_id=fam, split=split, document_set=[{"doc_id": "d1", "text": text}])
+
+
+def test_omni_bench_definitions_and_foundation():
+    assert [c[1] for c in T.OMNI_BENCH_CATEGORIES] == [
+        "Simple compliance", "Multi-document compliance", "Contradictory evidence", "Missing evidence", "Policy exceptions", "Temporal violations",
+        "Entity mismatch", "Distractor documents", "OCR noise", "Policy paraphrasing", "Ambiguous policies", "Adversarial document content",
+        "Prompt injection inside documents", "Conflicting policies", "Evidence removal"]
+    assert list(T.OMNI_BENCH_SPLITS) == ["TRAIN", "DEV", "TEST"]
+    assert T.validate_omni_bench_cases() == [] and T.validate_omni_bench_metadata() == []
+
+
+def test_omni_bench_metadata_validation():
+    m = dict(T.OMNI_BENCH_METADATA); m["seed_policy"] = ""; m["split_definitions"] = {"TRAIN": "x"}
+    assert len(T.validate_omni_bench_metadata(m)) == 2
+
+
+def test_omni_bench_valid_cases_pass_and_are_deterministic():
+    cs = [_ob_case(), _ob_other("c2", "f2", "TEST")]
+    assert T.validate_omni_bench_cases(cs) == [] and T.validate_omni_bench_cases(cs) == T.validate_omni_bench_cases(list(reversed(cs)))
+
+
+def test_omni_bench_duplicate_case_ids():
+    assert any("duplicate case_id" in p for p in T.validate_omni_bench_cases([_ob_case(), _ob_case(family_id="f2", document_set=[{"doc_id": "d1", "text": "z"}])]))
+
+
+def test_omni_bench_family_cannot_cross_splits():
+    assert any("multiple splits" in p for p in T.validate_omni_bench_cases([_ob_case(), _ob_other("c2", "f1", "TEST")]))
+    assert T.validate_omni_bench_cases([_ob_case(), _ob_other("c2", "f1", "TRAIN")]) == []
+
+
+def test_omni_bench_identical_content_cannot_cross_splits():
+    assert any("identical document_set+policy" in p for p in T.validate_omni_bench_cases([_ob_case(), _ob_case(case_id="c2", family_id="f2", split="TEST")]))
+
+
+def test_omni_bench_missing_fields_categories_and_splits():
+    for f in T.OMNI_BENCH_REQUIRED_FIELDS:
+        c = _ob_case(); del c[f]
+        assert any(f"missing required field '{f}'" in p for p in T.validate_omni_bench_cases([c])), f
+    assert any("invalid difficulty_category" in p for p in T.validate_omni_bench_cases([_ob_case(difficulty_category="Simple compliance ")]))
+    assert any("invalid split" in p for p in T.validate_omni_bench_cases([_ob_case(split="VALIDATION")]))
+
+
+def test_omni_bench_malformed_ground_truth():
+    bad = [dict(expected_decision="MAYBE"), dict(expected_escalation="yes"), dict(supporting_evidence="d1"), dict(supporting_evidence=["nope"]),
+           dict(document_set=[]), dict(document_set=[{"doc_id": "d1"}]), dict(counterfactual_correction=5),
+           dict(expected_decision="INSUFFICIENT_EVIDENCE", missing_evidence=[])]
+    for o in bad:
+        assert T.validate_omni_bench_cases([_ob_case(**o)]), o
+
+
+def test_omni_bench_rejects_prediction_derived_ground_truth():
+    assert any("prediction-derived" in p for p in T.validate_omni_bench_cases([_ob_case(predicted_decision="COMPLIANT")]))
+    assert any("prediction-derived" in p for p in T.validate_omni_bench_cases([_ob_case(provenance={"model_output": "x"})]))
+    assert any("label_source" in p for p in T.validate_omni_bench_cases([_ob_case(label_source="system_prediction")]))
+    assert T.validate_omni_bench_cases([_ob_case(label_source="human_annotation")]) == []
+
+
+# --- OMNI-Bench population: 15 categories x 3 splits, deterministic hand-authored cases ---
+import ast, datetime as _dt, json, re
+
+_OB_RULE = re.compile(r"[A-Z]{2,5}-\d+\.\d+")
+_OB_INJ = re.compile(r"IGNORE ALL PREVIOUS|SYSTEM OVERRIDE|Note to the AI auditor|Attention automated reviewer|New instructions|\[ADMIN\]")
+
+
+def _ob_cat(cat): return [c for c in T.OMNI_BENCH_CASES if c["difficulty_category"] == cat]
+def _ob_fams(cat):
+    g = collections.defaultdict(list)
+    for c in _ob_cat(cat): g[c["family_id"]].append(c)
+    return [sorted(v, key=lambda c: c["case_id"]) for _, v in sorted(g.items())]
+def _ob_dates(c): return [_dt.date.fromisoformat(x) for x in re.findall(r"\d{4}-\d{2}-\d{2}", " ".join(d["text"] for d in c["document_set"]))]
+
+
+def test_omni_bench_population_covers_all_categories_and_splits():
+    cs = T.OMNI_BENCH_CASES
+    assert {c["split"] for c in cs} == {"TRAIN", "DEV", "TEST"}
+    cells = collections.Counter((c["difficulty_category"], c["split"]) for c in cs)
+    for cat in T.OMNI_BENCH_CATEGORY_IDS:
+        assert len(_ob_cat(cat)) >= 8 and len(_ob_fams(cat)) >= 4, cat
+        assert len({c["expected_decision"] for c in _ob_cat(cat)}) >= 2, cat
+        for sp in T.OMNI_BENCH_SPLITS: assert cells[(cat, sp)] >= 2, (cat, sp)
+    assert {c["expected_decision"] for c in cs} == set(T.OMNI_BENCH_DECISIONS) and {c["expected_escalation"] for c in cs} == {True, False}
+
+
+def test_omni_bench_population_passes_schema_and_metadata_validation():
+    assert T.validate_omni_bench_cases() == [] and T.validate_omni_bench_metadata() == []
+    assert len({c["case_id"] for c in T.OMNI_BENCH_CASES}) == len(T.OMNI_BENCH_CASES)
+    assert T.OMNI_BENCH_METADATA["generation_methodology"].startswith("Hand-authored") and T.OMNI_BENCH_METADATA["seed_policy"].startswith("No randomness")
+    assert "inert data" in T.OMNI_BENCH_METADATA["document_content_policy"]
+
+
+def test_omni_bench_population_family_and_content_leakage_impossible():
+    cs = T.OMNI_BENCH_CASES
+    fam, content, doc_text = (collections.defaultdict(set) for _ in range(3))
+    for c in cs:
+        fam[c["family_id"]].add(c["split"])
+        content[json.dumps([c["document_set"], c["policy"]], sort_keys=True)].add(c["split"])
+        for d in c["document_set"]: doc_text[d["text"]].add(c["split"])
+    assert all(len(s) == 1 for s in (*fam.values(), *content.values(), *doc_text.values()))
+    # the validator still rejects leakage injected into the real population
+    assert any("identical document_set+policy" in p for p in T.validate_omni_bench_cases(cs + [dict(cs[0], case_id="OB-LEAK-1", family_id="FAM-LEAK-1", split="TEST")]))
+    assert any("multiple splits" in p for p in T.validate_omni_bench_cases(cs + [dict(cs[0], case_id="OB-LEAK-2", split="TEST", document_set=[{"doc_id": "d1", "text": "x"}])]))
+
+
+def test_omni_bench_population_is_deterministic_and_offline():
+    mod = importlib.import_module("omni_pkg_under_test.omni_bench_cases")
+    a, b = T.build_omni_bench_cases(), T.build_omni_bench_cases()
+    assert a == b == T.OMNI_BENCH_CASES and json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    a[0]["document_set"][0]["text"] = "mutated"
+    assert T.build_omni_bench_cases() == T.OMNI_BENCH_CASES  # fresh objects each call
+    mods = {n.names[0].name.split(".")[0] if isinstance(n, ast.Import) else n.module for n in ast.walk(ast.parse(pathlib.Path(mod.__file__).read_text())) if isinstance(n, (ast.Import, ast.ImportFrom))}
+    assert mods <= {"copy", "datetime", "typing"}
+
+
+def test_omni_bench_population_ground_truth_is_independent_and_policy_grounded():
+    for c in T.OMNI_BENCH_CASES:
+        assert c["label_source"] == "synthetic_construction" and not T._omni_bench_has_forbidden_key(c)
+        rule_ids = _OB_RULE.findall(c["applicable_policy_rule"])
+        assert rule_ids and all(r in c["policy"] for r in rule_ids), c["case_id"]
+        assert set(_OB_RULE.findall(c["counterfactual_correction"])) & set(_OB_RULE.findall(c["policy"])), c["case_id"]
+        if c["expected_decision"] == "INSUFFICIENT_EVIDENCE": assert c["missing_evidence"] and c["expected_escalation"] is True, c["case_id"]
+
+
+def test_omni_bench_category_invariants_basic_structure():
+    assert all(len(c["document_set"]) == 1 for c in _ob_cat("simple_compliance"))
+    assert all(len(c["document_set"]) >= 3 and len(c["supporting_evidence"]) >= 2 for c in _ob_cat("multi_document_compliance"))
+    assert all(c["supporting_evidence"] and c["contradicting_evidence"] for c in _ob_cat("contradictory_evidence") if c["expected_decision"] == "INSUFFICIENT_EVIDENCE")
+    assert all(bool(c["missing_evidence"]) == (c["expected_decision"] == "INSUFFICIENT_EVIDENCE") for c in _ob_cat("missing_evidence"))
+    for c in _ob_cat("distractor_documents"):
+        assert len(c["document_set"]) >= 4 and c["supporting_evidence"] == ["d1"] and c["contradicting_evidence"] == []
+    for fam in _ob_fams("policy_exceptions"):
+        assert {c["expected_decision"] for c in fam} == {"COMPLIANT", "NON_COMPLIANT"} and all("Exception" in c["policy"] for c in fam)
+    for fam in _ob_fams("contradictory_evidence"):  # same documents: only the policy's precedence clause decides
+        assert fam[0]["document_set"] == fam[1]["document_set"] and "prevails" in fam[1]["policy"] and "prevails" not in fam[0]["policy"]
+
+
+def test_omni_bench_category_invariants_temporal_ocr_and_entity_oracles():
+    for cat, noisy in (("temporal_violations", False), ("ocr_noise", True)):
+        for c in _ob_cat(cat):  # test-side oracle recomputed from the quoted policy and document dates only
+            n, (d0, d1) = int(re.search(r"within (\d+)", c["policy"]).group(1)), _ob_dates(c)[:2]
+            assert c["expected_decision"] == ("COMPLIANT" if (d1 - d0).days <= n else "NON_COMPLIANT"), c["case_id"]
+            if noisy: assert all(d["text"].startswith("| ") and re.search(r"[A-Za-z][01][A-Za-z]", d["text"]) for d in c["document_set"]), c["case_id"]
+    for c in _ob_cat("entity_mismatch"):
+        m1 = re.search(r"to (.+?), registration (\S+?)\. Status", c["document_set"][0]["text"]); m2 = re.search(r"clearance: (.+?) cleared; registration (\S+?)\.", c["document_set"][1]["text"])
+        assert c["expected_decision"] == ("COMPLIANT" if m1.groups() == m2.groups() else "NON_COMPLIANT"), c["case_id"]
+        if m1.groups() == m2.groups(): assert c["supporting_evidence"] == ["d1", "d2"] and c["contradicting_evidence"] == [], c["case_id"]
+        else: assert c["supporting_evidence"] == ["d1"] and c["contradicting_evidence"] == ["d2"], c["case_id"]  # mismatched clearance is contradicting, never supporting
+
+
+def test_omni_bench_category_invariants_paraphrasing_and_ambiguity():
+    for fam in _ob_fams("policy_paraphrasing"):
+        assert len(fam) >= 3 and len({c["policy"] for c in fam}) == len(fam)
+        assert all(c["document_set"] == fam[0]["document_set"] and c["expected_decision"] == fam[0]["expected_decision"] and c["expected_escalation"] == fam[0]["expected_escalation"]
+                   and c["counterfactual_correction"] == fam[0]["counterfactual_correction"] for c in fam)
+        n = {re.search(r"(\d+) business days", c["policy"]).group(1) for c in fam}; r = int(re.search(r"returned (\d+) business days", fam[0]["document_set"][0]["text"]).group(1))
+        assert len(n) == 1 and fam[0]["expected_decision"] == ("COMPLIANT" if r <= int(n.pop()) else "NON_COMPLIANT")
+    for c in _ob_cat("ambiguous_policies"):
+        if c["expected_decision"] == "INSUFFICIENT_EVIDENCE":
+            assert c["expected_escalation"] and "definition" in c["missing_evidence"][0] and not re.search(r"\d+ ?(days|years|hours|%)", c["policy"]), c["case_id"]
+        else: assert c["expected_escalation"] is False
+
+
+def test_omni_bench_category_invariants_conflicts_removal_injection_adversarial():
+    for c in _ob_cat("conflicting_policies"):
+        ids = set(_OB_RULE.findall(c["applicable_policy_rule"]))
+        assert len(ids) >= 2 and ids <= set(_OB_RULE.findall(c["policy"])), c["case_id"]
+        if "PRC-1.0" in c["policy"]: assert c["expected_decision"] != "INSUFFICIENT_EVIDENCE" and not c["expected_escalation"]
+        else: assert c["expected_decision"] == "INSUFFICIENT_EVIDENCE" and c["expected_escalation"] and "precedence" in c["missing_evidence"][0]
+    for base, removed, irrelevant in _ob_fams("evidence_removal"):  # convention: A base, B decisive evidence removed, C irrelevant document removed
+        ids = lambda c: {d["doc_id"] for d in c["document_set"]}
+        assert ids(removed) < ids(base) and ids(irrelevant) < ids(base) and {c["split"] for c in (base, removed, irrelevant)} == {base["split"]}
+        assert removed["expected_decision"] == "INSUFFICIENT_EVIDENCE" and removed["missing_evidence"] and set(removed["supporting_evidence"]) <= ids(removed)
+        assert irrelevant["expected_decision"] == base["expected_decision"] and base["document_set"][:1] == removed["document_set"][:1]
+        assert "does not change the expected decision" in irrelevant["counterfactual_correction"] and base["expected_decision"] in irrelevant["counterfactual_correction"]
+        assert "INSUFFICIENT_EVIDENCE" not in irrelevant["counterfactual_correction"] and "restored" in removed["counterfactual_correction"]
+    for c in _ob_cat("prompt_injection_inside_documents"):  # injected text is inert content: label follows the evidence, never the injected demand
+        assert any(_OB_INJ.search(d["text"]) for d in c["document_set"]) and not _OB_INJ.search(" ".join([c["policy"], c["counterfactual_correction"], c["applicable_policy_rule"], *c["missing_evidence"]]))
+        assert c["expected_decision"] == ("NON_COMPLIANT" if "Attachment: none" in c["document_set"][0]["text"] else "COMPLIANT"), c["case_id"]
+    for c in _ob_cat("adversarial_document_content"):
+        assert c["expected_decision"] == ("COMPLIANT" if any("issued by" in d["text"] for d in c["document_set"]) else "NON_COMPLIANT"), c["case_id"]
+        assert bool(c["contradicting_evidence"]) == (c["expected_decision"] == "COMPLIANT")
+
+
+# --- OMNI-Bench evaluator: structured counterfactual check + strict prediction container ---
+import json as _json_ev
+E = importlib.import_module("omni_pkg_under_test.omni_bench_eval")
+_CF_BASE = "Remove d1 -> INSUFFICIENT_EVIDENCE"
+
+
+def _ev_case(cid="c1", cf=_CF_BASE, **o):
+    return _ob_case(case_id=cid, family_id="f_" + cid, document_set=[{"doc_id": "d1", "text": "Invoice " + cid}, {"doc_id": "d2", "text": "PO " + cid}], counterfactual_correction=cf, **o)
+
+
+def _ev_pred(cid="c1", **o):
+    p = {"case_id": cid, "predicted_decision": "COMPLIANT"}
+    p.update(o)
+    return p
+
+
+def _cf_result(case, predicted):
+    r = E.evaluate_omni_bench([_ev_pred(case["case_id"], predicted_counterfactual_correction=predicted)], cases=[case])
+    assert r["status"] == "MEASURED", r
+    return r["per_case"][0]["counterfactual_correct"], r["overall"]["counterfactual_correctness"]
+
+
+def test_evaluator_equivalent_counterfactual_wording_is_scored_correct():
+    assert _cf_result(_ev_case(), "If d1 is removed, the decision becomes INSUFFICIENT_EVIDENCE.") == (True, 1.0)
+    assert _cf_result(_ev_case(), "  remove   d1 -> insufficient_evidence ")[0] is True
+    rule_case = _ev_case(cf="Per PRC-1.0, restore d2 -> COMPLIANT")
+    assert _cf_result(rule_case, "COMPLIANT results once d2 is restored under PRC-1.0")[0] is True
+
+
+def test_evaluator_materially_different_counterfactual_is_rejected():
+    case = _ev_case()
+    for wrong in ("Remove d1 -> COMPLIANT", "Remove d1 -> NON_COMPLIANT", "Remove d2 -> INSUFFICIENT_EVIDENCE", "Remove d1 and d2 -> INSUFFICIENT_EVIDENCE",
+                  "Removing d1 does not change the decision INSUFFICIENT_EVIDENCE"):
+        assert _cf_result(case, wrong) == (False, 0.0), wrong
+    assert _cf_result(_ev_case(cf="Per PRC-1.0, restore d2 -> COMPLIANT"), "Per PRC-2.0, restore d2 -> COMPLIANT")[0] is False
+    assert _cf_result(_ev_case(cf="Extend the deadline to 30 days -> COMPLIANT"), "Extend the deadline to 45 days -> COMPLIANT")[0] is False
+    assert _cf_result(_ev_case(cf="Adding d2 does not change the expected decision COMPLIANT"), "Adding d2 -> NON_COMPLIANT")[0] is False
+
+
+def test_evaluator_ambiguous_counterfactual_is_not_measured():
+    case = _ev_case()
+    for vague in ("Remove the invoice", "INSUFFICIENT_EVIDENCE", "Remove d1", "Something would be different"):  # no anchors, or anchors incomplete
+        got, agg = _cf_result(case, vague)
+        assert got == E.NOT_MEASURED and agg == E.NOT_MEASURED, vague
+    assert _cf_result(_ev_case(cf="The evidence must be restored"), "Restore the evidence")[0] == E.NOT_MEASURED  # benchmark text has no deterministic anchor
+    r = E.evaluate_omni_bench([_ev_pred()], cases=[_ev_case()])  # no counterfactual supplied
+    assert r["per_case"][0]["counterfactual_correct"] == E.NOT_MEASURED and r["overall"]["counterfactual_correctness"] == E.NOT_MEASURED
+
+
+def test_evaluator_rejects_malformed_prediction_container():
+    case = _ev_case()
+    rec = _ev_pred()
+    for bad in ({"c1": rec}, rec, "c1", 5, (r for r in [rec]), {"c1"}):
+        r = E.evaluate_omni_bench(bad, cases=[case])
+        assert r["status"] == "INVALID_PREDICTIONS" and r["errors"] and "list or tuple" in r["errors"][0], bad
+        assert "per_case" not in r
+    assert E.validate_omni_bench_predictions({"c1": rec}, cases=[case]) == ["predictions must be a list or tuple of records"]
+    assert E.evaluate_omni_bench(None, cases=[case])["status"] == "NOT_MEASURED" and E.evaluate_omni_bench([], cases=[case])["status"] == "NOT_MEASURED"
+    assert E.evaluate_omni_bench((rec,), cases=[case])["status"] == "MEASURED" and E.evaluate_omni_bench([rec], cases=[case])["status"] == "MEASURED"
+    assert E.evaluate_omni_bench(["not a record"], cases=[case])["status"] == "INVALID_PREDICTIONS"
+
+
+def _ev_perfect(c):
+    return {"case_id": c["case_id"], "predicted_decision": c["expected_decision"], "predicted_escalation": c["expected_escalation"], "predicted_applicable_policy_rule": c["applicable_policy_rule"],
+            "predicted_supporting_evidence": list(c["supporting_evidence"]), "predicted_contradicting_evidence": list(c["contradicting_evidence"]),
+            "predicted_missing_evidence": list(c["missing_evidence"]), "predicted_counterfactual_correction": c["counterfactual_correction"]}
+
+
+def test_evaluator_existing_perfect_and_wrong_metrics_unchanged():
+    cases = [_ev_case("c1"), _ev_case("c2", expected_decision="NON_COMPLIANT", expected_escalation=True, contradicting_evidence=["d2"], supporting_evidence=["d1"])]
+    perfect = E.evaluate_omni_bench([_ev_perfect(c) for c in cases], cases=cases)
+    o = perfect["overall"]
+    assert perfect["status"] == "MEASURED" and perfect["complete"] is True and perfect["coverage"] == 1.0
+    for k in ("decision_accuracy", "escalation_accuracy", "policy_rule_accuracy", "counterfactual_correctness", "supporting_evidence_f1", "contradicting_evidence_f1"):
+        assert o[k] == 1.0, k
+    assert o["missing_evidence_precision"] == E.NOT_MEASURED  # nothing predicted or expected: still not measured
+    wrong = []
+    for c in cases:
+        w = _ev_perfect(c)
+        w.update(predicted_decision="COMPLIANT" if c["expected_decision"] != "COMPLIANT" else "NON_COMPLIANT", predicted_escalation=not c["expected_escalation"],
+                 predicted_applicable_policy_rule="ZZ-9.9", predicted_supporting_evidence=["d2"] if c["supporting_evidence"] == ["d1"] else ["d1"],
+                 predicted_counterfactual_correction="Remove d1 -> COMPLIANT")
+        wrong.append(w)
+    o = E.evaluate_omni_bench(wrong, cases=cases)["overall"]
+    for k in ("decision_accuracy", "escalation_accuracy", "policy_rule_accuracy", "counterfactual_correctness", "supporting_evidence_f1"):
+        assert o[k] == 0.0, k
+    assert o["denominators"]["decision_accuracy"] == 2 and o["denominators"]["counterfactual_correctness"] == 2
+
+
+def test_evaluator_repeated_evaluation_is_identical_and_non_mutating():
+    cases = [_ev_case("c1"), _ev_case("c2", cf="Per PRC-1.0, restore d2 -> COMPLIANT")]
+    preds = [_ev_perfect(cases[0]), dict(_ev_perfect(cases[1]), predicted_counterfactual_correction="COMPLIANT once d2 is restored under PRC-1.0")]
+    before_p, before_c = _json_ev.dumps(preds, sort_keys=True), _json_ev.dumps(cases, sort_keys=True)
+    a, b = E.evaluate_omni_bench(preds, cases=cases), E.evaluate_omni_bench(tuple(preds), cases=cases)
+    assert _json_ev.dumps(a, sort_keys=True) == _json_ev.dumps(b, sort_keys=True) == _json_ev.dumps(E.evaluate_omni_bench(preds, cases=cases), sort_keys=True)
+    assert a["per_case"][1]["counterfactual_correct"] is True
+    assert _json_ev.dumps(preds, sort_keys=True) == before_p and _json_ev.dumps(cases, sort_keys=True) == before_c
