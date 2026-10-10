@@ -39,13 +39,13 @@ V2_COMPONENT_FLAGS: Dict[str, bool] = {"ENABLE_CROSS_DOCUMENT_LINKING": False, "
 V2_COMPONENT_MAP = {"cross_document_linking": "ENABLE_CROSS_DOCUMENT_LINKING", "cross_document_reasoning": "ENABLE_CROSS_DOCUMENT_REASONING",
                     "contradiction_detection": "ENABLE_CONTRADICTION_HEURISTIC", "compiled_policy": "COMPILED_POLICY_ENABLED"}
 V2_NO_FLAG_COMPONENTS = ("self_verification", "counterfactual", "uncertainty")  # no tasks.py flag exists; V2 simply never calls them
-V2_UNAVAILABLE_FIELDS = ("predicted_escalation", "predicted_supporting_evidence", "predicted_contradicting_evidence", "predicted_missing_evidence", "predicted_contradiction_detected")  # omitted, not defaulted
+V2_UNAVAILABLE_FIELDS = ("predicted_escalation", "predicted_contradicting_evidence", "predicted_missing_evidence", "predicted_contradiction_detected")  # omitted, not defaulted
 V3_COMPONENT_FLAGS: Dict[str, bool] = {**V2_COMPONENT_FLAGS, "COMPILED_POLICY_ENABLED": True}  # V3 = V2 graph-only run + existing compiled-policy stage; nothing else changes
 V4_COMPONENT_FLAGS: Dict[str, bool] = {**V3_COMPONENT_FLAGS, "ENABLE_CROSS_DOCUMENT_LINKING": True, "ENABLE_CROSS_DOCUMENT_REASONING": True}  # V4 = V3 + existing cross-document linking/reasoning; contradiction heuristic stays off
 V5_COMPONENT_FLAGS: Dict[str, bool] = {**V4_COMPONENT_FLAGS, "ENABLE_CONTRADICTION_HEURISTIC": True}  # V5 = V4 + existing contradiction heuristic; nothing else changes
 V6_COMPONENT_FLAGS: Dict[str, bool] = dict(V5_COMPONENT_FLAGS)  # V6 = V5 flags unchanged; self-verification has no tasks.py flag, it is invoked explicitly (see run_v6_graph)
 V6_VARIANT = "EVIDENCE_GRAPH_SELF_VERIFICATION"  # key of the 7B (self-verification, pre-applicability) variant in tasks.self_verification_variant_predictions; absent key -> honest unanswered, never a fallback
-V6_UNAVAILABLE_FIELDS = ("predicted_supporting_evidence", "predicted_contradicting_evidence", "predicted_missing_evidence", "predicted_contradiction_detected")  # omitted, not defaulted
+V6_UNAVAILABLE_FIELDS = ("predicted_missing_evidence",)  # omitted, not defaulted
 V7_COMPONENT_FLAGS: Dict[str, bool] = dict(V6_COMPONENT_FLAGS)  # V7 = V6 flags unchanged; counterfactual has no tasks.py flag, it is invoked explicitly (see run_v6_graph cf_log)
 V7_VARIANT = V6_VARIANT  # V7 decision/escalation come from the V6 path unchanged
 V7_UNAVAILABLE_FIELDS = V6_UNAVAILABLE_FIELDS  # tasks.build_counterfactual returns no decision, evidence-role or contradiction field the evaluator can compare: nothing is added to the prediction record
@@ -69,6 +69,49 @@ _VERDICT_RANK = {"VIOLATION": 0, "INDETERMINATE": 1, "SATISFIED": 2}
 def _sha(text: str) -> str: return hashlib.sha256(text.encode("utf-8")).hexdigest()
 def _rec(r: Any) -> Dict[str, Any]: return r.to_dict() if hasattr(r, "to_dict") else copy.deepcopy(r)
 
+
+# Cross-version compile-response cache: exact prompt hashes only; raw provider text is never
+# written to experiment outputs. The same compile prompt replays identically in V4-V8.
+_COMPILER_RESPONSE_CACHE: Dict[str, Optional[str]] = {}
+_COMPILER_CACHE_LOG: List[Dict[str, Any]] = []
+
+@contextlib.contextmanager
+def cached_compiler_responses(tasks: Any):
+    """Temporarily cache policy_compiler._call_llm by SHA-256 of the exact prompt pair."""
+    compile_fn = getattr(tasks, "_compile_policy", None)
+    module_name = getattr(compile_fn, "__module__", None)
+    compiler_module = sys.modules.get(module_name) if module_name else None
+    original = getattr(compiler_module, "_call_llm", None) if compiler_module else None
+    if not callable(original):
+        yield {"status": "UNAVAILABLE", "reason": "compiler _call_llm hook not found", "hits": 0, "misses": 0}
+        return
+    start = len(_COMPILER_CACHE_LOG)
+    def _cached(system: str, user: str):
+        key = _sha(str(system) + "\0" + str(user))
+        if key in _COMPILER_RESPONSE_CACHE:
+            value = _COMPILER_RESPONSE_CACHE[key]
+            _COMPILER_CACHE_LOG.append({"prompt_sha256": key, "status": "HIT", "response_sha256": _sha(value) if isinstance(value, str) else None})
+            return value
+        value = original(system, user)
+        if value is not None:
+            _COMPILER_RESPONSE_CACHE[key] = value
+        _COMPILER_CACHE_LOG.append({"prompt_sha256": key, "status": "MISS", "response_sha256": _sha(value) if isinstance(value, str) else None})
+        return value
+    setattr(compiler_module, "_call_llm", _cached)
+    try:
+        yield {"status": "ACTIVE", "start_index": start}
+    finally:
+        setattr(compiler_module, "_call_llm", original)
+
+def compiler_cache_summary(start_index: int = 0) -> Dict[str, Any]:
+    rows = _COMPILER_CACHE_LOG[start_index:]
+    return {"status": "MEASURED", "calls_observed": len(rows),
+            "cache_hits": sum(1 for x in rows if x["status"] == "HIT"),
+            "cache_misses": sum(1 for x in rows if x["status"] == "MISS"),
+            "entries": [{k: v for k, v in x.items()} for x in rows],
+            "cache_entries_total": len(_COMPILER_RESPONSE_CACHE),
+            "cache_key": "SHA-256(system_prompt + NUL + user_prompt)",
+            "raw_response_storage": "in-memory only; response hashes in provenance"}
 
 # ----------------------------------------------------------------------------- version selection / config
 def validate_version(version: Any) -> str:
@@ -238,24 +281,168 @@ def compiled_policy_before_rules(tasks: Any, rulebook_text: str, log: Optional[L
 
 
 def _build_graph(record: Any, tasks: Any, workdir: str, compiled_policy: bool, compile_log: Optional[List[Dict[str, Any]]] = None) -> Any:
+    """Build one graph with the selected version's components isolated.
+
+    tasks.build_evidence_graph calls classify_contradictions unconditionally in some
+    repository revisions, so V2-V4 temporarily replace that call with a no-op. The
+    original callable is always restored. This is runner-side only; tasks.py is not edited.
+    """
     paths, rb, _ = materialize_record(record, workdir)
-    if compiled_policy:
-        with compiled_policy_before_rules(tasks, tasks._rulebook_text_only(rb), compile_log): return tasks.build_evidence_graph(paths, rb)
-    return tasks.build_evidence_graph(paths, rb)
+    version = _ACTIVE_CONFIG.get("version")
+    original_classifier = getattr(tasks, "classify_contradictions", None)
+    suppress_classifier = version in ("V2", "V3", "V4") and callable(original_classifier)
+    if suppress_classifier:
+        def _disabled_classifier(G):
+            # Deliberately do not attach contradiction_findings to G.graph.
+            return {"status": "DISABLED", "findings": 0, "note": "disabled by controlled V2-V4 configuration"}
+        tasks.classify_contradictions = _disabled_classifier
+    try:
+        if compiled_policy:
+            with compiled_policy_before_rules(tasks, tasks._rulebook_text_only(rb), compile_log):
+                return tasks.build_evidence_graph(paths, rb)
+        return tasks.build_evidence_graph(paths, rb)
+    finally:
+        if suppress_classifier:
+            tasks.classify_contradictions = original_classifier
 
 
-def run_v6_graph(record: Any, tasks: Any, workdir: str, calls: List[str], cf_log: Optional[List[Tuple[str, Any]]] = None, unc_log: Optional[List[Tuple[str, Any, Any]]] = None) -> List[Dict[str, Any]]:
-    """V6: the V5 graph build (same helper), then the EXISTING tasks.self_verification_variant_predictions per Decision. Only the 7B variant is read;
-    verify_policy_applicability (7C), counterfactual and uncertainty are never called. Each invocation is appended to calls.
+def _graph_component_proof(G: Any) -> Dict[str, Any]:
+    """Compact, per-record proof of component realization from the actual graph.
+
+    Compilation being called is not enough to prove that V3 affected a decision.
+    This records rule-engine results attached to PolicyRule nodes and whether a
+    Decision node actually selected the compiled engine over the legacy engine.
+    """
+    graph_meta = getattr(G, "graph", {})
+    policies: List[Dict[str, Any]] = []
+    attached_rules: List[Dict[str, Any]] = []
+    decision_nodes: List[Dict[str, Any]] = []
+    try:
+        for node_id, data in G.nodes(data=True):
+            node_type = data.get("type")
+            if node_type == "Policy":
+                cp = data.get("compiled_policy")
+                if isinstance(cp, dict):
+                    stats = cp.get("stats") if isinstance(cp.get("stats"), dict) else {}
+                    inputs = cp.get("inputs") if isinstance(cp.get("inputs"), dict) else {}
+                    policies.append({
+                        "node_id": str(node_id),
+                        "status": cp.get("status"),
+                        "error": cp.get("error"),
+                        "valid_rule_count": stats.get("valid", 0),
+                        "needs_review_rule_count": stats.get("needs_review", 0),
+                        "rejected_rule_count": stats.get("rejected", 0),
+                        "evaluation_error": cp.get("evaluation_error"),
+                        "unmapped_rule_count": len(cp.get("unmapped_rules") or []),
+                        "inputs": {k: inputs.get(k) for k in (
+                            "evaluation_date", "evaluation_date_source", "evidence_supplied",
+                            "evidence_note", "fact_entities", "records", "strict_units", "fx_rates"
+                        )},
+                    })
+            if node_type == "PolicyRule":
+                for entry in data.get("compiled_rules") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+                    compiled_rule = entry.get("compiled_rule") if isinstance(entry.get("compiled_rule"), dict) else {}
+                    attached_rules.append({
+                        "rule_id": entry.get("rule_id"),
+                        "status": entry.get("status"),
+                        "executed": result.get("executed") is True,
+                        "verdict": result.get("verdict"),
+                        "mapped": bool(entry.get("mapping_basis")),
+                        "mapping_basis": entry.get("mapping_basis"),
+                        "rule_type": entry.get("rule_type"),
+                        "confidence": entry.get("confidence"),
+                        "expression": entry.get("expression"),
+                        "source_text": entry.get("source_text"),
+                        "ambiguities": copy.deepcopy(entry.get("ambiguities") or []),
+                        "required_evidence": copy.deepcopy(compiled_rule.get("required_evidence") or []),
+                        "missing_facts": copy.deepcopy(result.get("missing_facts") or []),
+                        "reasons": copy.deepcopy(result.get("reasons") or []),
+                    })
+            if node_type == "Decision":
+                decision_nodes.append({
+                    "node_id": str(node_id),
+                    "evaluation_engine": data.get("evaluation_engine"),
+                    "result_source": data.get("result_source"),
+                    "verdict": data.get("verdict"),
+                    "legacy_verdict": data.get("legacy_verdict"),
+                    "compiled_verdict": data.get("compiled_verdict"),
+                    "compiled_missing_facts": copy.deepcopy(data.get("compiled_missing_facts") or []),
+                    "compiled_verdict_downgraded": data.get("compiled_verdict_downgraded"),
+                })
+    except Exception:  # noqa: BLE001
+        # Keep the proof schema complete even if a custom graph object is malformed.
+        policies = policies or []
+        attached_rules = attached_rules or []
+        decision_nodes = decision_nodes or []
+    xdoc = graph_meta.get("cross_document_summary") if isinstance(graph_meta, dict) else None
+    findings = graph_meta.get("contradiction_findings") if isinstance(graph_meta, dict) else None
+    compiled_decision_count = sum(1 for row in decision_nodes if row.get("evaluation_engine") == "compiled_rule_engine")
+    executed_rule_count = sum(1 for row in attached_rules if row.get("executed"))
+    determinate_rule_count = sum(1 for row in attached_rules if row.get("executed") and row.get("verdict") not in (None, "INDETERMINATE"))
+    return {
+        "cross_document_summary_status": xdoc.get("status") if isinstance(xdoc, dict) else NOT_MEASURED,
+        "contradiction_findings_present": isinstance(graph_meta, dict) and "contradiction_findings" in graph_meta,
+        "contradiction_findings_count": len(findings or []) if isinstance(findings, list) else NOT_MEASURED,
+        "compiled_policy_summaries": policies,
+        "compiled_policy_rule_proof": attached_rules,
+        "decision_nodes": decision_nodes,
+        "compiled_policy_execution": {
+            "policy_summary_count": len(policies),
+            "attached_rule_count": len(attached_rules),
+            "executed_rule_count": executed_rule_count,
+            "determinate_executed_rule_count": determinate_rule_count,
+            "decision_count": len(decision_nodes),
+            "compiled_decision_count": compiled_decision_count,
+            "legacy_decision_count": sum(1 for row in decision_nodes if row.get("evaluation_engine") != "compiled_rule_engine"),
+            "effective_on_decision": compiled_decision_count > 0,
+        },
+        "graph_node_count": G.number_of_nodes() if callable(getattr(G, "number_of_nodes", None)) else NOT_MEASURED,
+    }
+
+
+def run_v6_graph(record: Any, tasks: Any, workdir: str, calls: List[str], cf_log: Optional[List[Tuple[str, Any]]] = None, unc_log: Optional[List[Tuple[str, Any, Any]]] = None, compile_log: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """V6: build the V5 graph with compiled-policy call proof, then invoke the existing 7B verification per Decision.
+    V6 does not call 7C, counterfactual or uncertainty. Each verification invocation is appended to calls.
     V7 only: when cf_log is given, the EXISTING tasks.build_counterfactual(G, dec_id) is called once per Decision AFTER the V6 read and its raw return is appended as (dec_id, result). Returned items are unchanged.
     V8 only: when unc_log is given, the EXISTING tasks.build_uncertainty_assessment(G, dec_id) is called once per Decision AFTER the counterfactual and its raw return is appended as (dec_id, result, problems), problems being the
     existing tasks.validate_uncertainty_assessment(G, result) list when that function exists (else None). V7 passes no unc_log, so it never calls uncertainty."""
-    G = _build_graph(record, tasks, workdir, True)
+    _paths, _rb, filename_to_doc_id = materialize_record(record, workdir)
+    G = _build_graph(record, tasks, workdir, True, compile_log)
+    proof = _graph_component_proof(G)
+    proof["filename_to_doc_id"] = dict(filename_to_doc_id)
+    proof["compiled_policy_call_log"] = copy.deepcopy(compile_log or [])
     out = []
+    selected_version = _ACTIVE_CONFIG.get("version")
     for dec_id, _ in sorted(tasks._nodes_of_type(G, "Decision"), key=lambda kv: kv[0]):
         calls.append(dec_id)
-        var = tasks.self_verification_variant_predictions(G, dec_id)[V6_VARIANT]
-        out.append({"outcome": var["outcome"], "verification_status": var["verification_status"]})
+        # Do not call self_verification_variant_predictions here: that helper eagerly
+        # computes 7B AND 7C. V6/V7 need 7B only; V8 explicitly adds 7C.
+        if selected_version == "V8" and callable(getattr(tasks, "verify_policy_applicability", None)) and callable(getattr(tasks, "verify_self_verification_result", None)):
+            verified = tasks.verify_policy_applicability(G, dec_id)
+            verdict = G.nodes[dec_id].get("verdict")
+            outcome = tasks._sv7d_outcome(verdict, verified.get("verification_status"))
+        elif callable(getattr(tasks, "verify_self_verification_result", None)):
+            verified = tasks.verify_self_verification_result(G, dec_id)
+            verdict = G.nodes[dec_id].get("verdict")
+            outcome = tasks._sv7d_outcome(verdict, verified.get("verification_status"))
+        else:
+            # Compatibility with minimal test doubles; production tasks.py exposes 7B/7C directly.
+            var = tasks.self_verification_variant_predictions(G, dec_id)[V6_VARIANT]
+            verified = var
+            outcome = var["outcome"]
+        row = {"outcome": outcome, "verification_status": verified.get("verification_status"), "component_proof": copy.deepcopy(proof)}
+        if isinstance(verified, dict) and "supporting_evidence" in verified:
+            row["supporting_evidence"] = copy.deepcopy(verified.get("supporting_evidence") or [])
+        if isinstance(verified, dict) and "contradicting_evidence" in verified:
+            row["contradicting_evidence"] = copy.deepcopy(verified.get("contradicting_evidence") or [])
+            verdict = G.nodes[dec_id].get("verdict")
+            asserting = verdict in ("VIOLATION", "SATISFIED")
+            row["contradiction_predicted"] = (any(item.get("source") == "contradiction_finding" and item.get("category") == "MAJOR_CONTRADICTION"
+                                                      for item in row["contradicting_evidence"]) if asserting else None)
+        out.append(row)
         if cf_log is not None: cf_log.append((dec_id, tasks.build_counterfactual(G, dec_id)))
         if unc_log is not None:
             a = tasks.build_uncertainty_assessment(G, dec_id)
@@ -265,29 +452,58 @@ def run_v6_graph(record: Any, tasks: Any, workdir: str, calls: List[str], cf_log
 
 
 def v6_prediction_from_results(record: Any, results: List[Dict[str, Any]], component_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Decision from the self-verification outcome; escalation from the existing verification_status. Fields it cannot supply are OMITTED. No Decision -> None."""
+    """7B decision/escalation plus the evidence and contradiction fields actually supplied by verification."""
     r = _rec(record)
     if not results: return None
-    return {"perturbation_id": r["perturbation_id"], "predicted_decision": _aggregate_decision([OUTCOME_TO_LABEL[x["outcome"]] for x in results]),
-            "predicted_escalation": any(x["verification_status"] == "ESCALATE" for x in results),
-            "provenance": {"system": "V2", "selected_version": "V6", "interface": "build_evidence_graph (V5 flags) + self_verification_variant_predictions[" + V6_VARIANT + "]",
-                           "variant": V6_VARIANT, "decision_count": len(results), "decision_outcomes": sorted(x["outcome"] for x in results), "component_state": copy.deepcopy(component_state),
-                           "unavailable_fields": list(V6_UNAVAILABLE_FIELDS), "perturbation_provenance": copy.deepcopy(r["provenance"])}}
+    prediction = {"perturbation_id": r["perturbation_id"],
+                  "predicted_decision": _aggregate_decision([OUTCOME_TO_LABEL[x["outcome"]] for x in results]),
+                  "predicted_escalation": any(x["verification_status"] == "ESCALATE" for x in results)}
+    proof = results[0].get("component_proof") or {}
+    names = proof.get("filename_to_doc_id") or {}
+    if any("supporting_evidence" in x for x in results):
+        sup_refs = [ref for x in results for ref in (x.get("supporting_evidence") or [])]
+        prediction["predicted_supporting_evidence"] = sorted({names[ref["filename"]] for ref in sup_refs
+                                                               if isinstance(ref, dict) and ref.get("filename") in names})
+    if any("contradicting_evidence" in x for x in results):
+        con_items = [item for x in results for item in (x.get("contradicting_evidence") or [])]
+        sup_refs = [ref for x in results for ref in (x.get("supporting_evidence") or [])]
+        sup_eids = {ref.get("evidence_id") for ref in sup_refs if isinstance(ref, dict)}
+        prediction["predicted_contradicting_evidence"] = sorted(_contra_docs(con_items, sup_eids, names))
+        flags = [x.get("contradiction_predicted") for x in results if isinstance(x.get("contradiction_predicted"), bool)]
+        prediction["predicted_contradiction_detected"] = (any(flags) if flags else None)
+    prediction["provenance"] = {"system": "V2", "selected_version": "V6",
+        "interface": "build_evidence_graph (V5 flags) + verify_self_verification_result (7B)",
+        "variant": V6_VARIANT, "decision_count": len(results),
+        "decision_outcomes": sorted(x["outcome"] for x in results),
+        "component_state": copy.deepcopy(component_state),
+        "unavailable_fields": list(V6_UNAVAILABLE_FIELDS),
+        "component_proof": [copy.deepcopy(x.get("component_proof")) for x in results],
+        "perturbation_provenance": copy.deepcopy(r["provenance"])}
+    return prediction
+
 
 
 def predict_v6(records: Iterable[Any], tasks: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Caller must already have applied V6 flags (see run_version). component_state is read from tasks; self_verification is marked enabled and invoked from the real call log."""
-    state, calls = v2_component_state(tasks), []
+    state, calls, compiled_calls = v2_component_state(tasks), [], []
     answered, unanswered = [], []
     for rec in records:
         r = _rec(rec)
+        compile_log: List[Dict[str, Any]] = []
         try:
-            with tempfile.TemporaryDirectory(prefix="omnibench_v6_") as wd: res = run_v6_graph(r, tasks, wd, calls)
+            with tempfile.TemporaryDirectory(prefix="omnibench_v6_") as wd: res = run_v6_graph(r, tasks, wd, calls, compile_log=compile_log)
         except Exception as e:  # noqa: BLE001
+            compiled_calls.extend(compile_log)
             unanswered.append({"perturbation_id": r["perturbation_id"], "reason": f"{type(e).__name__}: {e}"}); continue
+        compiled_calls.extend(compile_log)
         if not res: unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
         else: answered.append((r, res))
-    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.self_verification_variant_predictions; no tasks.py flag"}
+    state["compiled_policy"] = {"flag": "COMPILED_POLICY_ENABLED", "enabled": bool(getattr(tasks, "COMPILED_POLICY_ENABLED", False)),
+                                "invoked": any(isinstance(x, dict) and x.get("status") == "CALLED" for x in compiled_calls),
+                                "invocations": sum(1 for x in compiled_calls if isinstance(x, dict) and x.get("status") == "CALLED"),
+                                "call_log_records": len(compiled_calls)}
+    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.verify_self_verification_result (7B); no tasks.py flag"}
+    state["policy_applicability"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0, "note": "7C is disabled for V6"}
     return [v6_prediction_from_results(r, res, state) for r, res in answered], unanswered, state
 
 
@@ -305,29 +521,37 @@ def v7_prediction_from_results(record: Any, results: List[Dict[str, Any]], cf_en
     p = v6_prediction_from_results(record, results, component_state)
     if p is None: return None
     pv = p["provenance"]
-    pv.update({"selected_version": "V7", "interface": "build_evidence_graph (V5 flags) + self_verification_variant_predictions[" + V7_VARIANT + "] + build_counterfactual",
+    pv.update({"selected_version": "V7", "interface": "build_evidence_graph (V5 flags) + verify_self_verification_result (7B) + build_counterfactual",
                "unavailable_fields": list(V7_UNAVAILABLE_FIELDS), "counterfactual": copy.deepcopy(cf_entries)})
     return p
 
 
 def predict_v7(records: Iterable[Any], tasks: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Caller must already have applied V7 flags (see run_version). V6 path + existing counterfactual per Decision. Uncertainty is never called."""
-    state, calls, cf_calls = v2_component_state(tasks), [], []
+    state, calls, cf_calls, compiled_calls = v2_component_state(tasks), [], [], []
     answered, unanswered = [], []
     for rec in records:
         r = _rec(rec)
         cf_log: List[Tuple[str, Any]] = []
+        compile_log: List[Dict[str, Any]] = []
         try:
-            with tempfile.TemporaryDirectory(prefix="omnibench_v7_") as wd: res = run_v6_graph(r, tasks, wd, calls, cf_log)
+            with tempfile.TemporaryDirectory(prefix="omnibench_v7_") as wd: res = run_v6_graph(r, tasks, wd, calls, cf_log, compile_log=compile_log)
             cf_calls.extend(d for d, _ in cf_log)
             entries = v7_counterfactual_entries(cf_log)
         except Exception as e:  # noqa: BLE001
+            compiled_calls.extend(compile_log)
             cf_calls.extend(d for d, _ in cf_log)
             unanswered.append({"perturbation_id": r["perturbation_id"], "reason": f"{type(e).__name__}: {e}"}); continue
+        compiled_calls.extend(compile_log)
         if not res: unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
         else: answered.append((r, res, entries))
-    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.self_verification_variant_predictions; no tasks.py flag"}
+    state["compiled_policy"] = {"flag": "COMPILED_POLICY_ENABLED", "enabled": bool(getattr(tasks, "COMPILED_POLICY_ENABLED", False)),
+                                "invoked": any(isinstance(x, dict) and x.get("status") == "CALLED" for x in compiled_calls),
+                                "invocations": sum(1 for x in compiled_calls if isinstance(x, dict) and x.get("status") == "CALLED"),
+                                "call_log_records": len(compiled_calls)}
+    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.verify_self_verification_result (7B); no tasks.py flag"}
     state["counterfactual"] = {"flag": None, "enabled": True, "invoked": bool(cf_calls), "invocations": len(cf_calls), "note": "existing tasks.build_counterfactual; no tasks.py flag"}
+    state["policy_applicability"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0, "note": "7C is disabled for V7"}
     return [v7_prediction_from_results(r, res, ent, state) for r, res, ent in answered], unanswered, state
 
 
@@ -355,7 +579,7 @@ def v8_prediction_from_results(record: Any, results: List[Dict[str, Any]], cf_en
     v7_decision, v7_escalation = p["predicted_decision"], p["predicted_escalation"]
     p["predicted_decision"] = _aggregate_decision([V8_STATE_TO_LABEL[e["uncertainty_status"]] for e in unc_entries])
     p["predicted_escalation"] = any(e["escalation_required"] for e in unc_entries)
-    pv.update({"selected_version": "V8", "interface": "build_evidence_graph (V5 flags) + self_verification_variant_predictions[" + V8_VARIANT + "] + build_counterfactual + build_uncertainty_assessment",
+    pv.update({"selected_version": "V8", "interface": "build_evidence_graph (V5 flags) + verify_self_verification_result (7B) + verify_policy_applicability (7C) + build_counterfactual + build_uncertainty_assessment",
                "unavailable_fields": list(V8_UNAVAILABLE_FIELDS), "uncertainty": copy.deepcopy(unc_entries), "decision_source": "uncertainty_status", "escalation_source": "escalation_required",
                "v7_predicted_decision": v7_decision, "v7_predicted_escalation": v7_escalation})
     return p
@@ -363,25 +587,29 @@ def v8_prediction_from_results(record: Any, results: List[Dict[str, Any]], cf_en
 
 def predict_v8(records: Iterable[Any], tasks: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Caller must already have applied V8 flags (see run_version). V7 path + existing uncertainty assessment per Decision. A record whose uncertainty output is missing / invalid / raising is unanswered, never filled in."""
-    state, calls, cf_calls, unc_calls = v2_component_state(tasks), [], [], []
+    state, calls, cf_calls, unc_calls, compiled_calls = v2_component_state(tasks), [], [], [], []
     answered, unanswered = [], []
     for rec in records:
         r = _rec(rec)
         cf_log: List[Tuple[str, Any]] = []
         unc_log: List[Tuple[str, Any, Any]] = []
+        compile_log: List[Dict[str, Any]] = []
         try:
-            with tempfile.TemporaryDirectory(prefix="omnibench_v8_") as wd: res = run_v6_graph(r, tasks, wd, calls, cf_log, unc_log)
+            with tempfile.TemporaryDirectory(prefix="omnibench_v8_") as wd: res = run_v6_graph(r, tasks, wd, calls, cf_log, unc_log, compile_log)
             cf_calls.extend(d for d, _ in cf_log); unc_calls.extend(u[0] for u in unc_log)
             cf_entries = v7_counterfactual_entries(cf_log)
             unc_entries = v8_uncertainty_entries(unc_log)
         except Exception as e:  # noqa: BLE001
+            compiled_calls.extend(compile_log)
             cf_calls.extend(d for d, _ in cf_log); unc_calls.extend(u[0] for u in unc_log)
             unanswered.append({"perturbation_id": r["perturbation_id"], "reason": f"{type(e).__name__}: {e}"}); continue
+        compiled_calls.extend(compile_log)
         if not res: unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
         else: answered.append((r, res, cf_entries, unc_entries))
-    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.self_verification_variant_predictions; no tasks.py flag"}
+    state["self_verification"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.verify_self_verification_result (7B); no tasks.py flag"}
     state["counterfactual"] = {"flag": None, "enabled": True, "invoked": bool(cf_calls), "invocations": len(cf_calls), "note": "existing tasks.build_counterfactual; no tasks.py flag"}
     state["uncertainty"] = {"flag": None, "enabled": True, "invoked": bool(unc_calls), "invocations": len(unc_calls), "note": "existing tasks.build_uncertainty_assessment; no tasks.py flag"}
+    state["policy_applicability"] = {"flag": None, "enabled": True, "invoked": bool(calls), "invocations": len(calls), "note": "existing tasks.verify_policy_applicability (7C); V8 only"}
     preds = []
     for r, res, cfe, ue in answered:
         try: preds.append(v8_prediction_from_results(r, res, cfe, ue, state))
@@ -397,18 +625,92 @@ def run_v2_graph(record: Any, tasks: Any, workdir: str, compiled_policy: bool = 
 
 
 def predict_v2(records: Iterable[Any], tasks: Any, compiled_policy: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    """Caller must already have applied V2 flags (see run_version). Returns (predictions, unanswered, component_state)."""
+    """V2-V5 graph path. Uses 7A read-only evidence lineage only; 7B/7C are not invoked.
+
+    V2-V4 expose supporting evidence only. V5 additionally exposes contradiction
+    evidence/flag because the contradiction classifier is enabled. Missing fields
+    remain absent so the evaluator records NOT_MEASURED.
+    """
     state = v2_component_state(tasks)
+    version = _ACTIVE_CONFIG.get("version") or ("V3" if compiled_policy else "V2")
+    state["self_verification"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0,
+                                  "note": "V2-V5 use 7A read-only evidence lineage only; 7B self-verification is off"}
+    state["counterfactual"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0}
+    state["uncertainty"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0}
+    state["policy_applicability"] = {"flag": None, "enabled": False, "invoked": False, "invocations": 0,
+                                     "note": "7C is disabled for V2-V5"}
     preds, unanswered = [], []
     for rec in records:
         r = _rec(rec)
         try:
-            with tempfile.TemporaryDirectory(prefix="omnibench_v2_") as wd: p = v2_prediction_from_results(r, run_v2_graph(r, tasks, wd, compiled_policy), state)
+            with tempfile.TemporaryDirectory(prefix=f"omnibench_{version.lower()}_") as wd:
+                # Build exactly once for this record, then retain filename -> doc_id mapping.
+                paths, rb, names = materialize_record(r, wd)
+                compile_log: List[Dict[str, Any]] = []
+                if compiled_policy:
+                    with compiled_policy_before_rules(tasks, tasks._rulebook_text_only(rb), compile_log):
+                        G = _build_graph(r, tasks, wd, compiled_policy=False)
+                else:
+                    G = _build_graph(r, tasks, wd, compiled_policy=False)
+                proof = _graph_component_proof(G)
+                proof["filename_to_doc_id"] = dict(names)
+                proof["compiled_policy_call_log"] = copy.deepcopy(compile_log)
+                if compiled_policy:
+                    # Record observed invocation, not merely the configured flag.
+                    # A CALLED entry means apply_compiled_policy returned; the graph proof
+                    # separately records whether compilation produced a usable status.
+                    invoked = any(isinstance(row, dict) and row.get("status") == "CALLED" for row in compile_log)
+                    state["compiled_policy"]["invoked"] = bool(invoked)
+                    state["compiled_policy"]["invocations"] = int(state["compiled_policy"].get("invocations", 0)) + int(bool(invoked))
+                decision_nodes = sorted(tasks._nodes_of_type(G, "Decision"), key=lambda kv: kv[0])
+                if not decision_nodes:
+                    unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
+                    continue
+                outcomes, supporting_refs, contradicting_items, contradiction_flags = [], [], [], []
+                evidence_available = callable(getattr(tasks, "build_self_verification_result", None))
+                for dec_id, _dd in decision_nodes:
+                    dd = G.nodes[dec_id]
+                    verdict = dd.get("verdict")
+                    outcomes.append(tasks._sv7d_outcome(verdict, None))
+                    builder = getattr(tasks, "build_self_verification_result", None)
+                    if callable(builder):
+                        result = builder(G, dec_id)  # 7A structure only; does not run 7B/7C
+                        if not isinstance(result, dict) or result.get("found") is not True:
+                            raise ValueError(f"7A evidence result missing for Decision {dec_id}")
+                        supporting_refs.extend(result.get("supporting_evidence") or [])
+                        if version == "V5":
+                            contradicting_items.extend(result.get("contradicting_evidence") or [])
+                            contradiction_flags.append(any(
+                                item.get("source") == "contradiction_finding" and item.get("category") == "MAJOR_CONTRADICTION"
+                                for item in (result.get("contradicting_evidence") or [])
+                            ))
+                prediction = v2_prediction_from_results(r, outcomes, state)
+                if prediction is None:
+                    unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
+                    continue
+                # V2-V5 support evidence is available from 7A lineage, but never expose 7C/7B fields.
+                if evidence_available:
+                    prediction["predicted_supporting_evidence"] = sorted({
+                        names[ref["filename"]] for ref in supporting_refs
+                        if isinstance(ref, dict) and ref.get("filename") in names
+                    })
+                if version == "V5" and callable(getattr(tasks, "build_self_verification_result", None)):
+                    sup_eids = {x.get("evidence_id") for x in supporting_refs if isinstance(x, dict)}
+                    contra = sorted(_contra_docs(contradicting_items, sup_eids, names))
+                    prediction["predicted_contradicting_evidence"] = contra
+                    # Contradiction classification is not meaningful for a record with no assertive decision.
+                    asserting = any(x in ("VIOLATION", "SATISFIED") for x in outcomes)
+                    prediction["predicted_contradiction_detected"] = (any(contradiction_flags) if asserting else None)
+                prediction["provenance"].update({
+                    "selected_version": version,
+                    "component_state": copy.deepcopy(state),
+                    "evidence_source": "7A read-only lineage; filenames mapped to supplied doc_ids",
+                    "component_proof": copy.deepcopy(proof),
+                })
+                preds.append(prediction)
         except Exception as e:  # noqa: BLE001
-            unanswered.append({"perturbation_id": r["perturbation_id"], "reason": f"{type(e).__name__}: {e}"}); continue
-        if p is None: unanswered.append({"perturbation_id": r["perturbation_id"], "reason": "pipeline produced no Decision node"})
-        else: preds.append(p)
-    return preds, unanswered, state
+            unanswered.append({"perturbation_id": r["perturbation_id"], "reason": f"{type(e).__name__}: {e}"})
+    return preds or [], unanswered, state
 
 
 def run_version(records: Iterable[Any], tasks: Any, version: str) -> Dict[str, Any]:
@@ -426,12 +728,19 @@ def run_version(records: Iterable[Any], tasks: Any, version: str) -> Dict[str, A
         _ACTIVE_CONFIG["version"] = version
         for k, v in flags.items():
             if hasattr(tasks, k): setattr(tasks, k, v)
-        if version == "V8": preds, out["unanswered"], out["component_state"] = predict_v8(recs, tasks)
-        elif version == "V7": preds, out["unanswered"], out["component_state"] = predict_v7(recs, tasks)
-        elif version == "V6": preds, out["unanswered"], out["component_state"] = predict_v6(recs, tasks)
-        else: preds, out["unanswered"], out["component_state"] = predict_v2(recs, tasks, version in _COMPILED_POLICY_VERSIONS)
+        cache_start = len(_COMPILER_CACHE_LOG)
         if version in _COMPILED_POLICY_VERSIONS:
-            for pr in preds: pr["provenance"]["selected_version"] = version  # system stays "V2" (underlying graph-only prediction path)
+            with cached_compiler_responses(tasks):
+                if version == "V8": preds, out["unanswered"], out["component_state"] = predict_v8(recs, tasks)
+                elif version == "V7": preds, out["unanswered"], out["component_state"] = predict_v7(recs, tasks)
+                elif version == "V6": preds, out["unanswered"], out["component_state"] = predict_v6(recs, tasks)
+                else: preds, out["unanswered"], out["component_state"] = predict_v2(recs, tasks, True)
+        else:
+            preds, out["unanswered"], out["component_state"] = predict_v2(recs, tasks, False)
+        if version in _COMPILED_POLICY_VERSIONS:
+            cache_summary = compiler_cache_summary(cache_start)
+            if isinstance(out.get("component_state"), dict): out["component_state"]["compiler_cache"] = cache_summary
+            for pr in preds: pr["provenance"].update({"selected_version": version, "compiler_cache": cache_summary})  # system stays V2: same graph decision path
         out["predictions"] = preds or None
     finally: restore_config(snap, tasks)
     return out

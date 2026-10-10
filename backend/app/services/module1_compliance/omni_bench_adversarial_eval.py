@@ -42,7 +42,7 @@ except ImportError:
     from omni_bench_adversarial_generator import (COMP, INS, NC, OUTCOME_ALTERED, OUTCOME_UNCHANGED, PERTURBATION_TYPES, PerturbationRecord, generate_adversarial_suite,
                                         validate_adversarial_suite)
 
-EVALUATOR_NAME, EVALUATOR_VERSION = "omni_bench_adversarial_eval", "1.0.0"
+EVALUATOR_NAME, EVALUATOR_VERSION = "omni_bench_adversarial_eval", "1.1.0"
 NOT_MEASURED = "NOT_MEASURED"
 STATUS_MEASURED, STATUS_NOT_MEASURED = "MEASURED", "NOT_MEASURED"
 STATUS_INVALID_RECORDS, STATUS_INVALID_PREDICTIONS = "INVALID_RECORDS", "INVALID_PREDICTIONS"
@@ -192,7 +192,8 @@ def _eval_record(r: Dict[str, Any], p: Dict[str, Any]) -> Dict[str, Any]:
             "contradiction_detection_correct": NOT_MEASURED if det is None else det == exp_contra,
             "expected_contradiction_behavior": copy.deepcopy(r["expected_contradiction_behavior"]),
             "expected_evidence_roles": copy.deepcopy(roles),
-            "provenance": {"perturbation_provenance": copy.deepcopy(prov), "prediction_provenance": copy.deepcopy(p.get("provenance"))}}
+            "provenance": {"perturbation_provenance": copy.deepcopy(prov), "prediction_provenance": copy.deepcopy(p.get("provenance"))},
+            "_prediction_provenance": copy.deepcopy(p.get("provenance"))}
 
 
 # ----------------------------------------------------------------------------- aggregation
@@ -205,6 +206,69 @@ def _role_agg(rs, key) -> Dict[str, Any]:
     m = [x[key] for x in rs if x[key]["true_positives"] is not None]
     tp, pred, exp = (sum(x[k] for x in m) for k in ("true_positives", "predicted_count", "expected_count"))
     return {**_prf(tp, pred, exp), "true_positives": tp, "predicted_count": pred, "expected_count": exp, "records_measured": len(m)}
+
+
+def _multiclass_specificity_mcc(rs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Macro one-vs-rest specificity and multiclass MCC for the three fixed decision labels."""
+    if not rs:
+        return {"specificity": NOT_MEASURED, "mcc": NOT_MEASURED, "specificity_by_label": {}}
+    by = {}
+    total = len(rs)
+    for lab in LABELS:
+        tp = sum(1 for x in rs if x["expected_decision"] == lab and x["predicted_decision"] == lab)
+        fn = sum(1 for x in rs if x["expected_decision"] == lab and x["predicted_decision"] != lab)
+        fp = sum(1 for x in rs if x["expected_decision"] != lab and x["predicted_decision"] == lab)
+        tn = total - tp - fn - fp
+        by[lab] = _ratio(tn, tn + fp)
+    measured = [v for v in by.values() if isinstance(v, float)]
+    specificity = sum(measured) / len(measured) if measured else NOT_MEASURED
+    s = total
+    c = sum(1 for x in rs if x["expected_decision"] == x["predicted_decision"])
+    pred_counts = {lab: sum(1 for x in rs if x["predicted_decision"] == lab) for lab in LABELS}
+    exp_counts = {lab: sum(1 for x in rs if x["expected_decision"] == lab) for lab in LABELS}
+    numerator = c * s - sum(pred_counts[l] * exp_counts[l] for l in LABELS)
+    den_a = s * s - sum(v * v for v in pred_counts.values())
+    den_b = s * s - sum(v * v for v in exp_counts.values())
+    denominator = (den_a * den_b) ** 0.5 if den_a > 0 and den_b > 0 else 0
+    mcc = numerator / denominator if denominator else NOT_MEASURED
+    return {"specificity": specificity, "mcc": mcc, "specificity_by_label": by}
+
+
+def _confidence_values(rs: List[Dict[str, Any]]) -> List[Tuple[float, bool]]:
+    """Read only a numeric 0..1 predicted confidence if a system actually exposed one in provenance."""
+    out = []
+    for x in rs:
+        pp = x.get("_prediction_provenance") or {}
+        entries = pp.get("uncertainty") if isinstance(pp, dict) else None
+        if not isinstance(entries, list) or len(entries) != 1:
+            continue
+        ind = entries[0].get("decision_confidence") if isinstance(entries[0], dict) else None
+        value = ind.get("value") if isinstance(ind, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0.0 <= float(value) <= 1.0:
+            out.append((float(value), bool(x["decision_correct"])))
+    return out
+
+
+def _uncertainty_metrics(rs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    vals = _confidence_values(rs)
+    if not vals:
+        return {"ece": NOT_MEASURED, "brier": NOT_MEASURED, "confidence_reliability": NOT_MEASURED,
+                "records_measured": 0,
+                "reason": "No numeric calibrated decision confidence is exposed by the supplied predictions; current V8 decision_confidence.value is None/NOT_MEASURED."}
+    bins = []
+    for i in range(10):
+        lo, hi = i / 10.0, (i + 1) / 10.0
+        bucket = [(c, ok) for c, ok in vals if lo <= c < hi or (i == 9 and lo <= c <= hi)]
+        if bucket:
+            bins.append((len(bucket), sum(c for c, _ in bucket) / len(bucket), sum(ok for _, ok in bucket) / len(bucket)))
+    ece = sum(n / len(vals) * abs(conf - acc) for n, conf, acc in bins)
+    brier = sum((conf - (1.0 if ok else 0.0)) ** 2 for conf, ok in vals) / len(vals)
+    mean_conf = sum(c for c, _ in vals) / len(vals)
+    accuracy = sum(ok for _, ok in vals) / len(vals)
+    reliability = {"mean_confidence": mean_conf, "observed_accuracy": accuracy,
+                   "mean_signed_error": mean_conf - accuracy,
+                   "mean_absolute_error": sum(abs(c - (1.0 if ok else 0.0)) for c, ok in vals) / len(vals)}
+    return {"ece": ece, "brier": brier, "confidence_reliability": reliability, "records_measured": len(vals), "reason": ""}
 
 
 def _aggregate(rs: List[Dict[str, Any]], in_scope: int) -> Dict[str, Any]:
@@ -233,7 +297,14 @@ def _aggregate(rs: List[Dict[str, Any]], in_scope: int) -> Dict[str, Any]:
     chg_acc, _ = _bool_acc(rs, "escalation_change_correct")
     return {
         "records_in_scope": in_scope, "case_count": n, "coverage": _ratio(n, in_scope),
-        "decision": {"accuracy": dec_acc, "macro_f1": sum(f1s) / len(f1s) if f1s else NOT_MEASURED, "by_label": labels},
+        "decision": {"accuracy": dec_acc,
+                     "macro_precision": (sum(v["precision"] for v in labels.values() if isinstance(v["precision"], float)) / len([v for v in labels.values() if isinstance(v["precision"], float)])
+                                       if any(isinstance(v["precision"], float) for v in labels.values()) else NOT_MEASURED),
+                     "macro_recall": (sum(v["recall"] for v in labels.values() if isinstance(v["recall"], float)) / len([v for v in labels.values() if isinstance(v["recall"], float)])
+                                      if any(isinstance(v["recall"], float) for v in labels.values()) else NOT_MEASURED),
+                     "macro_f1": sum(f1s) / len(f1s) if f1s else NOT_MEASURED,
+                     **_multiclass_specificity_mcc(rs),
+                     "by_label": labels},
         "evidence_grounding": {"grounded_citation_rate": _ratio(valid, cited), "cited_doc_count": cited, "grounded_cited_doc_count": valid,
                                "supporting": _role_agg(rs, "supporting_evidence_metrics"), "contradicting": _role_agg(rs, "contradicting_evidence_metrics"),
                                "pooled_doc_roles": _role_agg(rs, "pooled_evidence_metrics"), "missing_strict": _role_agg(rs, "missing_evidence_metrics"),
@@ -245,7 +316,29 @@ def _aggregate(rs: List[Dict[str, Any]], in_scope: int) -> Dict[str, Any]:
         "escalation": {"accuracy": esc_acc, "change_accuracy": chg_acc,
                        "change_recall": _ratio(sum(1 for x in changed if x["predicted_escalation_change"]), len(changed)),
                        "change_false_alarm_rate": _ratio(sum(1 for x in unchanged if x["predicted_escalation_change"]), len(unchanged)),
-                       "expected_change_count": len(changed), "expected_no_change_count": len(unchanged), "records_measured": len(em)}}
+                       "expected_change_count": len(changed), "expected_no_change_count": len(unchanged), "records_measured": len(em)},
+        "verification": {
+            "unsupported_decision_rate": _ratio(unsupported, exp_ins),
+            "hallucination_rate": (NOT_MEASURED if not gm else _ratio(cited - valid, cited)),
+            "hallucination_definition": "cited document IDs absent from the perturbed document set; this is an evidence-citation hallucination rate, not a general semantic hallucination measure",
+            "contradiction_detection_f1": _prf(tp, tp + fp, tp + fn)["f1"] if cm else NOT_MEASURED,
+        },
+        "uncertainty": _uncertainty_metrics(rs),
+        "policy_reasoning": {
+            "rule_extraction_accuracy": NOT_MEASURED,
+            "condition_accuracy": NOT_MEASURED,
+            "exception_accuracy": NOT_MEASURED,
+            "execution_accuracy": NOT_MEASURED,
+            "reason": "Frozen V1-V8 prediction interfaces expose no structured rule/condition/exception/execution prediction fields; OMNI-Bench ground truth does not contain decomposed condition/exception/execution labels.",
+        },
+        "human_factors": {
+            "escalation_rate": _ratio(sum(1 for x in rs if x["predicted_escalation"] is True), len(em)),
+            "automation_coverage": _ratio(committed, n),
+            "expert_agreement": NOT_MEASURED,
+            "review_time": NOT_MEASURED,
+            "expert_agreement_reason": "No human-review labels supplied.",
+            "review_time_reason": "No human review-time observations supplied.",
+        }}
 
 
 def _ordered(values: Iterable[str], preferred: Tuple[str, ...]) -> List[str]:
@@ -282,6 +375,41 @@ def evaluate_adversarial_predictions(records: Iterable[Any], predictions: Option
                 "run_provenance": {"records_sha256": _sha(recs), "predictions_sha256": _sha(list(predictions)) if predictions else None, "randomness": "none", "network": "none",
                                    "ground_truth_source": "perturbation records only; predictions never supply or alter labels"}})
     return res
+
+
+def evaluate_version_suite(records: Iterable[Any], predictions_by_version: Dict[str, Optional[Iterable[Dict[str, Any]]]],
+                          versions: Tuple[str, ...] = ("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"),
+                          source_cases: Optional[List[Dict[str, Any]]] = None, splits=None, perturbation_types=None) -> Dict[str, Any]:
+    """Unified, same-record evaluator for V1..V8. It never invokes a system and never fills missing predictions."""
+    recs = [_as_dict(r) for r in records] if isinstance(records, (list, tuple)) else records
+    if not isinstance(predictions_by_version, dict):
+        return {"status": STATUS_INVALID_PREDICTIONS, "errors": ["predictions_by_version must be a dict"]}
+    invalid_versions = [v for v in versions if v not in ("V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8")]
+    if invalid_versions:
+        return {"status": STATUS_INVALID_PREDICTIONS, "errors": [f"invalid version(s): {invalid_versions}"]}
+    base = evaluate_adversarial_predictions(recs, [], source_cases=source_cases, splits=splits, perturbation_types=perturbation_types)
+    if base["status"] == STATUS_INVALID_RECORDS:
+        return base
+    record_ids = [r["perturbation_id"] for r in recs]
+    results = {}
+    for version in versions:
+        preds = predictions_by_version.get(version)
+        results[version] = evaluate_adversarial_predictions(recs, preds, source_cases=source_cases, splits=splits, perturbation_types=perturbation_types)
+    hashes = {v: results[v].get("run_provenance", {}).get("records_sha256") for v in versions if isinstance(results[v], dict)}
+    common_hash = next(iter({h for h in hashes.values() if h}), None)
+    common_ground_truth = len(set(h for h in hashes.values() if h)) <= 1
+    statuses = {v: results[v].get("status") for v in versions}
+    return {
+        "status": STATUS_MEASURED if common_ground_truth and any(x == STATUS_MEASURED for x in statuses.values()) else STATUS_NOT_MEASURED,
+        "versions": list(versions),
+        "record_count": len(record_ids),
+        "record_ids_sha256": _sha(record_ids),
+        "records_sha256": common_hash,
+        "same_records_for_all_versions": common_ground_truth,
+        "ground_truth_source": "same independent perturbation records for every version; predictions never alter ground truth",
+        "by_version": results,
+        "statuses": statuses,
+    }
 
 
 def _key(r: Dict[str, Any], key: str) -> str: return r["provenance"]["source_split"] if key == "split" else r[key]

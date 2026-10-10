@@ -11,6 +11,7 @@ Natural-language policy -> validated structured rules.
 
 Domain-neutral: entity / field / unit / action names come from the policy text itself.
 """
+import copy
 import hashlib
 import json
 import logging
@@ -22,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from pydantic import ValidationError
 
 from .policy_schema import (
-    CompiledRule, CompileResult, Condition, Logic, Operator, RejectedRule, RuleType,
+    CompiledRule, CompileResult, Condition, Logic, Operator, RejectedRule, RuleType, Severity,
     NEGATED_OPS, RANGE_OPS, TIME_UNITS, as_number, has_not_group, iter_leaves,
 )
 
@@ -37,6 +38,10 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 class CompilationError(Exception):
     """LLM unavailable or returned unusable output (distinct from a policy that is merely ambiguous)."""
 
+
+# Bump whenever the prompt, normalization or validation changes the compiled output. It is appended to
+# SYSTEM_PROMPT so any cache keyed on the prompt cannot replay a result from an incompatible compiler.
+COMPILER_VERSION = "2026-10-10.7-severity-label-required-connector"
 
 # ============================================================================ STAGE 1: LLM INTERPRETATION
 SYSTEM_PROMPT = """You are a POLICY-TO-RULE COMPILER. Translate natural-language policy text from ANY domain (finance, HR, IT security, procurement, safety, data governance, ...) into structured JSON rules.
@@ -62,7 +67,7 @@ OUTPUT SCHEMA
   "temporal": null | {"kind":"within|older_than|before|after|between","entity":"..","field":"..(a date field)","reference":"now|ISO date|entity.field","amount":number,"unit":"minutes|hours|days|weeks|months|years","direction":"after|before|either","start":"ISO date","end":"ISO date"},
   "required_evidence": [{"type":"snake_case_evidence_type","description":"..","mandatory":true,"min_count":1}],
   "exception": [{"description":"..","condition": <condition>}],
-  "severity": "low|medium|high|critical",
+  "severity": OPTIONAL KEY: omit it unless the policy text itself explicitly states a severity level (see "Severity" below); when present it is exactly one of "low", "medium", "high", "critical",
   "action": "snake_case_action (what must happen / the consequence)",
   "confidence": 0.0-1.0,
   "source_text": "exact clause quote",
@@ -77,14 +82,24 @@ CONDITION = a LEAF or a GROUP (never both)
 Negation: use not_* operators, "!=", or a NOT group. Never drop a "not"/"no"/"never".
 Exceptions ("unless", "except", "other than", "exempt"): put them in "exception", not in the main condition.
 Time limits ("within 30 days of ...", "before ...", "older than ...", "between <date> and <date>"): use "temporal".
+Conditional obligations: when a clause applies only to some entities or states ("Any X above N must have Y", "If A then B", "Confirmed incidents must be reported to ..."), use TRIGGER: put the applicability test (A) in "condition" and the demanded proof or consequence in "required_evidence" and/or "action". Use REQUIRE only when the condition itself is the property every entity must have (e.g. "Passwords must be at least 12 characters"). Never use REQUIRE for a condition that merely says when the clause applies: a REQUIRE rule is a VIOLATION whenever its condition is false. For a "confirmed <thing> must be <action>" clause, emit a TRIGGER whose condition is the confirmation flag (entity "<thing>", field "confirmed", operator "==", value true) and whose action is the stated escalation.
+Severity (optional key): include "severity" ONLY when the policy text itself explicitly states a severity level for that obligation, for example "high severity", "severity: critical", "priority: low" or "classified as medium". Otherwise omit the key so the schema default applies. Never infer or guess a severity from how serious, important, risky or costly the obligation sounds, from its consequence, or from its domain. A word such as "critical" in an ordinary description ("critical systems", "critical infrastructure", "a critical review") is NOT a severity classification. When given it must be exactly one of the lowercase strings low, medium, high, critical. The compiler checks every returned severity against the clause and discards any it cannot find there.
 Mandatory documents/proof the policy demands ("with receipt", "signed approval", "attach ..."): use "required_evidence".
+The evidence "type" must be the policy's own contiguous wording for that document as snake_case, INCLUDING who must issue it when the policy names a role (e.g. "a written sign-off from a Security Officer" -> "written_sign_off_from_a_security_officer"). Never drop the role, and never keep it only in "description": the evaluator can only verify what is part of the type.
+If the policy constrains the evidence itself in time (for example, written approval must be attached before payment), represent that relation as an explicit evidence match attribute such as `"match":{"timing":"before_payment"}`. Do NOT translate that relation into `payment_date before now`: it is about the approval evidence relative to payment, not about whether payment occurred before the current date. The evaluator must still verify the relation from source evidence; if the evidence does not explicitly establish it, the result remains INDETERMINATE.
 
 ILLUSTRATIVE EXAMPLES (different domains; do not copy their entities)
 Text: "Servers storing customer data must not be reachable from the public internet."
--> {"rule_type":"PROHIBIT","entity":"server","condition":{"logic":"AND","children":[{"entity":"server","field":"stores_customer_data","operator":"==","value":true,"unit":null},{"entity":"server","field":"publicly_reachable","operator":"==","value":true,"unit":null}]},"temporal":null,"required_evidence":[],"exception":[],"severity":"high","action":"block_and_report","confidence":0.9,"source_text":"Servers storing customer data must not be reachable from the public internet.","ambiguities":[]}
+-> {"rule_type":"PROHIBIT","entity":"server","condition":{"logic":"AND","children":[{"entity":"server","field":"stores_customer_data","operator":"==","value":true,"unit":null},{"entity":"server","field":"publicly_reachable","operator":"==","value":true,"unit":null}]},"temporal":null,"required_evidence":[],"exception":[],"action":"block_and_report","confidence":0.9,"source_text":"Servers storing customer data must not be reachable from the public internet.","ambiguities":[]}
 Text: "Purchase orders above 50,000 USD require legal review unless issued under an approved framework agreement."
--> {"rule_type":"TRIGGER","entity":"purchase_order","condition":{"entity":"purchase_order","field":"total_value","operator":">","value":50000,"unit":"USD"},"temporal":null,"required_evidence":[{"type":"legal_review","mandatory":true,"min_count":1}],"exception":[{"description":"issued under an approved framework agreement","condition":{"entity":"purchase_order","field":"under_framework_agreement","operator":"==","value":true,"unit":null}}],"severity":"medium","action":"legal_review_required","confidence":0.9,"source_text":"Purchase orders above 50,000 USD require legal review unless issued under an approved framework agreement.","ambiguities":[]}
+-> {"rule_type":"TRIGGER","entity":"purchase_order","condition":{"entity":"purchase_order","field":"total_value","operator":">","value":50000,"unit":"USD"},"temporal":null,"required_evidence":[{"type":"legal_review","mandatory":true,"min_count":1}],"exception":[{"description":"issued under an approved framework agreement","condition":{"entity":"purchase_order","field":"under_framework_agreement","operator":"==","value":true,"unit":null}}],"action":"legal_review_required","confidence":0.9,"source_text":"Purchase orders above 50,000 USD require legal review unless issued under an approved framework agreement.","ambiguities":[]}
+Text: "Backup archives must be encrypted at rest (severity: critical)."
+-> {"rule_type":"REQUIRE","entity":"backup_archive","condition":{"entity":"backup_archive","field":"encrypted_at_rest","operator":"==","value":true,"unit":null},"temporal":null,"required_evidence":[],"exception":[],"severity":"critical","action":"encrypt_backup_archive","confidence":0.9,"source_text":"Backup archives must be encrypted at rest (severity: critical).","ambiguities":[]}
+(The first two examples omit "severity" because their source text states none; the third includes it because its source text states it.)
 """
+
+
+SYSTEM_PROMPT = SYSTEM_PROMPT + f"\nCOMPILER_VERSION: {COMPILER_VERSION}\n"
 
 
 def _build_user_prompt(policy_text: str) -> str:
@@ -259,8 +274,9 @@ def lexical_ambiguity_reasons(text: str) -> List[str]:
     for s in _sentences(text):
         if _HAS_NUMBER.search(s):
             continue
-        v = _VAGUE.search(s)
-        a = _ADVISORY.search(s)
+        masked = _mask_severity_labels(s)  # an explicit severity label ("high severity") is not vague wording
+        v = _VAGUE.search(masked)
+        a = _ADVISORY.search(masked)
         if v:
             out.append(f"vague term '{v.group(0)}' with no measurable value: \"{s[:140]}\"")
         elif a:
@@ -321,18 +337,213 @@ def _grounding_issues(rule: CompiledRule, clause: str, policy_text: str) -> List
 
 
 def _fmt_errors(e: ValidationError) -> List[str]:
-    return [f"{'.'.join(str(x) for x in err['loc']) or 'rule'}: {err['msg']}" for err in e.errors()]
+    out = []
+    for err in e.errors():
+        msg = f"{'.'.join(str(x) for x in err['loc']) or 'rule'}: {err['msg']}"
+        if tuple(err["loc"]) == ("severity",):  # diagnostic only: the rule is still rejected
+            msg += f" (received {type(err.get('input')).__name__} {repr(err.get('input'))[:60]})"
+        out.append(msg)
+    return out
 
 
-_IGNORABLE_KEYS = {"description", "notes", "explanation", "id", "name", "title", "policy_id", "rule_id", "status", "issues", "expression"}
+_IGNORABLE_KEYS = {"description", "notes", "explanation", "id", "name", "title", "policy_id", "rule_id", "status", "issues", "expression", "severity_source"}  # severity_source is compiler-decided (see _assess_severity), never LLM input
+
+
+def _normalize_explicit_approval_timing(data: Dict[str, Any]) -> bool:
+    """Represent an explicit approval-before-payment relation as evidence metadata.
+
+    This narrow normalization applies only when the source clause explicitly says approval
+    must be before payment and the compiler attached an approval evidence requirement. It
+    avoids the invalid inference `payment_date before now`; it does NOT invent calendar dates.
+    The evidence must independently state the timing relation at evaluation time.
+    """
+    clause = str(data.get("source_text") or "")
+    if not re.search(r"\bapproval\b[^.\n]{0,180}\bbefore\s+(?:the\s+)?payment\b", clause, re.I):
+        return False
+    reqs = data.get("required_evidence")
+    if not isinstance(reqs, list):
+        return False
+    approval_reqs = []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        label = f"{req.get('type', '')} {req.get('description', '')}"
+        if re.search(r"\bapproval\b", label, re.I):
+            approval_reqs.append(req)
+    if not approval_reqs:
+        return False
+
+    temporal = data.get("temporal")
+    if temporal is not None:
+        if not isinstance(temporal, dict):
+            return False
+        entity = str(temporal.get("entity") or "").strip().lower()
+        field = str(temporal.get("field") or "").strip().lower()
+        kind = str(temporal.get("kind") or "").strip().lower()
+        reference = str(temporal.get("reference") or "").strip().lower()
+        # Real provider output has appeared in both forms:
+        #   payment.payment_date before payment
+        #   payment.date before payment.date
+        # Both are a malformed representation of the *approval evidence* being before
+        # payment, not a rule requiring the payment date to precede itself/current time.
+        payment_date_field = field in ("payment_date", "date_of_payment") or (
+            entity in ("payment", "payments", "the_payment")
+            and field in ("date", "payment_date", "date_of_payment")
+        )
+        payment_reference = reference in (
+            "now", "today", "evaluation_date", "payment", "payments", "the_payment",
+            "payment.date", "payments.date", "the_payment.date", "payment.payment_date",
+            "payment_date", "date_of_payment",
+        ) or reference == f"{entity}.{field}"
+        if not (payment_date_field and kind == "before" and payment_reference):
+            return False
+        data["temporal"] = None
+
+    for req in approval_reqs:
+        match = req.get("match")
+        match = dict(match) if isinstance(match, dict) else {}
+        match["timing"] = "before_payment"
+        req["match"] = match
+
+    # Drop only the model's explicit concern that this relation needs an approval timestamp;
+    # the relation is now checked against the source evidence, not guessed from a date field.
+    ambiguities = data.get("ambiguities")
+    if isinstance(ambiguities, list):
+        data["ambiguities"] = [
+            x for x in ambiguities
+            if not (isinstance(x, str) and re.search(r"approval timestamp|field for approval timestamp", x, re.I))
+        ]
+    return True
+
+
+_CONFIRMED_VIOLATION_RE = re.compile(r"\bconfirmed\s+violations?\b", re.I)
+_CONFIRM_COND_KEYS = {"entity", "field", "operator", "value", "unit"}
+_VIOLATION_ENTITY_RE = re.compile(r"^(?:[a-z][a-z0-9_]*_)?violation$")  # 'violation' or '<base>_violation'
+_ENTITY_SPACES = re.compile(r"[\s\-]+")
+
+
+def _confirmation_form(cond: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """(entity, field) when `cond` is EXACTLY one recognized confirmation leaf, else None. Recognized forms:
+         <violation|X_violation>.confirmed|violation_confirmed == true
+         <violation|X_violation>.status|state == "confirmed"
+         <base_entity>.violation_confirmed == true   (base-entity alias: the field name itself says 'violation')
+       A bare '<other>.confirmed' is NOT recognized: 'employee.confirmed' / 'expense.confirmed' do not mean a violation."""
+    if not isinstance(cond, dict) or not set(cond) <= _CONFIRM_COND_KEYS or cond.get("unit") not in (None, ""):
+        return None
+    ent, fld, op = cond.get("entity"), cond.get("field"), cond.get("operator")
+    if not all(isinstance(x, str) for x in (ent, fld, op)) or op.strip() != "==":
+        return None
+    ent, fld = _ENTITY_SPACES.sub("_", ent.strip().lower()), _ENTITY_SPACES.sub("_", fld.strip().lower())
+    val = cond.get("value")
+    violation_entity = bool(_VIOLATION_ENTITY_RE.match(ent))
+    if val is True:  # strictly boolean true: not 1, not "true"
+        if fld == "violation_confirmed" and re.match(r"^[a-z][a-z0-9_]*$", ent):
+            return ent, fld
+        if fld == "confirmed" and violation_entity:
+            return ent, fld
+    elif isinstance(val, str) and val.strip().lower() == "confirmed" and violation_entity and fld in ("status", "state"):
+        return ent, fld
+    return None
+
+
+def _normalize_confirmed_violation_rule_type(data: Dict[str, Any]) -> bool:
+    """REQUIRE -> TRIGGER for an explicit "confirmed violation(s) must be <action>" clause.
+
+    The clause is conditional: IF a violation is confirmed THEN the action is required. Typed REQUIRE, the
+    confirmation flag becomes a property every record must have (a false flag is a VIOLATION, an unknown one is
+    INDETERMINATE), which is never what the policy says. Narrow by construction: the clause must literally say
+    "confirmed violation(s)", the condition must be the single recognized confirmation leaf (see _confirmation_form:
+    entity, field, operator and value must agree; no extra predicates, unit or keys), the rule's own `entity` (when
+    given) must match the condition's entity, an action must be stated and there must be no temporal constraint.
+    Anything else is left untouched (a threshold REQUIRE, a malformed or unrelated condition). Only `rule_type` is
+    changed: source_text and every other field keep their provenance; the caller records the audit note.
+    """
+    if str(data.get("rule_type") or "").strip().upper() != "REQUIRE" or data.get("temporal"):
+        return False
+    if not _CONFIRMED_VIOLATION_RE.search(str(data.get("source_text") or "")) or not str(data.get("action") or "").strip():
+        return False
+    form = _confirmation_form(data.get("condition"))
+    if form is None:
+        return False
+    top = data.get("entity")
+    if top not in (None, "") and (not isinstance(top, str) or _ENTITY_SPACES.sub("_", top.strip().lower()) != form[0]):
+        return False
+    data["rule_type"] = "TRIGGER"
+    return True
+
+
+# ---- severity grounding: a returned severity is a policy-stated fact only when the source clause says so.
+_SEV_L = r"(low|medium|high|critical)"
+_SEV_CONTEXT_RES = (
+    re.compile(rf"\b{_SEV_L}[\s-]+(?:severity|priority)\b", re.I),                                        # "high severity"
+    re.compile(rf"\b(?:severity|priority)(?:\s+level)?(?:\s+(?:is|as)\s+|\s*[=:]\s*){_SEV_L}\b", re.I),  # "severity: critical", "severity is high"; a connector is REQUIRED ("severity high costs", "severity of high costs" are not labels)
+    re.compile(rf"\b(?:classified|rated|marked|labell?ed|categori[sz]ed|designated)\s+as\s+(?:an?\s+)?{_SEV_L}\b", re.I),
+)
+# Bare label words are only a CUE: they may or may not be a severity ("critical systems"), so they go to review.
+_SEV_BARE_CUES = {"critical": {"critical"}, "minor": {"low"}, "moderate": {"medium"},
+                  "major": {"high", "critical"}, "severe": {"high", "critical"}, "serious": {"high", "critical"}}
+_SEV_BARE_RE = re.compile(r"\b(" + "|".join(_SEV_BARE_CUES) + r")\b", re.I)
+
+
+def _mask_severity_labels(text: str) -> str:
+    """Copy of `text` with ONLY the spans matching the explicit-severity patterns (_SEV_CONTEXT_RES) blanked out, same length so
+    offsets are unchanged. Used solely before the vague/advisory scans: "high severity" must not be reported as the vague term
+    'high'. Bare words ("high costs", "low confidence", "critical systems") do not match those patterns and are left alone, as is
+    every other vague/advisory word. Never applied to source_text, the policy text or severity grounding."""
+    out = text or ""
+    for rx in _SEV_CONTEXT_RES:
+        out = rx.sub(lambda m: " " * len(m.group(0)), out)
+    return out
+
+
+def _assess_severity(data: Dict[str, Any], policy_text: str) -> Dict[str, Any]:
+    """Classify the severity the LLM returned against the source clause. -> {source, drop, issue, ambiguity}.
+    Only a clause that is an exact policy quote is trusted. Never invents a severity; an unsupported value is dropped
+    so the schema default applies and the discard is recorded. Values that are not valid severities are left for the
+    schema to REJECT (not coerced, not silently dropped)."""
+    out: Dict[str, Any] = {"source": "schema_default", "drop": False, "issue": None, "ambiguity": None}
+    if "severity" not in data:
+        return out
+    raw = data["severity"]
+    try:
+        level = Severity(raw).value if isinstance(raw, str) else None
+    except ValueError:
+        level = None
+    if level is None:
+        out["source"] = None  # invalid: CompiledRule validation rejects the rule
+        return out
+    clause = str(data.get("source_text") or "")
+    text = clause if clause.strip() and _norm_ws(clause) in _norm_ws(policy_text) else ""
+    stated = {m.group(1).lower() for rx in _SEV_CONTEXT_RES for m in rx.finditer(text)}
+    cues = {w.lower() for w in _SEV_BARE_RE.findall(text)}
+    plausible = set().union(*(_SEV_BARE_CUES[c] for c in cues)) if cues else set()
+    if len(stated) == 1 and level in stated:
+        out["source"] = "policy_stated"
+    elif len(stated) > 1:
+        out.update(source="ambiguous", ambiguity=f"severity wording is ambiguous: the clause states several levels ({', '.join(sorted(stated))}); compiler returned '{level}'")
+    elif len(stated) == 1:
+        out.update(source="schema_default", drop=True,
+                   issue=f"returned severity '{level}' discarded: the clause states '{next(iter(stated))}'; schema default applies",
+                   ambiguity=f"compiler returned severity '{level}' but the clause states '{next(iter(stated))}'; schema default applied")
+    elif level in plausible:
+        out.update(source="ambiguous", ambiguity=f"severity '{level}' is inferred from the wording {sorted(cues)}, which does not state a severity level outright")
+    else:
+        out.update(source="schema_default", drop=True,
+                   issue=f"returned severity '{level}' discarded: the source clause does not state a severity; schema default applies")
+    return out
 
 
 def validate_raw_rule(raw: Any, policy_id: str, index: int, policy_text: str, min_confidence: float) -> Tuple[Optional[CompiledRule], List[str]]:
     """-> (rule, errors). rule is None when malformed (REJECTED). Otherwise VALID or NEEDS_REVIEW."""
     if not isinstance(raw, dict):
         return None, ["rule is not a JSON object"]
-    data = {k: v for k, v in raw.items() if k not in _IGNORABLE_KEYS}
+    data = copy.deepcopy({k: v for k, v in raw.items() if k not in _IGNORABLE_KEYS})
     data["policy_id"], data["rule_id"] = policy_id, f"{policy_id}-R{index:03d}"
+    evidence_timing_normalized = _normalize_explicit_approval_timing(data)
+    trigger_retyped = _normalize_confirmed_violation_rule_type(data)
+    sev = _assess_severity(data, policy_text)
+    if sev["drop"]:
+        data.pop("severity")
     llm_amb = data.get("ambiguities")
     if llm_amb is not None and not (isinstance(llm_amb, list) and all(isinstance(x, str) for x in llm_amb)):
         return None, ["ambiguities must be a list of strings"]
@@ -344,10 +555,16 @@ def validate_raw_rule(raw: Any, policy_id: str, index: int, policy_text: str, mi
     clause = rule.source_text or ""
     amb: List[str] = [f"LLM-reported: {x}" for x in rule.ambiguities]
     amb += _grounding_issues(rule, clause, policy_text)
-    amb += semantic_crosschecks(rule, clause or policy_text)
+    crosschecks = semantic_crosschecks(rule, clause or policy_text)
+    if evidence_timing_normalized:
+        # The explicit temporal relation is represented on the evidence requirement above,
+        # so the generic "time cue has no temporal object" warning no longer applies.
+        crosschecks = [x for x in crosschecks if not ("clause contains a time constraint" in x and "no temporal constraint" in x)]
+    amb += crosschecks
     scope = clause if clause.strip() else policy_text
     if not _HAS_NUMBER.search(scope):
-        v, a = _VAGUE.search(scope), _ADVISORY.search(scope)
+        masked_scope = _mask_severity_labels(scope)  # only explicit severity-label spans are excluded; other vague/advisory wording still counts
+        v, a = _VAGUE.search(masked_scope), _ADVISORY.search(masked_scope)
         if v:
             amb.append(f"clause uses vague term '{v.group(0)}' with no measurable value")
         elif a:
@@ -359,7 +576,17 @@ def validate_raw_rule(raw: Any, policy_id: str, index: int, policy_text: str, mi
     if rule.confidence < min_confidence:
         amb.append(f"confidence {rule.confidence:.2f} is below the minimum {min_confidence:.2f}")
 
+    if sev["ambiguity"]:
+        amb.append(sev["ambiguity"])
+    if sev["issue"]:
+        issues.append(sev["issue"])
+    if sev["source"]:
+        rule.severity_source = sev["source"]
     rule.ambiguities = list(dict.fromkeys(amb))
+    if evidence_timing_normalized:
+        issues.append("explicit approval-before-payment relation represented as required_evidence.match.timing; source evidence must explicitly establish this relation")
+    if trigger_retyped:
+        issues.append("rule_type normalized REQUIRE -> TRIGGER: a confirmed-violation escalation clause is conditional (fires only when a violation is confirmed), not an unconditional requirement")
     rule.issues = issues
     if rule.ambiguities:
         rule.status = "NEEDS_REVIEW"

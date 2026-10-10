@@ -99,6 +99,7 @@ COMPILED_POLICY_STRICT_UNITS = os.getenv("COMPILED_POLICY_STRICT_UNITS", "true")
 try:
     from .policy_compiler import compile_policy as _compile_policy, CompilationError as _CompilationError, DEFAULT_MIN_CONFIDENCE as _COMPILER_MIN_CONFIDENCE
     from .rule_engine import evaluate_policy as _evaluate_compiled_rules, norm_unit as _compiled_norm_unit
+    from .policy_schema import CompiledRule as _CompiledRule, Condition as _CompiledCondition, Operator as _CompiledOperator, render_condition as _render_compiled_condition
     HAS_POLICY_COMPILER = True
 except ImportError as _pc_err:
     HAS_POLICY_COMPILER = False
@@ -2333,15 +2334,109 @@ def _compiled_source_span(text: str, clause: Optional[str]) -> Optional[List[int
     m = re.search(r"\s+".join(re.escape(tok) for tok in clause.split()), text)
     return [m.start(), m.end()] if m else None
 
-def graph_to_rule_inputs(G: nx.MultiDiGraph) -> Dict[str, Any]:
-    """Smallest adapter: existing STRUCTURED graph data -> rule_engine inputs. Nothing is read from raw text and nothing is defaulted.
-    facts: Transaction nodes (role TRANSACTION only: policy limits and UNCLEAR amounts are excluded) with amount/currency and the attributes the
-    pipeline already extracted unambiguously (ref_id, date, vendor, person, expense_type), under the entity names transaction/expense/payment(s);
-    GovID / Phone Entity nodes only when a validity result exists (GovID: only when validation is fully configured).
-    Any other entity/field a compiled rule asks for is simply absent -> the engine answers INDETERMINATE.
-    evidence: only Evidence nodes that carry an explicit structured `evidence_type`; the pipeline sets none today, so evidence is NOT supplied
-    (rules that require evidence become INDETERMINATE instead of a fabricated 'missing evidence' violation).
-    Also returns node_ids[entity] aligned with each fact list so record results map back to graph nodes."""
+def _norm_compiled_evidence_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _explicit_evidence_timing(text: str, expected: Any) -> bool:
+    """True only for a direct, affirmative statement that something was dated before payment."""
+    val = _norm_compiled_evidence_text(expected).replace(" ", "_")
+    if val != "before_payment":
+        return False
+    if re.search(r"\b(?:not|never|no|without)\b.{0,45}\bbefore\s+(?:the\s+)?payment\b", text, re.I):
+        return False
+    return bool(re.search(r"\b(?:dated|approved|signed|granted|issued|attached|provided)?\s*(?:on\s+)?before\s+(?:the\s+)?payment\b", text, re.I))
+
+
+def _explicitly_negates_evidence(text: str, phrase: str) -> bool:
+    """Conservative local negation guard for typed evidence inferred from exact source wording."""
+    m = re.search(r"\b" + re.escape(phrase).replace(r"\ ", r"\s+") + r"\b", text, re.I)
+    if not m:
+        return True
+    window = text[max(0, m.start() - 55):min(len(text), m.end() + 55)]
+    return bool(re.search(r"\b(?:no|not|never|without|missing|lacks?|lacked)\b.{0,45}\b(?:" + re.escape(phrase.split()[0]) + r")\b|\b(?:not|never)\b.{0,35}\b(?:attached|provided|obtained|approved|present)\b", window, re.I))
+
+
+def _typed_evidence_from_requirements(G: nx.MultiDiGraph, compiled_rules: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """Create typed evidence inputs only when the evidence node explicitly supports the type and attributes.
+
+    No LLM is used here. Type labels must appear verbatim as a phrase in the source evidence;
+    non-timing match attributes must be explicitly labelled in the text. Policy/context evidence
+    and negated evidence are excluded. Unsupported requirements remain unknown.
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    requirements = []
+    for rule in compiled_rules or []:
+        for req in (getattr(rule, "required_evidence", None) or []):
+            req_type = str(getattr(req, "type", "") or "").strip().lower()
+            if req_type:
+                requirements.append((req_type, getattr(req, "description", None), getattr(req, "match", None)))
+    # Articles ("a/an/the") are ignored only for the contiguous type-phrase search and its negation guard,
+    # so "approval from a Director" (policy) equals "approval from the Director" (evidence). Role words stay
+    # bound inside the contiguous phrase; timing and labelled-attribute checks still use the original text.
+    _strip_articles = lambda s: re.sub(r"\b(?:a|an|the)\b\s*", "", s).strip()
+    for ev_id, data in _investigation_evidence(G):
+        if data.get("context_only") or _is_policy_source_evidence(data):
+            continue
+        text = _norm_compiled_evidence_text(data.get("text", ""))
+        if not text:
+            continue
+        text_phrase_view = _strip_articles(text)
+        for req_type, description, match in requirements:
+            phrase = _strip_articles(re.sub(r"[^a-z0-9]+", " ", req_type).strip())
+            if not phrase or not re.search(r"\b" + re.escape(phrase).replace(r"\ ", r"\s+") + r"\b", text_phrase_view, re.I):
+                continue
+            if _explicitly_negates_evidence(text_phrase_view, phrase):
+                continue
+            attrs: Dict[str, Any] = {}
+            match_map = match if isinstance(match, dict) else {}
+            matches = True
+            for key, expected in match_map.items():
+                if str(key).lower() == "timing" and _norm_compiled_evidence_text(expected).replace(" ", "_") == "before_payment":
+                    if not _explicit_evidence_timing(text, expected):
+                        matches = False
+                        break
+                    attrs[str(key)] = "before_payment"
+                else:
+                    label = _norm_compiled_evidence_text(key)
+                    value = _norm_compiled_evidence_text(expected)
+                    if not label or not value or not re.search(r"\b" + re.escape(label).replace(r"\ ", r"\s+") + r"\s*[:=]\s*" + re.escape(value).replace(r"\ ", r"\s+") + r"\b", text, re.I):
+                        matches = False
+                        break
+                    attrs[str(key)] = expected
+            if not matches:
+                continue
+            item = {"type": req_type, "evidence_id": ev_id, "file": data.get("source_file"), "location": data.get("source_location"), **attrs}
+            key = (ev_id, req_type, tuple(sorted((str(k), str(v)) for k, v in attrs.items())))
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+    return out
+
+
+def graph_to_rule_inputs(G: nx.MultiDiGraph, compiled_rules: Optional[List[Any]] = None) -> Dict[str, Any]:
+    """Existing structured graph data -> deterministic rule-engine inputs.
+    Transaction facts remain restricted to unambiguous transaction-role amounts and extracted attributes.
+    Evidence types / match attributes are added only when the source Evidence text explicitly supports them;
+    unsupported or negated evidence is not inferred. Returns node_ids aligned with fact lists.
+
+    When callers omit ``compiled_rules`` on an already evaluated graph, recover attached structured rules
+    so diagnostic input snapshots use the same evidence typing requirements as actual execution.
+    """
+    if compiled_rules is None and HAS_POLICY_COMPILER:
+        recovered = []
+        for _, rule_data in _nodes_of_type(G, "PolicyRule"):
+            for entry in (rule_data.get("compiled_rules") or []):
+                raw_rule = entry.get("compiled_rule") if isinstance(entry, dict) else None
+                if isinstance(raw_rule, dict):
+                    try:
+                        recovered.append(_CompiledRule.model_validate(raw_rule))
+                    except Exception:
+                        # Diagnostics remain read-only and tolerant of malformed historical entries.
+                        continue
+        compiled_rules = recovered or None
+
     facts: Dict[str, Any] = {}
     node_ids: Dict[str, List[str]] = {}
     txns = [(n, d) for n, d in _nodes_of_type(G, "Transaction") if d.get("amount_role") == ROLE_TXN and isinstance(d.get("amount"), (int, float))]
@@ -2365,8 +2460,17 @@ def graph_to_rule_inputs(G: nx.MultiDiGraph) -> Dict[str, Any]:
         for alias in aliases:
             facts[alias], node_ids[alias] = recs, [n for n, _ in ents]
     typed = [{"type": d["evidence_type"], "evidence_id": n, "file": d.get("source_file"), "location": d.get("source_location")}
-             for n, d in _investigation_evidence(G) if d.get("evidence_type")]
-    return {"facts": facts, "evidence": (typed or None), "node_ids": node_ids, "strict_units": COMPILED_POLICY_STRICT_UNITS, "evaluation_date": None, "fx_rates": None}
+             for n, d in _investigation_evidence(G) if d.get("evidence_type") and not d.get("context_only")]
+    typed.extend(_typed_evidence_from_requirements(G, compiled_rules))
+    # Deduplicate only exact evidence/type/attribute triples; different structured match attributes
+    # must remain separate so one cannot accidentally satisfy another requirement.
+    deduped, seen_evidence = [], set()
+    for item in typed:
+        key = (item.get("evidence_id"), item.get("type"), tuple(sorted((str(k), str(v)) for k, v in item.items() if k not in ("evidence_id", "type", "file", "location"))))
+        if key not in seen_evidence:
+            seen_evidence.add(key)
+            deduped.append(item)
+    return {"facts": facts, "evidence": (deduped or None), "node_ids": node_ids, "strict_units": COMPILED_POLICY_STRICT_UNITS, "evaluation_date": None, "fx_rates": None}
 
 def _compiled_top(entries: List[Dict[str, Any]]) -> Optional[str]:
     vs = {(e.get("result") or {}).get("verdict") for e in entries if e.get("result")}
@@ -2393,6 +2497,225 @@ def _compiled_entry_result(entry: Dict[str, Any], rrs: List[Dict[str, Any]], nod
             "violating_node_ids": _nodes("VIOLATION"), "satisfying_node_ids": _nodes("COMPLIANT"),
             "record_results": [{"record_index": r.get("record_index"), "verdict": r["verdict"], "missing_facts": r.get("missing_facts", [])} for r in rrs[:50]]}
 
+def _compiled_rule_leaves(condition: Any) -> List[Any]:
+    if condition is None:
+        return []
+    children = getattr(condition, "children", None) or []
+    if children:
+        return [leaf for child in children for leaf in _compiled_rule_leaves(child)]
+    return [condition]
+
+
+def _is_confirmed_violation_trigger(rule: Any) -> bool:
+    if getattr(getattr(rule, "rule_type", None), "value", None) != "TRIGGER":
+        return False
+    for leaf in _compiled_rule_leaves(getattr(rule, "condition", None)):
+        entity = str(getattr(leaf, "entity", "") or "").lower()
+        field = str(getattr(leaf, "field", "") or "").lower()
+        op = getattr(getattr(leaf, "operator", None), "value", getattr(leaf, "operator", None))
+        if entity.endswith("_violation") and field == "confirmed" and op == "==" and getattr(leaf, "value", None) is True:
+            return True
+    return False
+
+
+def _is_confirmed_violation_candidate(rule: Any) -> bool:
+    """TRIGGER whose source says "confirmed violation(s)" and whose only predicate is a confirmation flag/status
+    (any alias form, before or after alias normalization). Used to tell escalation triggers from base obligations."""
+    if getattr(getattr(rule, "rule_type", None), "value", None) != "TRIGGER":
+        return False
+    if not re.search(r"\bconfirmed\s+violations?\b", str(getattr(rule, "source_text", "") or ""), re.I):
+        return False
+    cond = getattr(rule, "condition", None)
+    if cond is None or getattr(cond, "children", None):
+        return False
+    entity = str(getattr(cond, "entity", "") or "").lower()
+    field = str(getattr(cond, "field", "") or "").lower()
+    op = getattr(getattr(cond, "operator", None), "value", getattr(cond, "operator", None))
+    value = getattr(cond, "value", None)
+    return op == "==" and (
+        (entity == "violation" and field in ("status", "state") and isinstance(value, str) and value.strip().lower() == "confirmed")
+        or (field in ("confirmed", "violation_confirmed") and value is True))
+
+
+def _is_base_obligation_rule(rule: Any) -> bool:
+    """Rules whose verdict is a compliance outcome that a confirmed violation can be derived from.
+
+    REQUIRE/PROHIBIT always; a TRIGGER only when it carries required evidence (it then yields COMPLIANT /
+    VIOLATION / NOT_APPLICABLE, e.g. "expenses above N need approval"). Escalation triggers and action-only
+    triggers are never base obligations."""
+    if getattr(getattr(rule, "rule_type", None), "value", None) != "TRIGGER":
+        return True
+    if _is_confirmed_violation_trigger(rule) or _is_confirmed_violation_candidate(rule):
+        return False
+    return bool(getattr(rule, "required_evidence", None))
+
+
+def _normalize_confirmed_violation_trigger_aliases(rules: List[Any]) -> List[str]:
+    """Normalize a narrow compiler alias for an explicit confirmed-violation trigger.
+
+    Compiler responses may represent the explicit phrase "confirmed violations" either as
+    ``violation.status == "confirmed"`` OR as ``<base_entity>.violation_confirmed == True``.
+    Derivation uses ``<base_entity>_violation.confirmed == True``. Normalize only these exact
+    patterns, only with one base-rule entity, and only when the trigger source explicitly says
+    "confirmed violation(s)". Ambiguous/multi-domain policies remain untouched.
+    """
+    base_entities = {
+        str(getattr(rule, "entity", "") or "").strip().lower()
+        for rule in rules
+        if _is_base_obligation_rule(rule)
+        and str(getattr(rule, "entity", "") or "").strip()
+    }
+    if len(base_entities) != 1:
+        return []
+    base_entity = next(iter(base_entities))
+    target_entity = base_entity if base_entity.endswith("_violation") else f"{base_entity}_violation"
+    changed: List[str] = []
+    for rule in rules:
+        if getattr(getattr(rule, "rule_type", None), "value", None) != "TRIGGER":
+            continue
+        source = str(getattr(rule, "source_text", "") or "")
+        if not re.search(r"\bconfirmed\s+violations?\b", source, re.I):
+            continue
+        condition = getattr(rule, "condition", None)
+        if condition is None or getattr(condition, "children", None):
+            continue
+        entity = str(getattr(condition, "entity", "") or "").lower()
+        field = str(getattr(condition, "field", "") or "").lower()
+        op = getattr(getattr(condition, "operator", None), "value", getattr(condition, "operator", None))
+        value = getattr(condition, "value", None)
+        alias_status_form = (
+            entity == "violation" and field in ("status", "state") and op == "=="
+            and isinstance(value, str) and value.strip().lower() == "confirmed"
+        )
+        canonical_flag_form = (
+            entity == base_entity and field == "violation_confirmed" and op == "==" and value is True
+        )
+        # Some compiler responses already use the canonical field name but leave it
+        # on the generic `violation` entity (violation.confirmed == True). Because
+        # the source explicitly says "confirmed violations" and this policy has
+        # exactly one base entity, normalize that alias to the derived entity too.
+        generic_confirmed_form = (
+            entity == "violation" and field == "confirmed" and op == "==" and value is True
+        )
+        if not (alias_status_form or canonical_flag_form or generic_confirmed_form):
+            continue
+        normalized = _CompiledCondition.model_validate({
+            "entity": target_entity, "field": "confirmed", "operator": _CompiledOperator.EQ,
+            "value": True, "unit": None,
+        })
+        rule.condition = normalized
+        # The executor groups records using CompiledRule.entity as well as Condition.entity.
+        # Keep both schema levels aligned; changing only the condition still leaves the trigger
+        # looking for facts under the stale ``violation`` alias.
+        rule.entity = target_entity
+        rule.operator = _CompiledOperator.EQ
+        rule.value = True
+        rule.unit = None
+        rule.expression = _render_compiled_condition(normalized)
+        changed.append(str(getattr(rule, "rule_id", "")))
+    return changed
+
+
+_TXN_AMOUNT_FIELD_SYNONYMS = frozenset({"total_amount", "amount_total", "total", "total_value", "grand_total"})
+
+
+def _normalize_transaction_amount_field_aliases(rules: List[Any], facts: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Re-point a compiler-chosen monetary-total field name to the graph's canonical transaction fact ``amount``.
+
+    The compiler names fields freely (``total_amount``, ``expense_amount``, ...) but the graph exposes exactly one
+    transaction-role monetary fact per record: ``<transaction-alias>.amount``. Without this, the engine reports the
+    uncovered field as missing and every dependent rule stays INDETERMINATE although the amount is known.
+
+    Fail-closed grounding: a leaf is rewritten only when (a) its entity is a transaction alias, (b) its field is a known
+    total-amount synonym or ``<entity>_amount``, (c) EVERY fact record for that entity has an ``amount`` and none has the
+    original field, and (d) the same rule does not also read ``amount`` (which could mean a different quantity).
+    No fact is created or changed; unit/currency checks stay in the engine. Anything else is left untouched.
+    """
+    changed: List[Dict[str, str]] = []
+    for rule in rules:
+        leaves = list(_compiled_rule_leaves(getattr(rule, "condition", None)))
+        for ex in (getattr(rule, "exception", None) or []):
+            leaves.extend(_compiled_rule_leaves(getattr(ex, "condition", None)))
+        txn_leaves = [lf for lf in leaves
+                      if str(getattr(lf, "entity", "") or "").lower() in _COMPILED_TXN_ENTITIES and getattr(lf, "field", None)]
+        rewritten: List[Dict[str, str]] = []
+        reads_canonical = {str(o.entity).lower() for o in txn_leaves if str(o.field).lower() == "amount"}  # taken BEFORE any rewrite
+        for leaf in txn_leaves:
+            entity, field = str(leaf.entity).lower(), str(leaf.field).lower()
+            if field != f"{entity}_amount" and field not in _TXN_AMOUNT_FIELD_SYNONYMS:
+                continue
+            if entity in reads_canonical:
+                continue
+            records = facts.get(entity)
+            if not isinstance(records, list) or not records:
+                continue
+            if not all(isinstance(r, dict) and "amount" in r and field not in {str(k).lower() for k in r} for r in records):
+                continue
+            leaf.field = "amount"
+            rewritten.append({"rule_id": str(getattr(rule, "rule_id", "")), "entity": entity, "from_field": field, "to_field": "amount"})
+        if rewritten:
+            try:  # rebuild the rendered expression exactly as the schema does
+                rule.expression = _CompiledRule.model_validate(rule.model_dump(mode="json")).expression
+            except Exception:
+                for r in rewritten:
+                    rule.expression = (rule.expression or "").replace(f"{r['entity']}.{r['from_field']}", f"{r['entity']}.amount")
+            changed.extend(rewritten)
+    return changed
+
+
+def _derive_confirmed_violation_facts(valid_rules: List[Any], compiled_results: List[Dict[str, Any]],
+                                      compile_result: Any, facts: Dict[str, Any]) -> bool:
+    """Derive *_violation.confirmed only from complete, determinate non-trigger rule results.
+
+    If any non-trigger obligation is unresolved/rejected/unparsed, the fact stays absent so the
+    engine returns INDETERMINATE. This is a derived fact, not an LLM assertion.
+    """
+    rules = list(getattr(compile_result, "rules", []) or [])
+    base_rules = [r for r in rules if _is_base_obligation_rule(r)]
+    trigger_entities = sorted({str(getattr(leaf, "entity", "") or "").lower()
+                               for r in valid_rules if _is_confirmed_violation_trigger(r)
+                               for leaf in _compiled_rule_leaves(getattr(r, "condition", None))
+                               if str(getattr(leaf, "entity", "") or "").lower().endswith("_violation")})
+    if not base_rules or not trigger_entities:
+        return False
+    if getattr(compile_result, "rejected", None) or getattr(compile_result, "unparsed_statements", None):
+        return False
+    if any(getattr(r, "status", None) != "VALID" for r in base_rules):
+        return False
+
+    by_rule: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in compiled_results:
+        if row.get("rule_id"):
+            by_rule[row["rule_id"]].append(row)
+    base_ids = [getattr(r, "rule_id", None) for r in base_rules]
+    if any(not rid or not by_rule.get(rid) for rid in base_ids):
+        return False
+    # All base rules must address the same record domain (transaction aliases are equivalent).
+    base_entities = {str(getattr(r, "entity", "") or "").lower() for r in base_rules}
+    txn_aliases = set(_COMPILED_TXN_ENTITIES)
+    for target in trigger_entities:
+        base_entity = target[:-len("_violation")]
+        compatible = (base_entity in txn_aliases and base_entities.issubset(txn_aliases)) or base_entities == {base_entity}
+        if not compatible:
+            continue
+        row_maps = [{r.get("record_index"): r for r in by_rule[rid]} for rid in base_ids]
+        indices = set(row_maps[0])
+        if None in indices or any(set(m) != indices for m in row_maps):
+            continue
+        derived = []
+        safe = True
+        for idx in sorted(indices):
+            rows = [m[idx] for m in row_maps]
+            verdicts = [str(r.get("verdict")) for r in rows]
+            if any(v not in ("COMPLIANT", "VIOLATION", "NOT_APPLICABLE", "EXEMPT") for v in verdicts):
+                safe = False
+                break
+            derived.append({"confirmed": any(v == "VIOLATION" for v in verdicts)})
+        if safe and derived:
+            facts[target] = derived
+    return any(target in facts for target in trigger_entities)
+
+
 def apply_compiled_policy(G: nx.MultiDiGraph, rulebook_text: str) -> Optional[Dict[str, Any]]:
     """Compile the (already extracted) rulebook text, attach each compiled rule to its existing PolicyRule node (with rulebook provenance), and
     execute VALID rules deterministically against facts/evidence derived from the graph. NEEDS_REVIEW rules are never executed. Call BEFORE
@@ -2417,20 +2740,35 @@ def apply_compiled_policy(G: nx.MultiDiGraph, rulebook_text: str) -> Optional[Di
         logger.exception("Policy compilation crashed (continuing with legacy engine)")
         summary["error"] = f"unexpected compilation error: {str(e)[:200]}"; return summary
 
+    normalized_trigger_aliases = _normalize_confirmed_violation_trigger_aliases(result.rules)
     lines = [(n, _ws_norm(redact_pii(d.get("original_text") or d.get("condition") or ""))) for n, d in rule_nodes]
     lines = [(n, ln) for n, ln in lines if len(ln) >= 8]
-    inputs = graph_to_rule_inputs(G)
-    valid = [cr for cr in result.rules if cr.status == "VALID"]  # NEEDS_REVIEW rules are not even passed to the engine
+    inputs = graph_to_rule_inputs(G, result.rules)
+    normalized_amount_aliases = _normalize_transaction_amount_field_aliases(result.rules, inputs["facts"])
+    valid = [cr for cr in result.rules if cr.status == "VALID"]  # NEEDS_REVIEW rules are never executed
+    base_rules = [cr for cr in valid if _is_base_obligation_rule(cr)]  # evaluated first; confirmed-violation facts are derived from these
+    trigger_rules = [cr for cr in valid if not _is_base_obligation_rule(cr)]
     by_rule: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     eval_error: Optional[str] = None
     ev: Optional[Dict[str, Any]] = None
-    if valid:
-        try:
+    all_results: List[Dict[str, Any]] = []
+    try:
+        if base_rules:
+            base_ev = _evaluate_compiled_rules(base_rules, inputs["facts"], inputs["evidence"], inputs["evaluation_date"], False, inputs["fx_rates"], inputs["strict_units"])
+            all_results.extend(base_ev.get("rule_results", []))
+            _derive_confirmed_violation_facts(valid, all_results, result, inputs["facts"])
+            if trigger_rules:
+                trigger_ev = _evaluate_compiled_rules(trigger_rules, inputs["facts"], inputs["evidence"], inputs["evaluation_date"], False, inputs["fx_rates"], inputs["strict_units"])
+                all_results.extend(trigger_ev.get("rule_results", []))
+            ev = {**base_ev, "rule_results": all_results}
+        elif valid:
             ev = _evaluate_compiled_rules(valid, inputs["facts"], inputs["evidence"], inputs["evaluation_date"], False, inputs["fx_rates"], inputs["strict_units"])
-            for rr in ev["rule_results"]: by_rule[rr["rule_id"]].append(rr)
-        except Exception as e:
-            logger.exception("Compiled rule evaluation failed (legacy engine continues)")
-            eval_error = str(e)[:300]
+            all_results.extend(ev.get("rule_results", []))
+        for rr in all_results:
+            by_rule[rr["rule_id"]].append(rr)
+    except Exception as e:
+        logger.exception("Compiled rule evaluation failed (legacy engine continues)")
+        eval_error = str(e)[:300]
 
     unmapped: List[Dict[str, Any]] = []
     for cr in result.rules:
@@ -2454,6 +2792,8 @@ def apply_compiled_policy(G: nx.MultiDiGraph, rulebook_text: str) -> Optional[Di
                    needs_review_not_executed=[cr.rule_id for cr in result.rules if cr.status != "VALID"],
                    rejected=[{"errors": x.errors, "source_text": x.source_text} for x in result.rejected][:20], unparsed_statements=result.unparsed_statements[:20],
                    unmapped_rules=unmapped, evaluation_error=eval_error,
+                   normalized_confirmed_violation_trigger_aliases=normalized_trigger_aliases,
+                   normalized_transaction_amount_field_aliases=normalized_amount_aliases,
                    inputs={"fact_entities": sorted(inputs["facts"]), "records": {k: len(v) for k, v in inputs["node_ids"].items()},
                            "evidence_supplied": inputs["evidence"] is not None,
                            "evidence_note": ("typed Evidence nodes supplied" if inputs["evidence"] is not None else "no Evidence node carries a structured evidence_type: evidence NOT supplied; evidence-requiring rules are INDETERMINATE"),
@@ -2462,9 +2802,20 @@ def apply_compiled_policy(G: nx.MultiDiGraph, rulebook_text: str) -> Optional[Di
     return summary
 
 def _compiled_node_result(rd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Authoritative compiled result for a PolicyRule node, or None (no compiled rule, NEEDS_REVIEW, or INDETERMINATE: legacy result stays authoritative)."""
-    entries = [e for e in (rd.get("compiled_rules") or []) if (e.get("result") or {}).get("executed") and e["result"]["verdict"] != "INDETERMINATE"]
-    if not entries: return None
+    """Use a compiled result only when every compiled rule attached to this PolicyRule is determinate.
+
+    A determinate sibling must not mask an indeterminate or unexecuted obligation on the same rule line.
+    Otherwise the compiled result is not authoritative and the legacy result remains visible.
+    """
+    entries = list(rd.get("compiled_rules") or [])
+    if not entries:
+        return None
+    if any(
+        not (entry.get("result") or {}).get("executed")
+        or (entry.get("result") or {}).get("verdict") == "INDETERMINATE"
+        for entry in entries
+    ):
+        return None
     raw = _compiled_top(entries)
     viol = list(dict.fromkeys(n for e in entries for n in e["result"]["violating_node_ids"]))  # record-level outcomes of every determinate entry
     sat = [n for n in dict.fromkeys(n for e in entries for n in e["result"]["satisfying_node_ids"]) if n not in viol]

@@ -430,6 +430,13 @@ class CompiledRule(BaseModel):
     exception: List[ExceptionClause] = Field(default_factory=list)
     temporal: Optional[Temporal] = None
     severity: Severity = Severity.MEDIUM
+    # Where `severity` came from. schema_default = policy stated none (the MEDIUM above is a default, NOT a policy fact);
+    # policy_stated = the source clause itself states it; ambiguous = clause wording unclear/conflicting (rule is
+    # NEEDS_REVIEW); unverified = supplied directly to the model without a source check.
+    # DIAGNOSTIC METADATA: decided only by policy_compiler.validate_raw_rule (LLM-supplied values are ignored there).
+    # Execution (rule_engine) reads `severity`, never this field. It is persisted by model_dump() and must stay accepted
+    # here because tasks.py revalidates stored dumps with CompiledRule.model_validate (extra="forbid").
+    severity_source: Literal["schema_default", "policy_stated", "ambiguous", "unverified"] = "schema_default"
     action: str
     confidence: float = Field(ge=0.0, le=1.0)
     # --- provenance / validation outcome
@@ -468,6 +475,8 @@ class CompiledRule(BaseModel):
 
     @model_validator(mode="after")
     def _rule_checks(self):
+        if "severity" in self.model_fields_set and "severity_source" not in self.model_fields_set:
+            self.severity_source = "unverified"
         if self.condition is not None:
             if cond_depth(self.condition) > MAX_CONDITION_DEPTH or cond_size(self.condition) > MAX_CONDITION_NODES:
                 raise ValueError("condition tree too deep/large")

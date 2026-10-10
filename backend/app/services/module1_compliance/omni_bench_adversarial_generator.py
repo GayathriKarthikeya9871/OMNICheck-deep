@@ -648,8 +648,14 @@ class AdversarialGeneratorTests(unittest.TestCase):
             self.assertTrue(isinstance(d["provenance"]["source_split"], str) and isinstance(d["provenance"]["source_expected_escalation"], bool))
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omni_bench_adversarial_eval.py")
         if not os.path.exists(path): self.skipTest("omni_bench_adversarial_eval.py not next to this file")
+        # The evaluator is loaded under a synthetic standalone name below.  Make
+        # both its legacy fallback import names resolve to this already-loaded
+        # generator module, regardless of whether unittest was launched from the
+        # package root or from this file's directory.
         saved = sys.modules.get("omni_bench_adversarial")
-        sys.modules["omni_bench_adversarial"] = sys.modules[__name__]  # the evaluator imports its generator under this name
+        saved_generator = sys.modules.get("omni_bench_adversarial_generator")
+        sys.modules["omni_bench_adversarial"] = sys.modules[__name__]
+        sys.modules["omni_bench_adversarial_generator"] = sys.modules[__name__]
         try:
             spec = importlib.util.spec_from_file_location("omni_bench_adversarial_eval_under_test", path)
             ev = importlib.util.module_from_spec(spec)
@@ -662,6 +668,8 @@ class AdversarialGeneratorTests(unittest.TestCase):
         finally:
             if saved is None: sys.modules.pop("omni_bench_adversarial", None)
             else: sys.modules["omni_bench_adversarial"] = saved
+            if saved_generator is None: sys.modules.pop("omni_bench_adversarial_generator", None)
+            else: sys.modules["omni_bench_adversarial_generator"] = saved_generator
 
     def test_module_is_offline_and_random_free(self):
         with open(os.path.abspath(__file__), encoding="utf-8") as fh: src = fh.read()

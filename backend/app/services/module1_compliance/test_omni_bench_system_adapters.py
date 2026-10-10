@@ -448,22 +448,43 @@ class V6Tests(unittest.TestCase):
         if mod is None: self.skipTest(f"real tasks.py not importable here: {why}")
         keys = tuple(A.V6_COMPONENT_FLAGS)
         before, seen, sv = {k: getattr(mod, k) for k in keys}, [], []
-        real_build, real_sv = mod.build_evidence_graph, mod.self_verification_variant_predictions
-        def spy_build(*a, **k): seen.append({x: getattr(mod, x) for x in keys}); return real_build(*a, **k)
-        def spy_sv(*a, **k): r = real_sv(*a, **k); sv.append(set(r)); return r
-        mod.build_evidence_graph, mod.self_verification_variant_predictions = spy_build, spy_sv
-        try: out = A.run_version(RECORDS[:1], mod, "V6")
-        finally: mod.build_evidence_graph, mod.self_verification_variant_predictions = real_build, real_sv
+        real_build = mod.build_evidence_graph
+        real_verify = getattr(mod, "verify_self_verification_result", None)
+        if not callable(real_verify): self.skipTest("tasks.py has no verify_self_verification_result (7B) function")
+        real_applicability = getattr(mod, "verify_policy_applicability", None)
+        applicability_calls = []
+        def spy_build(*a, **k):
+            seen.append({x: getattr(mod, x) for x in keys})
+            return real_build(*a, **k)
+        def spy_verify(*a, **k):
+            r = real_verify(*a, **k)
+            sv.append(r)
+            return r
+        def spy_applicability(*a, **k):
+            applicability_calls.append((a, k))
+            return real_applicability(*a, **k)
+        mod.build_evidence_graph = spy_build
+        mod.verify_self_verification_result = spy_verify
+        if callable(real_applicability): mod.verify_policy_applicability = spy_applicability
+        try:
+            out = A.run_version(RECORDS[:1], mod, "V6")
+        finally:
+            mod.build_evidence_graph = real_build
+            mod.verify_self_verification_result = real_verify
+            if callable(real_applicability): mod.verify_policy_applicability = real_applicability
         self.assertTrue(seen and all(s == A.V5_COMPONENT_FLAGS and all(s.values()) for s in seen))
         self.assertEqual(out["selected_version"], "V6")
-        self.assertTrue(sv, "real self_verification_variant_predictions was never invoked/returned")  # a KeyError on the variant must fail here, not pass as unanswered
-        self.assertIn(A.V6_VARIANT, sv[0])  # the real call succeeded and exposes the variant V6 reads
-        self.assertTrue(out["component_state"]["self_verification"]["invoked"])  # invocation recorded
+        self.assertTrue(sv, "real verify_self_verification_result (7B) was never invoked/returned")
+        self.assertTrue(all(isinstance(x, dict) for x in sv))
+        self.assertFalse(applicability_calls, "V6 must not invoke 7C policy applicability")
+        self.assertTrue(out["component_state"]["self_verification"]["invoked"])
+        self.assertFalse(out["component_state"]["policy_applicability"]["enabled"])
         self.assertEqual(len(out["predictions"] or []) + len(out["unanswered"]), 1)
         for u in out["unanswered"]: self.assertTrue(u["reason"])
         for p in out["predictions"] or []: self.assertEqual((p["provenance"]["selected_version"], p["provenance"]["system"]), ("V6", "V2"))
         self.assertEqual({k: getattr(mod, k) for k in keys}, before)
-        self.assertIs(mod.self_verification_variant_predictions, real_sv)
+        self.assertIs(mod.build_evidence_graph, real_build)
+        self.assertIs(mod.verify_self_verification_result, real_verify)
         self.assertIsNone(A._ACTIVE_CONFIG["version"])
 
 
@@ -773,3 +794,47 @@ class RealPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CompiledPolicyProofTests(unittest.TestCase):
+    def test_graph_proof_requires_effective_compiled_decision_evidence(self):
+        class FakeGraph:
+            graph = {}
+            def __init__(self):
+                self._nodes = [
+                    ("p1", {"type": "Policy", "compiled_policy": {
+                        "status": "COMPILED_WITH_REVIEW",
+                        "stats": {"valid": 2, "needs_review": 1, "rejected": 0},
+                        "unmapped_rules": [],
+                    }}),
+                    ("r1", {"type": "PolicyRule", "compiled_rules": [{
+                        "rule_id": "R-1", "status": "VALID", "mapping_basis": "clause_within_rule_line",
+                        "result": {"executed": True, "verdict": "SATISFIED"},
+                    }]}),
+                    ("d1", {"type": "Decision", "evaluation_engine": "compiled_rule_engine", "verdict": "SATISFIED"}),
+                    ("d2", {"type": "Decision", "evaluation_engine": "legacy_dsl", "verdict": "SATISFIED"}),
+                ]
+            def nodes(self, data=False):
+                return self._nodes if data else [node_id for node_id, _ in self._nodes]
+            def number_of_nodes(self):
+                return len(self._nodes)
+
+        proof = A._graph_component_proof(FakeGraph())
+        self.assertEqual(proof["compiled_policy_summaries"][0]["status"], "COMPILED_WITH_REVIEW")
+        self.assertEqual(proof["compiled_policy_execution"]["executed_rule_count"], 1)
+        self.assertEqual(proof["compiled_policy_execution"]["compiled_decision_count"], 1)
+        self.assertTrue(proof["compiled_policy_execution"]["effective_on_decision"])
+
+    def test_graph_proof_does_not_treat_compilation_alone_as_effective(self):
+        class FakeGraph:
+            graph = {}
+            def nodes(self, data=False):
+                rows = [
+                    ("p1", {"type": "Policy", "compiled_policy": {"status": "COMPILED_WITH_REVIEW", "stats": {"valid": 1}}}),
+                    ("d1", {"type": "Decision", "evaluation_engine": "legacy_dsl", "verdict": "NO_CONCLUSION"}),
+                ]
+                return rows if data else [node_id for node_id, _ in rows]
+            def number_of_nodes(self): return 2
+
+        proof = A._graph_component_proof(FakeGraph())
+        self.assertFalse(proof["compiled_policy_execution"]["effective_on_decision"])
+        self.assertEqual(proof["compiled_policy_execution"]["compiled_decision_count"], 0)

@@ -39,10 +39,10 @@ import unittest
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:  # package use or flat-directory use
-    from .omni_bench_adversarial import (COMP, INS, NC, OUTCOME_ALTERED, OUTCOME_UNCHANGED, PERTURBATION_TYPES, PerturbationRecord, generate_adversarial_suite,
+    from .omni_bench_adversarial_generator import (COMP, INS, NC, OUTCOME_ALTERED, OUTCOME_UNCHANGED, PERTURBATION_TYPES, PerturbationRecord, generate_adversarial_suite,
                                          validate_adversarial_suite)
 except ImportError:
-    from omni_bench_adversarial import (COMP, INS, NC, OUTCOME_ALTERED, OUTCOME_UNCHANGED, PERTURBATION_TYPES, PerturbationRecord, generate_adversarial_suite,
+    from omni_bench_adversarial_generator import (COMP, INS, NC, OUTCOME_ALTERED, OUTCOME_UNCHANGED, PERTURBATION_TYPES, PerturbationRecord, generate_adversarial_suite,
                                         validate_adversarial_suite)
 
 EVALUATOR_NAME, EVALUATOR_VERSION = "omni_bench_adversarial_eval", "1.0.0"
